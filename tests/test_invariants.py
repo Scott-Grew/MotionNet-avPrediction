@@ -2074,3 +2074,49 @@ def test_the_anchor_count_search_keeps_every_anchor_clear_of_the_prune_radius():
     )
     assert contract.NUM_PREDICTED_MODES <= crowded_count < 18
     assert fit_anchors.minimum_pairwise_distance(crowded_fitted) >= model.PRUNE_DISTANCE_METRES
+
+
+def test_map_chunk_centres_are_the_mean_dot_position_per_slot():
+    map_rows = torch.zeros(6, contract.MAP_FEATURE_DIM)
+    map_rows[:, contract.MAP_POSITION] = torch.tensor(
+        [[0.0, 0.0], [2.0, 0.0], [10.0, 10.0], [30.0, 0.0], [30.0, 4.0], [30.0, 8.0]]
+    )
+    centres = model.map_chunk_centres(map_rows, torch.tensor([0, 0, 1, 3, 3, 3]), 2, 2)
+    assert centres.shape == (2, 2, 2)
+    assert torch.allclose(centres[0, 0], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(centres[0, 1], torch.tensor([10.0, 10.0]))
+    assert torch.allclose(centres[1, 0], torch.tensor([0.0, 0.0]))
+    assert torch.allclose(centres[1, 1], torch.tensor([30.0, 4.0]))
+
+
+def test_a_focused_decoder_reads_the_map_chunk_near_its_draft_more_than_a_far_one():
+    torch.manual_seed(121)
+    unit_anchors = model.unit_anchor_offsets_per_type() * 40.0
+    decoder = model.ModeDecoder(unit_anchors).eval()
+    with torch.no_grad():
+        decoder.map_focus_scale.fill_(20.0)
+    neighbour_count = 2
+    tokens = torch.randn(1, 1 + neighbour_count + 2, model.HIDDEN_DIM)
+    token_present = torch.ones(1, tokens.shape[1], dtype=torch.bool)
+    chunk_centres = torch.tensor([[[40.0, 0.0], [-380.0, 0.0]]])
+    near_token, far_token = 1 + neighbour_count, 2 + neighbour_count
+    forward_mode = model.ANCHOR_DISTANCE_COUNT - 1
+    vehicle = torch.zeros(1, dtype=torch.long)
+
+    def endpoint(token_set):
+        with torch.no_grad():
+            round_outputs, _, _ = decoder(token_set, token_present, vehicle, chunk_centres)
+        return round_outputs[-1][0][0, forward_mode, -1]
+
+    base = endpoint(tokens)
+    near_perturbed = tokens.clone()
+    near_perturbed[0, near_token] += 3.0
+    far_perturbed = tokens.clone()
+    far_perturbed[0, far_token] += 3.0
+    near_shift = float((endpoint(near_perturbed) - base).norm())
+    far_shift = float((endpoint(far_perturbed) - base).norm())
+    assert near_shift > 10.0 * far_shift
+    with torch.no_grad():
+        decoder.map_focus_scale.fill_(-20.0)
+    unfocused_far_shift = float((endpoint(far_perturbed) - endpoint(tokens)).norm())
+    assert unfocused_far_shift > far_shift
