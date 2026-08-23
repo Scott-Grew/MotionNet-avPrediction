@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from womd import contract, frame_ops, loader, model, pipeline
+from womd import baseline, contract, frame_ops, loader, model, pipeline
 
 BATCH_SIZE = 16
 SUBMISSION_STEP_SELECTOR = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
@@ -54,20 +54,18 @@ def grouped(pairs, group_size):
 def submission_trajectories_and_confidences(predictor, samples):
     batch = pipeline.collate_samples(samples)
     with torch.no_grad():
-        trajectories, confidence_logits = predictor(batch)
+        if predictor is None:
+            trajectories, confidence_logits = baseline.constant_velocity(batch)
+        else:
+            trajectories, confidence_logits = predictor(batch)
     pruned_trajectories, pruned_logits = model.prune_modes_batched(trajectories, confidence_logits)
     decimated = pruned_trajectories.index_select(2, SUBMISSION_STEP_SELECTOR)
     return decimated.numpy(), torch.softmax(pruned_logits, dim=-1).numpy()
 
 
 def load_predictor(checkpoint_path, anchors_path):
-    with np.load(anchors_path) as anchors_file:
-        contract.check_artifact_provenance(
-            anchors_file["provenance"] if "provenance" in anchors_file else None,
-            anchors_path, "Refit them with fit_anchors.py.",
-        )
-        unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
-    predictor = model.MotionPredictor(unit_anchors)
+    unit_anchors, anchor_counts = model.load_anchor_file(anchors_path)
+    predictor = model.MotionPredictor(unit_anchors, anchor_counts)
     predictor.load_state_dict(model.load_checkpoint_state(checkpoint_path)["model_state"])
     return predictor.eval()
 
@@ -106,19 +104,24 @@ def write_submission_arrays(predictor, staged_directory, output_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("checkpoint_path", type=Path)
-    parser.add_argument("staged_directory", type=Path)
-    parser.add_argument("anchors_path", type=Path)
-    parser.add_argument("output_path", type=Path)
+    parser.add_argument("--constant-velocity", action="store_true")
+    parser.add_argument("paths", nargs="+", type=Path)
     arguments = parser.parse_args()
+    if arguments.constant_velocity:
+        if len(arguments.paths) != 2:
+            raise SystemExit("usage: submit.py --constant-velocity STAGED OUTPUT")
+        staged_directory, output_path = arguments.paths
+        predictor = None
+    else:
+        if len(arguments.paths) != 4:
+            raise SystemExit("usage: submit.py CHECKPOINT STAGED ANCHORS OUTPUT")
+        checkpoint_path, staged_directory, anchors_path, output_path = arguments.paths
+        predictor = load_predictor(checkpoint_path, anchors_path)
 
-    predictor = load_predictor(arguments.checkpoint_path, arguments.anchors_path)
-    agent_count = write_submission_arrays(
-        predictor, arguments.staged_directory, arguments.output_path
-    )
+    agent_count = write_submission_arrays(predictor, staged_directory, output_path)
     print(
-        f"{agent_count} designated targets written to {arguments.output_path}"
-        f" ({arguments.output_path.stat().st_size} bytes)"
+        f"{agent_count} designated targets written to {output_path}"
+        f" ({output_path.stat().st_size} bytes)"
     )
 
 

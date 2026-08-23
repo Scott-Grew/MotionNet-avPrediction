@@ -16,11 +16,12 @@ def build_synthetic_map_rows(dot_count):
     return map_rows
 
 
-def test_warmup_rises_to_the_learning_rate_then_the_cosine_decays_it_to_zero():
+def test_warmup_rises_to_the_learning_rate_holds_it_then_decays_linearly_to_zero():
     total_steps = 200
     warmup_steps = 20
+    decay_steps = 50
     rates = [
-        train.warmed_cosine_learning_rate(step, total_steps, warmup_steps)
+        train.scheduled_learning_rate(step, warmup_steps, total_steps, decay_steps)
         for step in range(total_steps + 1)
     ]
 
@@ -29,10 +30,14 @@ def test_warmup_rises_to_the_learning_rate_then_the_cosine_decays_it_to_zero():
     assert all(
         later >= earlier for earlier, later in zip(rates[:warmup_steps], rates[1:warmup_steps])
     )
-    assert all(
-        later <= earlier for earlier, later in zip(rates[warmup_steps:], rates[warmup_steps + 1:])
+    assert all(rate == train.LEARNING_RATE for rate in rates[warmup_steps:total_steps - decay_steps + 1])
+    decaying = rates[total_steps - decay_steps:]
+    assert all(later < earlier for earlier, later in zip(decaying, decaying[1:]))
+    assert rates[total_steps - decay_steps + decay_steps // 2] == pytest.approx(
+        0.5 * train.LEARNING_RATE
     )
-    assert rates[-1] < 1e-12
+    assert rates[total_steps - 1] == pytest.approx(train.LEARNING_RATE / decay_steps)
+    assert rates[total_steps] == 0.0
 
 
 def test_resuming_retrains_the_interrupted_epoch_and_never_skips_a_completed_one():
@@ -113,17 +118,14 @@ def test_one_training_step_runs_forward_loss_backward_and_optimizer_step():
     }
 
     (
-        trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-        predicted_speed, selected_unit_anchors, neighbour_future_positions,
-    ) = predictor.predict_with_heading(batch)
-    total, _, _, _, _ = loss.prediction_loss(
-        trajectories, heading_cosine_sine, position_log_standard_deviation, confidence_logits,
-        predicted_speed,
-        batch["future_positions"], batch["future_headings"], batch["future_mask"],
-        selected_unit_anchors, 1.0, 1.0, 1.0,
+        round_outputs, selected_unit_anchors, mode_valid,
+        neighbour_future_positions, neighbour_log_standard_deviation,
+    ) = predictor.predict_every_round(batch)
+    total, _, _, _, _ = train.round_summed_prediction_loss(
+        round_outputs, batch, selected_unit_anchors, mode_valid, 1.0, 1.0, 1.0
     )
     total = total + loss.neighbour_future_loss(
-        neighbour_future_positions,
+        neighbour_future_positions, neighbour_log_standard_deviation,
         batch["neighbour_future_positions"],
         batch["neighbour_future_mask"],
         batch["neighbour_history_mask"].any(dim=-1),
@@ -164,6 +166,14 @@ def kernel_train_arguments():
 
 def test_the_kernel_command_line_parses_against_the_real_training_interface(tmp_path):
     literal_arguments, element_count = kernel_train_arguments()
+    for weight_flag in (
+        "--heading-loss-weight", "--classification-loss-weight",
+        "--neighbour-future-loss-weight", "--speed-loss-weight",
+    ):
+        assert weight_flag in literal_arguments, (
+            f"the kernel's train.py line omits {weight_flag}: a loss weight is a stated prior"
+            f" and must be written on the command line, never inherited from a default"
+        )
     flag_arguments = literal_arguments[2:]
     while flag_arguments and not flag_arguments[0].startswith("--"):
         flag_arguments = flag_arguments[1:]
@@ -176,6 +186,7 @@ def test_the_kernel_command_line_parses_against_the_real_training_interface(tmp_
         unit_anchors=np.zeros(
             (contract_module.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2), dtype=np.float32
         ),
+        anchor_counts=np.full(contract_module.NUM_OBJECT_TYPES, model.QUERY_COUNT, dtype=np.int64),
         provenance=contract_module.artifact_provenance("test", "kernel-interface-test"),
     )
 

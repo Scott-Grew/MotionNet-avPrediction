@@ -10,6 +10,7 @@ import torch
 from womd import contract, loader, model
 
 MAXIMUM_ITERATIONS = 2000
+SEED_GENERATOR_SEED = 0
 
 
 def metre_endpoints(scenario_paths):
@@ -72,9 +73,23 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
     return reseeded
 
 
-def fit_unit_anchors(endpoints):
-    seed_scale = float(endpoints.norm(dim=-1).max())
-    centres = model.unit_anchor_offsets() * seed_scale
+def spread_out_seed_centres(endpoints, centre_count, generator):
+    first_seed = int(torch.randint(len(endpoints), (1,), generator=generator))
+    centres = [endpoints[first_seed]]
+    nearest_squared = (endpoints - centres[0]).pow(2).sum(dim=-1)
+    while len(centres) < centre_count:
+        probabilities = nearest_squared / nearest_squared.sum().clamp_min(1e-12)
+        next_seed = int(torch.multinomial(probabilities, 1, generator=generator))
+        centres.append(endpoints[next_seed])
+        nearest_squared = torch.minimum(
+            nearest_squared, (endpoints - centres[-1]).pow(2).sum(dim=-1)
+        )
+    return torch.stack(centres)
+
+
+def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
+    generator = torch.Generator().manual_seed(SEED_GENERATOR_SEED)
+    centres = spread_out_seed_centres(endpoints, centre_count, generator)
     initial_assignment = torch.cdist(endpoints, centres).argmin(dim=1)
     assignment = initial_assignment
     for iteration_count in range(1, MAXIMUM_ITERATIONS + 1):
@@ -93,17 +108,34 @@ def minimum_pairwise_distance(anchors):
     return float(separations.min())
 
 
+def largest_count_kept_apart_by_the_prune(endpoints, type_name):
+    for centre_count in range(model.QUERY_COUNT, contract.NUM_PREDICTED_MODES - 1, -1):
+        fitted = fit_unit_anchors(endpoints, centre_count)
+        separation = minimum_pairwise_distance(fitted[0])
+        print(
+            f"  {type_name}: {centre_count} anchors, minimum pairwise {separation:.3f} m,"
+            f" {'kept apart by' if separation >= model.PRUNE_DISTANCE_METRES else 'inside'}"
+            f" the {model.PRUNE_DISTANCE_METRES} m prune radius"
+        )
+        if separation >= model.PRUNE_DISTANCE_METRES:
+            return centre_count, fitted
+    raise SystemExit(
+        f"{type_name}: even {contract.NUM_PREDICTED_MODES} anchors sit inside the"
+        f" {model.PRUNE_DISTANCE_METRES} m prune radius"
+    )
+
+
 def print_one_type(
-    type_name, type_sample_count, fitted_anchors, fitted_counts, fan_counts,
-    seed_scale, iteration_count, stopped_by_convergence,
+    type_name, type_sample_count, fitted_anchors, fitted_counts,
+    iteration_count, stopped_by_convergence,
 ):
     print(
-        f"{type_name} | samples {type_sample_count} | k-means ran {iteration_count} iterations,"
-        f" stopped by "
+        f"{type_name} | samples {type_sample_count} | {len(fitted_anchors)} anchors |"
+        f" k-means ran {iteration_count} iterations, stopped by "
         f"{'an unchanged assignment' if stopped_by_convergence else f'the {MAXIMUM_ITERATIONS} iteration cap'}"
     )
     print(f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}{'angle deg':>11}{'share':>9}")
-    for anchor_index in range(model.QUERY_COUNT):
+    for anchor_index in range(len(fitted_anchors)):
         offset_x, offset_y = fitted_anchors[anchor_index].tolist()
         print(
             f"{anchor_index:>7}{offset_x:>10.3f}{offset_y:>10.3f}"
@@ -111,20 +143,8 @@ def print_one_type(
             f"{math.degrees(math.atan2(offset_y, offset_x)):>11.1f}"
             f"{int(fitted_counts[anchor_index]) / type_sample_count:>9.1%}"
         )
-    print(f"{'':<28}{'geometric fan':>16}{'fitted':>12}")
-    print(
-        f"{'anchors with an endpoint':<28}{int((fan_counts > 0).sum()):>16}"
-        f"{int((fitted_counts > 0).sum()):>12}"
-    )
-    print(
-        f"{'largest single share':<28}{int(fan_counts.max()) / type_sample_count:>16.1%}"
-        f"{int(fitted_counts.max()) / type_sample_count:>12.1%}"
-    )
-    print(
-        f"{'minimum pairwise distance':<28}"
-        f"{minimum_pairwise_distance(model.unit_anchor_offsets() * seed_scale):>16.3f}"
-        f"{minimum_pairwise_distance(fitted_anchors):>12.3f}"
-    )
+    print(f"{'largest single share':<28}{int(fitted_counts.max()) / type_sample_count:>12.1%}")
+    print(f"{'minimum pairwise distance':<28}{minimum_pairwise_distance(fitted_anchors):>12.3f}")
     print()
 
 
@@ -187,7 +207,7 @@ def main():
         if type_sample_count < model.QUERY_COUNT
     ]
     assert not starved_types, (
-        f"{model.QUERY_COUNT} anchors per type need at least {model.QUERY_COUNT} endpoints per"
+        f"a {model.QUERY_COUNT}-anchor search needs at least {model.QUERY_COUNT} endpoints per"
         f" type, but " + ", ".join(starved_types) + f" over {len(endpoints)} endpoints of"
         f" {staged_directory}"
     )
@@ -204,31 +224,33 @@ def main():
     )
     print()
 
-    fitted_anchors_per_type = []
+    unit_anchors = torch.zeros(contract.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2)
+    anchor_counts = torch.zeros(contract.NUM_OBJECT_TYPES, dtype=torch.long)
     for type_index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES):
         type_endpoints = endpoints[predicted_type_index == type_index]
-        (
-            centres, assignment, initial_assignment, iteration_count, stopped_by_convergence
-        ) = fit_unit_anchors(type_endpoints)
-        fitted_counts = endpoints_per_centre(assignment, model.QUERY_COUNT)
+        centre_count, (
+            centres, assignment, _, iteration_count, stopped_by_convergence
+        ) = largest_count_kept_apart_by_the_prune(type_endpoints, type_name)
+        fitted_counts = endpoints_per_centre(assignment, centre_count)
         share_order = torch.argsort(fitted_counts, descending=True, stable=True)
         fitted_anchors = centres[share_order]
-        fitted_anchors_per_type.append(fitted_anchors)
+        unit_anchors[type_index, :centre_count] = fitted_anchors
+        anchor_counts[type_index] = centre_count
         print_one_type(
             type_name, type_endpoints.shape[0], fitted_anchors, fitted_counts[share_order],
-            endpoints_per_centre(initial_assignment, model.QUERY_COUNT),
-            float(type_endpoints.norm(dim=-1).max()), iteration_count, stopped_by_convergence,
+            iteration_count, stopped_by_convergence,
         )
 
-    unit_anchors = torch.stack(fitted_anchors_per_type)
     np.savez(
         output_path,
         unit_anchors=unit_anchors.numpy().astype(np.float32),
+        anchor_counts=anchor_counts.numpy().astype(np.int64),
         provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
     )
     print(
-        f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)},"
-        f" one set per {contract.PREDICTED_OBJECT_TYPES} in that order, most-used anchor first"
+        f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)} padded past each type's"
+        f" count, anchor_counts {anchor_counts.tolist()} per {contract.PREDICTED_OBJECT_TYPES}"
+        f" in that order, most-used anchor first"
     )
 
 

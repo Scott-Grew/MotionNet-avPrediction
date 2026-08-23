@@ -1,8 +1,3 @@
-# > Training-time loader: staged scenario .npz in, per-agent samples out
-# Everything on disk is in the storage frame (self-driving car at origin). A sample re-frames
-# the world around one predicted agent: its history, every other agent (ragged, uncapped),
-# and the map dots inside a speed-stretched crop, all rotated and shifted to that agent's view.
-
 import heapq
 
 import numpy as np
@@ -12,9 +7,6 @@ from womd import contract, frame_ops
 BASE_RADIUS_METRES = 80.0
 STRETCH_GAIN = 0.5
 
-# Crop membership: stretched-forward half-ellipse in the agent's frame. Rear half stays a
-# circle of base_radius; the forward semi-axis is base_radius * forward_stretch, where the
-# stretch grows with current speed - a fast car needs to see far ahead, a stopped one around.
 def inside_crop(agent_frame_points, base_radius, forward_stretch):
     x = agent_frame_points[:, 0]
     y = agent_frame_points[:, 1]
@@ -22,10 +14,6 @@ def inside_crop(agent_frame_points, base_radius, forward_stretch):
     rear = (x / base_radius) ** 2 + (y / base_radius) ** 2 <= 1.0
     return np.where(x > 0.0, forward, rear)
 
-# Which tracks become samples: the three predicted object types, valid at the "now" step.
-# An agent invalid at now has no defined frame to predict from. With designated_targets_only
-# the set narrows further to the agents WOMD itself asks for - training's population since
-# Scott's 2026-08-14 ruling; the whole eligible set stays reachable for comparison.
 def eligible_track_indices(track_rows, track_valid, is_designated_target, designated_targets_only):
     now_valid = track_valid[:, contract.CURRENT_STEP_INDEX]
     predicted_type = track_rows[:, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE][:,
@@ -35,17 +23,12 @@ def eligible_track_indices(track_rows, track_valid, is_designated_target, design
         selected = selected & is_designated_target
     return np.flatnonzero(selected)
 
-# The sample's frame: where the predicted agent sits and faces at "now", read off its stored
-# row. arctan2(sin, cos) recovers the angle from the stored pair - the recovery V6 guards.
 def sample_frame(track_rows, track_index):
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     origin = now_row[contract.AGENT_POSITION]
     heading = np.arctan2(now_row[contract.AGENT_HEADING_SINE], now_row[contract.AGENT_HEADING_COSINE])
     return origin, heading
 
-# Re-frame agent rows into the sample's frame. Three rules for three quantities: positions
-# shift then rotate, velocities rotate only, headings subtract - done through the cos/sin
-# angle-difference identities so the pair never round-trips through an angle.
 def track_rows_to_agent_frame(rows, origin, heading):
     reframed = rows.copy()
     reframed[..., contract.AGENT_POSITION] = frame_ops.positions_to_agent_frame(
@@ -61,14 +44,6 @@ def track_rows_to_agent_frame(rows, origin, heading):
     reframed[..., contract.AGENT_HEADING_SINE] = heading_sine * rotation_cosine - heading_cosine * rotation_sine
     return reframed
 
-# A two-way street puts an oncoming centreline within reach of the agent's own, and it is often the
-# closer of the two: measured over 517 designated targets, 12.6% of them have a nearest lane dot
-# whose direction arrow OPPOSES their heading, at a median 2.57 m against 5.66 m for the nearest
-# agreeing dot. Assigning those agents to the oncoming lane made the lane-following null score
-# 10.37 m against constant velocity's 9.40, and the same rule feeds the model's reachability. The
-# candidate set is therefore the dots that point the agent's way, and the sign of a dot product is
-# not a chosen number. Falling back to every dot when none agree keeps an agent facing across a road
-# assigned to something rather than to nothing.
 def nearest_lane_dot_facing_the_agent_way(lane_dot_rows, agent_distances, agent_heading_cosine_sine):
     faces_the_agent_way = (
         agent_heading_cosine_sine @ lane_dot_rows[:, contract.MAP_DIRECTION].T > 0.0
@@ -243,14 +218,6 @@ def signed_curvature_per_chunk(positions, directions, chunk_index, chunk_count):
     curvatures[:] = totals
     return curvatures
 
-
-# Crop the map to the agent's view, reframe it, and cut the surviving dots into the chunks that
-# become attention tokens: at most contract.MAP_CHUNK_DOTS consecutive dots of one polyline, so a
-# token summarises a bounded stretch of road instead of a whole polyline of any length. Chunking
-# follows the crop, so a polyline that survives in part is cut by its surviving dots. Chunk indices
-# run 0..chunk count - 1 with no gaps, and a chunk's dots stay contiguous in the returned rows.
-# The signal history is per polyline, so every chunk cut from a polyline is handed that polyline's
-# history - the dots never carry it, and the model attaches it after pooling.
 def crop_and_reframe_map(map_rows, dot_polyline_index, polyline_signal_histories,
                          polyline_lane_context, origin, heading, speed):
     agent_frame_positions = frame_ops.positions_to_agent_frame(map_rows[:, contract.MAP_POSITION], origin, heading)
@@ -293,10 +260,6 @@ def with_derived_arrays(scenario_array):
     )
     return scenario_array
 
-# feature_lengths is the ONLY thing tying a dot back to the polyline it came from: the dots are one
-# flat block and the lengths cut it. A staging bug that leaves the two out of step shifts every dot
-# after the first bad polyline onto a neighbour's identity, which the model reads as a plausible map
-# and the loss descends against without any signature at all, so the agreement is checked on read.
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
         scenario_array = {name: scenario_file[name] for name in scenario_file.files}
@@ -374,12 +337,6 @@ def build_sample(scenario_array, track_index):
         "is_object_of_interest": scenario_array["is_object_of_interest"][track_index],
     }
 
-# Only the neighbour and chunk axes are padded to a common width - the chunk signal histories
-# pad on the chunk axis with the zeros an unsignalled chunk already carries. The map dots stay ragged:
-# every sample's dots are concatenated into one flat block, and each dot carries the global
-# chunk slot (sample_index * max_chunks_in_batch + chunk index within the sample) it pools
-# into, so the dot axis never pays for the batch's largest crop. The slot and width keep the
-# names the model reads them under.
 def build_batch(samples):
     batch_size = len(samples)
     max_neighbours = max(sample["neighbour_history"].shape[0] for sample in samples)

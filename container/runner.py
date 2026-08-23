@@ -44,7 +44,6 @@ step_configurations {
 max_predictions: 6
 """
 
-
 def track_row_world_frame_state(track_row, frame_origin, frame_heading):
     positions_world = frame_ops.positions_to_world_frame(
         track_row[:, contract.AGENT_POSITION], frame_origin, frame_heading
@@ -61,7 +60,6 @@ def track_row_world_frame_state(track_row, frame_origin, frame_heading):
         [positions_world, dimensions, heading_world[:, np.newaxis], velocities_world], axis=1
     )
 
-
 def scenario_world_frame_ground_truth(scenario_array):
     track_rows = scenario_array["track_rows"]
     frame_origin = scenario_array["frame_origin"]
@@ -74,13 +72,6 @@ def scenario_world_frame_ground_truth(scenario_array):
     object_types = type_onehots.argmax(axis=-1).astype(np.int64) + 1
     return world_frame_states, scenario_array["track_valid"], object_types
 
-
-# One batch row PER SCENARIO, the shape Waymo's op defines: every agent in the scenario is in the
-# ground truth - overlap_rate checks the predicted trajectories against ALL of them, not only the
-# predicted agents - and prediction_ground_truth_indices maps each prediction to its own agent's
-# row. Scenarios hold different agent and target counts, so both axes are padded to the batch
-# maximum: a padded agent row is all-invalid ground truth, and a padded prediction slot is masked
-# out through prediction_ground_truth_indices_mask.
 def build_motion_metric_tensors(predictions, staged_directory):
     scenario_ids = predictions["scenario_id"]
     track_ids = predictions["track_id"]
@@ -160,7 +151,6 @@ def build_motion_metric_tensors(predictions, staged_directory):
         "scenario_id": np.array(ordered_scenario_ids),
     }
 
-
 def run_score(predictions_path, staged_directory):
     import tensorflow as tf
     from google.protobuf import text_format
@@ -217,10 +207,8 @@ def run_score(predictions_path, staged_directory):
             f" {mean_average_precision[index]:10.4f}"
         )
 
-
 def base_environment():
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-
 
 def generate_container_local_protos(generated_root):
     generated_root.mkdir(parents=True, exist_ok=True)
@@ -237,12 +225,10 @@ def generate_container_local_protos(generated_root):
     (generated_root / "womd_protos").mkdir(parents=True, exist_ok=True)
     (generated_root / "womd_protos" / "__init__.py").touch()
 
-
 def fields_disagree(ours_value, theirs_value):
     if isinstance(ours_value, float) or isinstance(theirs_value, float):
         return abs(ours_value - theirs_value) > FLOATING_POINT_DISAGREEMENT_TOLERANCE
     return ours_value != theirs_value
-
 
 def compare_scenario_fields(scenario_index, ours, theirs, path=""):
     if isinstance(ours, dict):
@@ -266,7 +252,6 @@ def compare_scenario_fields(scenario_index, ours, theirs, path=""):
         print(f"DISAGREEMENT scenario {scenario_index}{path}: ours={ours!r} theirs={theirs!r}")
         return 1
     return 0
-
 
 def run_check_reader(shard_path, sample_count):
     generated_root = Path("/tmp/container_local_protos")
@@ -308,7 +293,6 @@ def run_check_reader(shard_path, sample_count):
         print(f"{disagreement_count} field disagreements across {len(ours_scenarios)} scenarios")
         sys.exit(1)
 
-
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -330,7 +314,6 @@ def main():
         run_score(arguments.predictions_path, arguments.staged_directory)
     elif arguments.command == "check-reader":
         run_check_reader(arguments.shard_path, arguments.sample_count)
-
 
 if __name__ == "__main__":
     main()

@@ -1,27 +1,15 @@
-# > Pure-torch training monitor: minADE / minFDE over the PRUNED 6 modes, and the walk's own health
-# Monitor only - every reported number comes from Waymo's scorer in the container. Counts
-# follow B5's lesson: minADE averages over samples with any valid future step, minFDE over
-# samples whose 8 s endpoint is present - never over batch size.
-# Every sample is selected by MULTIPLYING by its mask rather than indexing with it: indexing has to
-# know how many rows survive, which reads a device tensor on the host and stalls the queue, and the
-# monitor runs on every batch. A sample with no valid future step averages 0/0, so its denominator
-# is clamped to 1 first - it then contributes an exact zero to a sum it is masked out of anyway,
-# and a sample with any valid step divides by its own untouched count.
-# The pruning walk's kept-mode count comes back with the trajectories: a sample that kept fewer than
-# NUM_PREDICTED_MODES modes had the rest backfilled with duplicates, so a backfill rate near 1 means
-# the six emitted futures are one future repeated.
-
 import torch
 
 from womd import contract
 from womd.model import prune_modes_batched_with_kept_count
 
-
-def mean_distance_per_mode(trajectories, future_positions, future_mask):
+def mean_distance_per_mode(trajectories, future_positions, future_mask, mode_valid=None):
     step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
     validity = future_mask.unsqueeze(1).to(step_distances.dtype)
-    return (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
-
+    mean_distances = (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
+    if mode_valid is not None:
+        mean_distances = mean_distances.masked_fill(~mode_valid, float("inf"))
+    return mean_distances
 
 class MetricAccumulator:
     def __init__(self):
@@ -33,9 +21,9 @@ class MetricAccumulator:
         self.backfilled_sample_count = 0
         self.sample_count = 0
 
-    def update(self, trajectories, confidence_logits, future_positions, future_mask):
+    def update(self, trajectories, confidence_logits, future_positions, future_mask, mode_valid=None):
         kept_trajectories, _, kept_mode_count = prune_modes_batched_with_kept_count(
-            trajectories, confidence_logits
+            trajectories, confidence_logits, mode_valid
         )
         distances = (kept_trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
         valid_steps = future_mask.unsqueeze(1)
