@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
 
 from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
@@ -53,9 +54,12 @@ def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designat
 def scheduled_learning_rate(
     completed_steps, warmup_steps, total_steps, decay_steps,
     elapsed_seconds=0.0, budget_seconds=float("inf"), seconds_per_step=None,
+    process_steps=None,
 ):
-    if completed_steps < warmup_steps:
-        return LEARNING_RATE * (completed_steps + 1) / warmup_steps
+    if process_steps is None:
+        process_steps = completed_steps
+    if process_steps < warmup_steps:
+        return LEARNING_RATE * (process_steps + 1) / warmup_steps
     decay_start = max(total_steps - decay_steps, warmup_steps)
     rate_by_steps = LEARNING_RATE
     if completed_steps >= decay_start:
@@ -88,6 +92,82 @@ def round_summed_prediction_loss(
             running + component for running, component in zip(summed, components)
         )
     return summed
+
+class TrainingStep(nn.Module):
+    def __init__(
+        self, predictor, heading_loss_weight, classification_loss_weight,
+        neighbour_future_loss_weight, speed_loss_weight,
+    ):
+        super().__init__()
+        self.predictor = predictor
+        self.heading_loss_weight = heading_loss_weight
+        self.classification_loss_weight = classification_loss_weight
+        self.neighbour_future_loss_weight = neighbour_future_loss_weight
+        self.speed_loss_weight = speed_loss_weight
+
+    def forward(self, batch):
+        (
+            round_outputs, selected_unit_anchors, mode_valid,
+            neighbour_future_positions, neighbour_log_standard_deviation,
+        ) = self.predictor.predict_every_round(batch)
+        total, regression, heading, classification, speed = round_summed_prediction_loss(
+            round_outputs, batch, selected_unit_anchors, mode_valid,
+            self.heading_loss_weight, self.classification_loss_weight, self.speed_loss_weight,
+        )
+        neighbour_future = loss.neighbour_future_loss(
+            neighbour_future_positions, neighbour_log_standard_deviation,
+            batch["neighbour_future_positions"],
+            batch["neighbour_future_mask"],
+            batch["neighbour_history_mask"].any(dim=-1),
+        )
+        total = total + self.neighbour_future_loss_weight * neighbour_future
+        sample_count = batch["agent_history"].shape[0]
+        weight = torch.full((1,), float(sample_count), device=total.device, dtype=torch.float32)
+        trajectories, heading_cosine_sine, _, _, confidence_logits, _ = round_outputs[-1]
+        return {
+            "sample_count": weight,
+            "total": total[None] * weight,
+            "regression": regression[None] * weight,
+            "heading": heading[None] * weight,
+            "classification": classification[None] * weight,
+            "neighbour_future": neighbour_future[None] * weight,
+            "speed": speed[None] * weight,
+            "trajectories": trajectories,
+            "heading_cosine_sine": heading_cosine_sine,
+            "confidence_logits": confidence_logits,
+            "mode_valid": mode_valid,
+        }
+
+
+def combine_step_outputs(outputs):
+    sample_count = outputs["sample_count"].sum()
+    return {
+        name: (value.sum() / sample_count if name in LOSS_COMPONENT_NAMES else value)
+        for name, value in outputs.items()
+    }
+
+
+LOSS_COMPONENT_NAMES = ("total", "regression", "heading", "classification", "neighbour_future", "speed")
+
+
+class SampleSplittingDataParallel(nn.DataParallel):
+    def scatter(self, inputs, kwargs, device_ids):
+        (batch,) = inputs
+        parts = pipeline.split_batch_by_samples(batch, len(device_ids))
+        scattered = [
+            (({name: tensor.to(device_id, non_blocking=True) for name, tensor in part.items()},), {})
+            for part, device_id in zip(parts, device_ids)
+        ]
+        return [pair[0] for pair in scattered], [pair[1] for pair in scattered]
+
+
+def training_step_module(predictor, weights, device):
+    step = TrainingStep(predictor, *weights)
+    device_ids = list(range(torch.cuda.device_count())) if device.type == "cuda" else []
+    if len(device_ids) > 1:
+        return SampleSplittingDataParallel(step, device_ids=device_ids), len(device_ids)
+    return step, 1
+
 
 def checkpoint_state(predictor, optimizer, gradient_scaler, seed, completed_epochs, batch_index):
     return {
@@ -123,14 +203,16 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path.replace(checkpoint_path)
 
 def train_epoch(
-    predictor, optimizer, batches, device, gradient_scaler,
-    heading_loss_weight, classification_loss_weight, neighbour_future_loss_weight,
-    speed_loss_weight,
+    predictor, step_module, optimizer, batches, device, gradient_scaler,
     checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
     completed_steps_before_epoch, warmup_steps, total_optimiser_steps, decay_steps,
     gradient_clip_norm, training_start, stop_after_seconds, process_steps_before_epoch,
 ):
+    step = step_module.module if isinstance(step_module, nn.DataParallel) else step_module
+    heading_loss_weight = step.heading_loss_weight
+    neighbour_future_loss_weight = step.neighbour_future_loss_weight
+    speed_loss_weight = step.speed_loss_weight
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
     loss_sums = {
@@ -155,22 +237,17 @@ def train_epoch(
         step_start = time.perf_counter()
         batch = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
-            (
-                round_outputs, selected_unit_anchors, mode_valid,
-                neighbour_future_positions, neighbour_log_standard_deviation,
-            ) = predictor.predict_every_round(batch)
-            total, regression, heading, classification, speed = round_summed_prediction_loss(
-                round_outputs, batch, selected_unit_anchors, mode_valid,
-                heading_loss_weight, classification_loss_weight, speed_loss_weight,
-            )
-            neighbour_future = loss.neighbour_future_loss(
-                neighbour_future_positions, neighbour_log_standard_deviation,
-                batch["neighbour_future_positions"],
-                batch["neighbour_future_mask"],
-                batch["neighbour_history_mask"].any(dim=-1),
-            )
-            total = total + neighbour_future_loss_weight * neighbour_future
-            trajectories, heading_cosine_sine, _, _, confidence_logits, _ = round_outputs[-1]
+            step_outputs = combine_step_outputs(step_module(batch))
+            total = step_outputs["total"]
+            regression = step_outputs["regression"]
+            heading = step_outputs["heading"]
+            classification = step_outputs["classification"]
+            neighbour_future = step_outputs["neighbour_future"]
+            speed = step_outputs["speed"]
+            trajectories = step_outputs["trajectories"]
+            heading_cosine_sine = step_outputs["heading_cosine_sine"]
+            confidence_logits = step_outputs["confidence_logits"]
+            mode_valid = step_outputs["mode_valid"]
         elapsed_seconds = time.perf_counter() - training_start
         process_steps = process_steps_before_epoch + batch_count
         learning_rate = scheduled_learning_rate(
@@ -178,6 +255,7 @@ def train_epoch(
             total_optimiser_steps, decay_steps,
             elapsed_seconds, stop_after_seconds,
             elapsed_seconds / process_steps if process_steps else None,
+            process_steps,
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
@@ -367,6 +445,15 @@ def main():
         f" anchors per type {anchor_counts.tolist()}",
         flush=True,
     )
+    step_module, device_count = training_step_module(
+        predictor,
+        (
+            arguments.heading_loss_weight, arguments.classification_loss_weight,
+            arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
+        ),
+        device,
+    )
+    print(f"training on {device_count} {device.type} device(s)", flush=True)
     previous_checkpoint_path = arguments.checkpoint_path.with_suffix(
         arguments.checkpoint_path.suffix + ".previous"
     )
@@ -432,9 +519,7 @@ def main():
             not arguments.all_eligible_agents,
         )
         averages, monitor, seconds, stopped_on_the_clock = train_epoch(
-            predictor, optimizer, batches, device, gradient_scaler,
-            arguments.heading_loss_weight, arguments.classification_loss_weight,
-            arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
+            predictor, step_module, optimizer, batches, device, gradient_scaler,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             epoch_index * steps_per_epoch,

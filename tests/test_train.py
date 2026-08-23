@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import train
-from womd import contract, loss, model
+from womd import contract, loss, model, pipeline
 from womd.model import MotionPredictor, unit_anchor_offsets_per_type
 
 
@@ -293,9 +293,12 @@ def test_the_clock_stops_an_epoch_mid_way_and_leaves_a_resumable_checkpoint(tmp_
         "future_mask": torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
     }
     checkpoint_path = tmp_path / "checkpoint.pt"
+    step_module, device_count = train.training_step_module(
+        predictor, (1.0, 1.0, 1.0, 1.0), torch.device("cpu")
+    )
+    assert device_count == 1
     _, _, _, stopped_on_the_clock = train.train_epoch(
-        predictor, optimizer, [batch, batch, batch], torch.device("cpu"), scaler,
-        1.0, 1.0, 1.0, 1.0,
+        predictor, step_module, optimizer, [batch, batch, batch], torch.device("cpu"), scaler,
         checkpoint_path, tmp_path / "checkpoint.pt.previous",
         3600, 2, 0,
         0, 1, 10, 1, float("inf"),
@@ -305,3 +308,41 @@ def test_the_clock_stops_an_epoch_mid_way_and_leaves_a_resumable_checkpoint(tmp_
     checkpoint = model.load_checkpoint_state(checkpoint_path)
     assert checkpoint["completed_epochs"] == 2
     assert checkpoint["batch_index"] == 1
+
+
+def test_splitting_a_batch_by_samples_reproduces_the_whole_batch_step():
+    torch.manual_seed(3)
+    predictor = MotionPredictor(unit_anchor_offsets_per_type()).eval()
+    sample_count = 4
+    chunks = 3
+    dots_per_chunk = 5
+    map_rows = build_synthetic_map_rows(sample_count * chunks * dots_per_chunk)
+    batch = {
+        "agent_history": torch.randn(sample_count, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "agent_history_mask": torch.ones(sample_count, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(sample_count, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(sample_count, 2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_future_positions": torch.randn(sample_count, 2, contract.FUTURE_STEPS, 2),
+        "neighbour_future_mask": torch.ones(sample_count, 2, contract.FUTURE_STEPS, dtype=torch.bool),
+        "agent_signal_history": torch.rand(sample_count, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        "neighbour_signal_history": torch.rand(sample_count, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        "map_rows": map_rows,
+        "map_dot_polyline_slot": torch.arange(sample_count * chunks * dots_per_chunk) // dots_per_chunk,
+        "map_chunk_signal_history": torch.rand(sample_count, chunks, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        "map_chunk_lane_context": torch.randn(sample_count, chunks, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(chunks),
+        "future_positions": torch.randn(sample_count, contract.FUTURE_STEPS, 2),
+        "future_headings": torch.nn.functional.normalize(torch.randn(sample_count, contract.FUTURE_STEPS, 2), dim=-1),
+        "future_mask": torch.ones(sample_count, contract.FUTURE_STEPS, dtype=torch.bool),
+    }
+    step = train.TrainingStep(predictor, 1.0, 1.0, 1.0, 1.0)
+    with torch.no_grad():
+        whole = train.combine_step_outputs(step(batch))
+        parts = [step(part) for part in pipeline.split_batch_by_samples(batch, 2)]
+        gathered = {name: torch.cat([part[name] for part in parts], dim=0) for name in parts[0]}
+        halves = train.combine_step_outputs(gathered)
+    assert [part["agent_history"].shape[0] for part in pipeline.split_batch_by_samples(batch, 2)] == [2, 2]
+    assert torch.allclose(halves["trajectories"], whole["trajectories"], atol=1e-4)
+    assert torch.equal(halves["mode_valid"], whole["mode_valid"])
+    for name in train.LOSS_COMPONENT_NAMES:
+        assert float(halves[name]) == pytest.approx(float(whole[name]), rel=1e-4), name
