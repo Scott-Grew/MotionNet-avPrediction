@@ -177,6 +177,7 @@ POSITION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
 HEADING_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
 LOG_STANDARD_DEVIATION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
 HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
+SPEED_LOG_STANDARD_DEVIATION_CONTROL_VALUES = TRAJECTORY_CONTROL_POINTS
 MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
 HEADING_MAXIMUM_LOG_STANDARD_DEVIATION = math.log(2.0)
@@ -284,7 +285,8 @@ class ModeDecoder(nn.Module):
                 POSITION_CONTROL_VALUES
                 + HEADING_CONTROL_VALUES
                 + LOG_STANDARD_DEVIATION_CONTROL_VALUES
-                + HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES,
+                + HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES
+                + SPEED_LOG_STANDARD_DEVIATION_CONTROL_VALUES,
             ),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
@@ -323,9 +325,13 @@ class ModeDecoder(nn.Module):
         log_standard_deviation_control_points = head_output[
             ..., heading_slice:position_sigma_slice
         ].view(control_shape)
+        heading_sigma_slice = position_sigma_slice + HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES
         heading_log_standard_deviation_control_points = head_output[
-            ..., position_sigma_slice:
+            ..., position_sigma_slice:heading_sigma_slice
         ].view(control_shape)
+        speed_log_standard_deviation_control_points = head_output[
+            ..., heading_sigma_slice:
+        ].view(batch_size, self.query_count, TRAJECTORY_CONTROL_POINTS, 1)
         heading_cosine_sine = (
             torch.matmul(self.curve_basis, heading_control_points)
             + self.heading_at_now.to(head_output.dtype)
@@ -349,9 +355,13 @@ class ModeDecoder(nn.Module):
         predicted_speed = emitted_step_positions.diff(dim=-2).norm(
             dim=-1
         ) / contract.TIMESTEP_SECONDS
+        speed_log_standard_deviation = self.log_standard_deviation_curve(
+            speed_log_standard_deviation_control_points, MAXIMUM_LOG_STANDARD_DEVIATION
+        ).squeeze(-1)
         return (
             anchored_position, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
+            speed_log_standard_deviation,
         )
 
     def map_focus_bias(self, draft_points, map_chunk_centres, token_count):
@@ -594,16 +604,17 @@ class MotionPredictor(nn.Module):
         (
             trajectories, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
+            speed_log_standard_deviation,
         ) = round_outputs[-1]
         return (
             trajectories, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
-            selected_unit_anchors, mode_valid, neighbour_future_positions,
-            neighbour_log_standard_deviation,
+            speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+            neighbour_future_positions, neighbour_log_standard_deviation,
         )
 
     def forward(self, batch):
-        trajectories, _, _, _, confidence_logits, _, _, _, _, _ = self.predict_with_heading(batch)
+        trajectories, _, _, _, confidence_logits, _, _, _, _, _, _ = self.predict_with_heading(batch)
         return trajectories, confidence_logits
 
 def parameter_fingerprint(model_state):

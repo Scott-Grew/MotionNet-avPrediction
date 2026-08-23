@@ -123,7 +123,7 @@ class TrainingStep(nn.Module):
         total = total + self.neighbour_future_loss_weight * neighbour_future
         sample_count = batch["agent_history"].shape[0]
         weight = torch.full((1,), float(sample_count), device=total.device, dtype=torch.float32)
-        trajectories, heading_cosine_sine, _, _, confidence_logits, _ = round_outputs[-1]
+        trajectories, heading_cosine_sine, _, _, confidence_logits, _, _ = round_outputs[-1]
         return {
             "sample_count": weight,
             "total": total[None] * weight,

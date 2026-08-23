@@ -249,7 +249,7 @@ def test_padded_modes_are_never_assigned_kept_or_believed():
     pedestrian_row = contract.PREDICTED_OBJECT_TYPES.index("TYPE_PEDESTRIAN")
     with torch.no_grad():
         (
-            trajectories, _, _, _, confidence_logits, _, selected_unit_anchors, mode_valid, _, _,
+            trajectories, _, _, _, confidence_logits, _, _, selected_unit_anchors, mode_valid, _, _,
         ) = predictor.predict_with_heading(batch)
     valid_count = int(anchor_counts[pedestrian_row])
     assert mode_valid[pedestrian_row].tolist() == [True] * valid_count + [False] * (
@@ -967,7 +967,7 @@ def test_two_agents_alike_but_for_their_object_type_get_their_own_types_anchor_s
 
     with torch.no_grad():
         (
-            trajectories, _, _, _, _, _, selected_unit_anchors, _, _, _,
+            trajectories, _, _, _, _, _, _, selected_unit_anchors, _, _, _,
         ) = predictor.predict_with_heading(batch)
     endpoints = trajectories[:, :, -1]
 
@@ -1045,8 +1045,8 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     (
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        selected_unit_anchors, mode_valid, neighbour_future_positions,
-        neighbour_log_standard_deviation,
+        speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+        neighbour_future_positions, neighbour_log_standard_deviation,
     ) = predictor.predict_with_heading(batch)
     assert neighbour_future_positions.shape == (
         batch["neighbour_future_positions"].shape[:2] + (contract.FUTURE_STEPS, 2)
@@ -1057,6 +1057,7 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
+        speed_log_standard_deviation,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
         selected_unit_anchors, 1.0, 1.0, 1.0, mode_valid,
     )
@@ -1276,7 +1277,7 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
             trajectories, heading_cosine_sine,
             torch.full_like(trajectories, log_standard_deviation),
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed,
+            predicted_speed, torch.zeros_like(predicted_speed),
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1335,7 +1336,7 @@ def test_predicted_speed_carries_the_anchor_motion_the_emitted_trajectory_carrie
         decoder.trajectory_head[-1].bias.zero_()
         normed_tokens = decoder.scene_norm(torch.randn(2, 7, model.HIDDEN_DIM))
         token_present = torch.ones(2, 7, dtype=torch.bool)
-        anchored_position, _, _, _, _, predicted_speed = decoder.decode_from_anchors(
+        anchored_position, _, _, _, _, predicted_speed, _ = decoder.decode_from_anchors(
             normed_tokens, token_present,
             anchor_endpoint.expand(2, model.QUERY_COUNT, 2),
             torch.ones(2, model.QUERY_COUNT, dtype=torch.bool), 2,
@@ -1380,7 +1381,7 @@ def test_heading_term_is_the_gaussian_negative_log_likelihood_on_the_unit_pair()
         _, _, heading, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, log_standard_deviation,
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed,
+            predicted_speed, torch.zeros_like(predicted_speed),
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1436,13 +1437,14 @@ def test_classification_is_softmax_cross_entropy_on_the_assigned_mode():
         trajectories, heading_cosine_sine, torch.zeros_like(trajectories),
         torch.zeros_like(trajectories), confidence_logits,
         torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS),
+        torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS),
         future_positions, future_headings, future_mask,
         unit_anchors, 1.0, 1.0, 1.0,
     )
     assert float(classification) == pytest.approx(math.log(model.QUERY_COUNT), rel=1e-5)
 
 
-def test_speed_term_is_gaussian_nll_at_the_measured_velocity_scale():
+def test_speed_term_is_gaussian_nll_at_the_emitted_speed_sigma():
     sample_count = 2
     step_speed = contract.VELOCITY_NORMALISER_METRES_PER_SECOND
     future_positions = torch.zeros(sample_count, contract.FUTURE_STEPS, 2)
@@ -1465,7 +1467,8 @@ def test_speed_term_is_gaussian_nll_at_the_measured_velocity_scale():
         _, _, _, _, speed = loss.prediction_loss(
             trajectories, heading_cosine_sine, torch.zeros_like(trajectories),
             torch.zeros_like(trajectories), torch.zeros(sample_count, model.QUERY_COUNT),
-            predicted_speed, future_positions, future_headings, future_mask,
+            predicted_speed, torch.full_like(predicted_speed, math.log(step_speed)),
+            future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
         return float(speed)
@@ -1536,6 +1539,7 @@ EMITTED_QUANTITY_NAMES = (
     "heading_log_standard_deviation",
     "confidence_logits",
     "predicted_speed",
+    "speed_log_standard_deviation",
     "selected_unit_anchors",
     "mode_valid",
     "neighbour_future_positions",
@@ -1551,12 +1555,13 @@ def combined_training_loss(emitted_quantities, batch):
     (
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        selected_unit_anchors, mode_valid, neighbour_future_positions,
-        neighbour_log_standard_deviation,
+        speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+        neighbour_future_positions, neighbour_log_standard_deviation,
     ) = emitted_quantities
     total, _, _, _, _ = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
+        speed_log_standard_deviation,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
         selected_unit_anchors, 1.0, 1.0, 1.0, mode_valid,
     )
@@ -1591,6 +1596,7 @@ def test_every_quantity_the_model_emits_is_pinned_by_the_loss_that_trains_it():
             [value[..., :1] + 1.0, value[..., 1:]], dim=-1
         ),
         "predicted_speed": lambda value: value + 1.0,
+        "speed_log_standard_deviation": lambda value: value + 1.0,
         "selected_unit_anchors": lambda value: -value,
         "mode_valid": lambda value: torch.zeros_like(value),
         "neighbour_future_positions": lambda value: value + 1.0,
@@ -1668,7 +1674,7 @@ def test_the_position_likelihood_never_reads_the_predicted_heading():
         _, regression, heading, _, _ = loss.prediction_loss(
             trajectories, predicted_pair, position_log_standard_deviation,
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed,
+            predicted_speed, torch.zeros_like(predicted_speed),
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1691,7 +1697,7 @@ def test_no_step_uncertainty_starts_saturated_and_both_axes_start_carrying_sprea
     with torch.no_grad():
         (
             _, _, position_log_standard_deviation, heading_log_standard_deviation,
-            _, _, _, _, _, _,
+            _, _, _, _, _, _, _,
         ) = predictor.predict_with_heading(batch)
 
     saturated_low = position_log_standard_deviation == model.MINIMUM_LOG_STANDARD_DEVIATION
@@ -1727,12 +1733,14 @@ def test_v2_a_masked_future_step_moves_no_term_of_the_prediction_loss():
     heading_log_standard_deviation = torch.randn_like(trajectories)
     confidence_logits = torch.randn(sample_count, model.QUERY_COUNT)
     predicted_speed = torch.rand(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS)
+    speed_log_standard_deviation = torch.randn_like(predicted_speed)
     unit_anchors = model.unit_anchor_offsets().expand(sample_count, -1, -1) * 40.0
 
     def loss_components(logged_positions, logged_headings, predicted_positions, predicted_speeds):
         return torch.stack(loss.prediction_loss(
             predicted_positions, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speeds,
+            speed_log_standard_deviation,
             logged_positions, logged_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         ))
@@ -1929,7 +1937,7 @@ def test_untrained_modes_are_finite_and_not_the_same_point():
     predictor = model.MotionPredictor(model.unit_anchor_offsets_per_type()).eval()
     batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 2, 2, 10)
     with torch.no_grad():
-        trajectories, heading_cosine_sine, _, _, _, predicted_speed, _, _, _, _ = (
+        trajectories, heading_cosine_sine, _, _, _, predicted_speed, _, _, _, _, _ = (
             predictor.predict_with_heading(batch)
         )
     assert trajectories.isfinite().all()
@@ -1964,10 +1972,11 @@ def test_autocast_forward_keeps_every_likelihood_input_in_float32_and_steps_stay
                 neighbour_future_positions, neighbour_log_standard_deviation,
             ) = predictor.predict_every_round(batch)
             for round_output in round_outputs:
-                trajectories, _, position_log_standard_deviation, heading_log_standard_deviation, _, _ = round_output
+                trajectories, _, position_log_standard_deviation, heading_log_standard_deviation, _, _, speed_log_standard_deviation = round_output
                 assert trajectories.dtype == torch.float32
                 assert position_log_standard_deviation.dtype == torch.float32
                 assert heading_log_standard_deviation.dtype == torch.float32
+                assert speed_log_standard_deviation.dtype == torch.float32
             assert neighbour_future_positions.dtype == torch.float32
             total, *_ = train.round_summed_prediction_loss(
                 round_outputs, batch, selected_unit_anchors, mode_valid,
@@ -2003,14 +2012,17 @@ def test_a_zeroed_head_emits_the_known_now_boundary_heading_straight_ahead_at_th
             torch.ones(2, 5, dtype=torch.bool),
             torch.zeros(2, dtype=torch.long),
         )
-    _, heading_cosine_sine, position_log_standard_deviation, heading_log_standard_deviation, _, _ = (
+    _, heading_cosine_sine, position_log_standard_deviation, heading_log_standard_deviation, _, _, speed_log_standard_deviation = (
         round_outputs[-1]
     )
     assert torch.allclose(
         heading_cosine_sine, torch.tensor(model.HEADING_AT_NOW).expand_as(heading_cosine_sine)
     )
     first_step_weight = (1.0 - 1.0 / contract.FUTURE_STEPS) ** model.TRAJECTORY_CONTROL_POINTS
-    for log_standard_deviation in (position_log_standard_deviation, heading_log_standard_deviation):
+    for log_standard_deviation in (
+        position_log_standard_deviation, heading_log_standard_deviation,
+        speed_log_standard_deviation[..., None],
+    ):
         assert float(log_standard_deviation[..., 0, :].min()) == pytest.approx(
             model.MINIMUM_LOG_STANDARD_DEVIATION * first_step_weight, rel=1e-5
         )
@@ -2026,7 +2038,7 @@ def test_neighbour_futures_are_displacements_from_the_neighbours_last_seen_posit
     with torch.no_grad():
         predictor.neighbour_future_head.network[-1].weight.zero_()
         predictor.neighbour_future_head.network[-1].bias.zero_()
-        _, _, _, _, _, _, _, _, neighbour_future_positions, _ = predictor.predict_with_heading(batch)
+        _, _, _, _, _, _, _, _, _, neighbour_future_positions, _ = predictor.predict_with_heading(batch)
     now_positions = batch["neighbour_history"][:, :, contract.CURRENT_STEP_INDEX, contract.AGENT_POSITION]
     last_seen_positions = batch["neighbour_history"][
         :, :, contract.CURRENT_STEP_INDEX - 3, contract.AGENT_POSITION

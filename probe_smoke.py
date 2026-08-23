@@ -66,7 +66,7 @@ def main():
             )
             (
                 trajectories, heading_cosine_sine, position_log_standard_deviation,
-                heading_log_standard_deviation, confidence_logits, predicted_speed,
+                heading_log_standard_deviation, confidence_logits, predicted_speed, _,
             ) = round_outputs[-1]
             neighbour_future = loss.neighbour_future_loss(
                 neighbour_future_positions, neighbour_log_standard_deviation,

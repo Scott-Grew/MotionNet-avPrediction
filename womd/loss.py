@@ -39,7 +39,7 @@ def gaussian_negative_log_likelihood(predicted_mean, log_standard_deviation, tar
 def prediction_loss(
     trajectories, heading_cosine_sine, position_log_standard_deviation,
     heading_log_standard_deviation, confidence_logits,
-    predicted_speed,
+    predicted_speed, speed_log_standard_deviation,
     future_positions, future_headings, future_mask,
     selected_unit_anchors,
     heading_loss_weight, classification_loss_weight, speed_loss_weight,
@@ -77,17 +77,18 @@ def prediction_loss(
         * scoreable
     ).sum() / scoreable_count
 
-    assigned_mode_speed = predicted_speed.gather(
-        1, assigned_mode[:, None, None].expand(-1, -1, contract.FUTURE_STEPS)
+    mode_selector = assigned_mode[:, None, None].expand(-1, -1, contract.FUTURE_STEPS)
+    assigned_mode_speed = predicted_speed.gather(1, mode_selector).squeeze(1)
+    assigned_mode_speed_log_standard_deviation = speed_log_standard_deviation.gather(
+        1, mode_selector
     ).squeeze(1)
     logged_speed, valid_speed_step = logged_speed_per_step(future_positions, future_mask)
     valid_speed_step = valid_speed_step.to(assigned_mode_speed.dtype)
-    speed_log_standard_deviation = math.log(contract.VELOCITY_NORMALISER_METRES_PER_SECOND)
     step_speed_nll = (
-        speed_log_standard_deviation
+        assigned_mode_speed_log_standard_deviation
         + 0.5 * (
             (assigned_mode_speed - logged_speed)
-            / contract.VELOCITY_NORMALISER_METRES_PER_SECOND
+            / assigned_mode_speed_log_standard_deviation.exp()
         ) ** 2
         + HALF_LOG_TWO_PI
     )
