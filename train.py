@@ -50,13 +50,26 @@ def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designat
         steps += math.ceil(stream_sample_count / batch_size)
     return steps
 
-def scheduled_learning_rate(completed_steps, warmup_steps, total_steps, decay_steps):
+def scheduled_learning_rate(
+    completed_steps, warmup_steps, total_steps, decay_steps,
+    elapsed_seconds=0.0, budget_seconds=float("inf"), seconds_per_step=None,
+):
     if completed_steps < warmup_steps:
         return LEARNING_RATE * (completed_steps + 1) / warmup_steps
     decay_start = max(total_steps - decay_steps, warmup_steps)
-    if completed_steps < decay_start:
-        return LEARNING_RATE
-    return LEARNING_RATE * max(total_steps - completed_steps, 0) / max(total_steps - decay_start, 1)
+    rate_by_steps = LEARNING_RATE
+    if completed_steps >= decay_start:
+        rate_by_steps = LEARNING_RATE * max(total_steps - completed_steps, 0) / max(
+            total_steps - decay_start, 1
+        )
+    rate_by_clock = LEARNING_RATE
+    if seconds_per_step is not None and math.isfinite(budget_seconds):
+        decay_window_seconds = decay_steps * seconds_per_step
+        remaining_seconds = budget_seconds - elapsed_seconds
+        rate_by_clock = LEARNING_RATE * min(
+            max(remaining_seconds / max(decay_window_seconds, 1e-9), 0.0), 1.0
+        )
+    return min(rate_by_steps, rate_by_clock)
 
 def round_summed_prediction_loss(
     round_outputs, batch, selected_unit_anchors, mode_valid,
@@ -116,7 +129,7 @@ def train_epoch(
     checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
     completed_steps_before_epoch, warmup_steps, total_optimiser_steps, decay_steps,
-    gradient_clip_norm,
+    gradient_clip_norm, training_start, stop_after_seconds, process_steps_before_epoch,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
@@ -158,9 +171,13 @@ def train_epoch(
             )
             total = total + neighbour_future_loss_weight * neighbour_future
             trajectories, heading_cosine_sine, _, _, confidence_logits, _ = round_outputs[-1]
+        elapsed_seconds = time.perf_counter() - training_start
+        process_steps = process_steps_before_epoch + batch_count
         learning_rate = scheduled_learning_rate(
             completed_steps_before_epoch + batch_count, warmup_steps,
             total_optimiser_steps, decay_steps,
+            elapsed_seconds, stop_after_seconds,
+            elapsed_seconds / process_steps if process_steps else None,
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
@@ -283,9 +300,24 @@ def train_epoch(
                     flush=True,
                 )
             checkpoint_wait_start = time.perf_counter()
+        if time.perf_counter() - training_start >= stop_after_seconds:
+            if math.isfinite(component_values["total"]):
+                save_checkpoint(
+                    checkpoint_path, previous_checkpoint_path,
+                    checkpoint_state(predictor, optimizer, gradient_scaler, seed, epoch_index, batch_count),
+                )
+            print(
+                f"STOPPING ON THE CLOCK: {(time.perf_counter() - training_start) / 3600:.2f} h"
+                f" elapsed against a --stop-after-seconds budget of {stop_after_seconds / 3600:.2f} h,"
+                f" {batch_count} batches into epoch {epoch_index + 1} at learning rate"
+                f" {learning_rate:.3e}; {checkpoint_path} holds this point.",
+                flush=True,
+            )
+            averages = {name: value / max(batch_count, 1) for name, value in loss_sums.items()}
+            return averages, accumulator.results(), seconds, True
         wait_start = time.perf_counter()
     averages = {name: value / max(batch_count, 1) for name, value in loss_sums.items()}
-    return averages, accumulator.results(), seconds
+    return averages, accumulator.results(), seconds, False
 
 def main():
     parser = argparse.ArgumentParser()
@@ -330,7 +362,8 @@ def main():
         f"{steps_per_epoch} optimiser steps per epoch,"
         f" {total_optimiser_steps} over {arguments.epochs} epochs,"
         f" peak learning rate {LEARNING_RATE} after {arguments.warmup_steps} warmup steps,"
-        f" linear decay to zero over the last {decay_steps} steps,"
+        f" linear decay to zero over the last {decay_steps} steps or the last"
+        f" {decay_steps} steps' worth of the --stop-after-seconds budget, whichever comes first,"
         f" anchors per type {anchor_counts.tolist()}",
         flush=True,
     )
@@ -391,13 +424,14 @@ def main():
             f" trains.",
             flush=True,
         )
+    process_steps_before_epoch = 0
     for epoch_index in remaining_epochs:
         batches = pipeline.batches(
             scenario_paths, arguments.workers, arguments.batch_size,
             arguments.prefetch, arguments.seed + epoch_index,
             not arguments.all_eligible_agents,
         )
-        averages, monitor, seconds = train_epoch(
+        averages, monitor, seconds, stopped_on_the_clock = train_epoch(
             predictor, optimizer, batches, device, gradient_scaler,
             arguments.heading_loss_weight, arguments.classification_loss_weight,
             arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
@@ -406,7 +440,11 @@ def main():
             epoch_index * steps_per_epoch,
             arguments.warmup_steps, total_optimiser_steps, decay_steps,
             arguments.gradient_clip_norm,
+            training_start, arguments.stop_after_seconds, process_steps_before_epoch,
         )
+        process_steps_before_epoch += steps_per_epoch
+        if stopped_on_the_clock:
+            return
         print(
             f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"

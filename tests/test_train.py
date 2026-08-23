@@ -39,6 +39,27 @@ def test_warmup_rises_to_the_learning_rate_holds_it_then_decays_linearly_to_zero
     assert rates[total_steps - 1] == pytest.approx(train.LEARNING_RATE / decay_steps)
     assert rates[total_steps] == 0.0
 
+    mid_run_step = warmup_steps + 10
+    seconds_per_step = 2.0
+    budget_seconds = 1000.0
+    clock_window_seconds = decay_steps * seconds_per_step
+    assert train.scheduled_learning_rate(
+        mid_run_step, warmup_steps, total_steps, decay_steps,
+        budget_seconds - clock_window_seconds - 1.0, budget_seconds, seconds_per_step,
+    ) == train.LEARNING_RATE
+    assert train.scheduled_learning_rate(
+        mid_run_step, warmup_steps, total_steps, decay_steps,
+        budget_seconds - 0.5 * clock_window_seconds, budget_seconds, seconds_per_step,
+    ) == pytest.approx(0.5 * train.LEARNING_RATE)
+    assert train.scheduled_learning_rate(
+        mid_run_step, warmup_steps, total_steps, decay_steps,
+        budget_seconds, budget_seconds, seconds_per_step,
+    ) == 0.0
+    assert train.scheduled_learning_rate(
+        total_steps - 1, warmup_steps, total_steps, decay_steps,
+        0.0, budget_seconds, seconds_per_step,
+    ) == pytest.approx(train.LEARNING_RATE / decay_steps)
+
 
 def test_resuming_retrains_the_interrupted_epoch_and_never_skips_a_completed_one():
     predictor = torch.nn.Linear(1, 1)
@@ -237,3 +258,50 @@ def test_the_kernel_command_line_parses_against_the_real_training_interface(tmp_
                 f"the kernel's train.py command line does not parse:"
                 f" {error_output.getvalue()}"
             ) from parse_failure
+
+
+def test_the_clock_stops_an_epoch_mid_way_and_leaves_a_resumable_checkpoint(tmp_path):
+    import time
+    torch.manual_seed(1)
+    predictor = MotionPredictor(unit_anchor_offsets_per_type())
+    optimizer = torch.optim.AdamW(train.parameter_groups(predictor), lr=train.LEARNING_RATE)
+    scaler = train.GradScaler(enabled=False)
+    batch = {
+        "agent_history": torch.randn(2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "agent_history_mask": torch.ones(2, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_history": torch.randn(2, 3, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
+        "neighbour_history_mask": torch.ones(2, 3, contract.HISTORY_STEPS, dtype=torch.bool),
+        "neighbour_future_positions": torch.randn(2, 3, contract.FUTURE_STEPS, 2),
+        "neighbour_future_mask": torch.ones(2, 3, contract.FUTURE_STEPS, dtype=torch.bool),
+        "agent_signal_history": torch.zeros(
+            2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "neighbour_signal_history": torch.zeros(
+            2, 3, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_rows": build_synthetic_map_rows(20),
+        "map_dot_polyline_slot": torch.arange(20) // 5,
+        "map_chunk_signal_history": torch.zeros(
+            2, 4, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
+        ),
+        "map_chunk_lane_context": torch.randn(2, 4, contract.LANE_CONTEXT_DIM),
+        "max_polylines_in_batch": torch.tensor(4),
+        "future_positions": torch.randn(2, contract.FUTURE_STEPS, 2),
+        "future_headings": torch.nn.functional.normalize(
+            torch.randn(2, contract.FUTURE_STEPS, 2), dim=-1
+        ),
+        "future_mask": torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
+    }
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    _, _, _, stopped_on_the_clock = train.train_epoch(
+        predictor, optimizer, [batch, batch, batch], torch.device("cpu"), scaler,
+        1.0, 1.0, 1.0, 1.0,
+        checkpoint_path, tmp_path / "checkpoint.pt.previous",
+        3600, 2, 0,
+        0, 1, 10, 1, float("inf"),
+        time.perf_counter(), 0.0, 0,
+    )
+    assert stopped_on_the_clock
+    checkpoint = model.load_checkpoint_state(checkpoint_path)
+    assert checkpoint["completed_epochs"] == 2
+    assert checkpoint["batch_index"] == 1
