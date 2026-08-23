@@ -443,10 +443,9 @@ def main():
             training_start, arguments.stop_after_seconds, process_steps_before_epoch,
         )
         process_steps_before_epoch += steps_per_epoch
-        if stopped_on_the_clock:
-            return
         print(
-            f"epoch {epoch_index + 1}/{arguments.epochs} | "
+            f"epoch {epoch_index + 1}/{arguments.epochs}"
+            f"{' (partial, stopped on the clock)' if stopped_on_the_clock else ''} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
             f" + hdg {averages['heading']:.4f}"
             f" + cls {averages['classification']:.4f}"
@@ -460,6 +459,8 @@ def main():
             f" · monitor {seconds['monitor']:.0f} s",
             flush=True,
         )
+        if stopped_on_the_clock:
+            return
         if not math.isfinite(averages["total"]):
             print(
                 f"epoch {epoch_index + 1} mean total loss {averages['total']},"
