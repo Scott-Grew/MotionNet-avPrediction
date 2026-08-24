@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from womd import baseline, contract, model, pipeline
+from womd import baseline, model, pipeline
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "derivation"))
 from plot_run_report import (

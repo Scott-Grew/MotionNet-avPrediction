@@ -97,17 +97,12 @@ class MultiHeadAttention(nn.Module):
         per_head = HIDDEN_DIM // ATTENTION_HEAD_COUNT
         return projected.view(batch_size, token_count, ATTENTION_HEAD_COUNT, per_head).transpose(1, 2)
 
-    def forward(self, query_tokens, key_value_tokens, key_present, additive_bias=None):
+    def forward(self, query_tokens, key_value_tokens, key_present):
         queries = self.split_heads(self.query_projection(query_tokens))
         keys = self.split_heads(self.key_projection(key_value_tokens))
         values = self.split_heads(self.value_projection(key_value_tokens))
-        readable = key_present[:, None, None, :]
-        if additive_bias is None:
-            attention_mask = readable
-        else:
-            attention_mask = additive_bias.to(queries.dtype).masked_fill(~readable, float("-inf"))
         attended = nn.functional.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=attention_mask
+            queries, keys, values, attn_mask=key_present[:, None, None, :]
         )
         merged = attended.transpose(1, 2).flatten(start_dim=-2)
         return self.output_projection(merged)
@@ -172,30 +167,14 @@ ANCHOR_DIRECTION_COUNT = 9
 ANCHOR_DISTANCE_COUNT = 6
 assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
 DECODER_ROUNDS = 3
-TRAJECTORY_CONTROL_POINTS = 3
-POSITION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
-HEADING_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
-LOG_STANDARD_DEVIATION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
-HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES = 2 * TRAJECTORY_CONTROL_POINTS
-SPEED_LOG_STANDARD_DEVIATION_CONTROL_VALUES = TRAJECTORY_CONTROL_POINTS
+TRAJECTORY_QUANTITIES = (
+    "step_offsets", "heading_offsets",
+    "position_log_standard_deviation", "heading_log_standard_deviation",
+)
 MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
 HEADING_MAXIMUM_LOG_STANDARD_DEVIATION = math.log(2.0)
 HEADING_AT_NOW = (1.0, 0.0)
-
-def bernstein_curve_basis(control_point_count, step_count):
-    time_fraction = torch.arange(1, step_count + 1, dtype=torch.float32) / step_count
-    control_indices = torch.arange(control_point_count + 1, dtype=torch.float32)
-    log_binomial_coefficients = (
-        torch.lgamma(torch.tensor(control_point_count + 1.0))
-        - torch.lgamma(control_indices + 1.0)
-        - torch.lgamma(control_point_count - control_indices + 1.0)
-    )
-    return (
-        log_binomial_coefficients.exp()
-        * time_fraction[:, None] ** control_indices
-        * (1.0 - time_fraction[:, None]) ** (control_point_count - control_indices)
-    )
 
 def unit_anchor_offsets():
     direction_indices = torch.arange(ANCHOR_DIRECTION_COUNT).repeat_interleave(ANCHOR_DISTANCE_COUNT)
@@ -217,19 +196,6 @@ def agent_reachable_distance(agent_history):
         current_speed * contract.FUTURE_HORIZON_SECONDS
         + 0.5 * contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED * contract.FUTURE_HORIZON_SECONDS ** 2
     )
-
-def map_chunk_centres(map_rows, dot_polyline_slot, batch_size, max_polylines):
-    positions = map_rows[:, contract.MAP_POSITION].float()
-    sums = torch.zeros(batch_size * max_polylines, 2, device=positions.device)
-    counts = torch.zeros(batch_size * max_polylines, device=positions.device)
-    sums.index_add_(0, dot_polyline_slot, positions)
-    counts.index_add_(0, dot_polyline_slot, torch.ones_like(positions[:, 0]))
-    centres = sums / counts.clamp_min(1.0).unsqueeze(-1)
-    return centres.view(batch_size, max_polylines, 2)
-
-def draft_to_chunk_distances(draft_points, chunk_centres):
-    offsets = draft_points[:, :, None, :, :] - chunk_centres[:, None, :, None, :]
-    return offsets.norm(dim=-1).min(dim=-1).values
 
 def full_anchor_counts(query_count):
     return torch.full((contract.NUM_OBJECT_TYPES,), query_count, dtype=torch.long)
@@ -268,31 +234,18 @@ class ModeDecoder(nn.Module):
         self.register_buffer("anchor_counts", anchor_counts)
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.round_self_norms = nn.ModuleList(nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS))
-        self.round_self_attention = nn.ModuleList(MultiHeadAttention() for _ in range(DECODER_ROUNDS))
         self.round_norms = nn.ModuleList(nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS))
         self.round_attention = nn.ModuleList(MultiHeadAttention() for _ in range(DECODER_ROUNDS))
         self.draft_projection = nn.Linear(2, HIDDEN_DIM, bias=False)
-        self.map_focus_scale = nn.Parameter(torch.zeros(ATTENTION_HEAD_COUNT))
-        self.register_buffer(
-            "draft_step_indices", torch.tensor(contract.SUBMISSION_FUTURE_INDICES), persistent=False
-        )
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
             nn.Linear(
                 FEEDFORWARD_DIM,
-                POSITION_CONTROL_VALUES
-                + HEADING_CONTROL_VALUES
-                + LOG_STANDARD_DEVIATION_CONTROL_VALUES
-                + HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES
-                + SPEED_LOG_STANDARD_DEVIATION_CONTROL_VALUES,
+                len(TRAJECTORY_QUANTITIES) * contract.FUTURE_STEPS * 2,
             ),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
-        full_basis = bernstein_curve_basis(TRAJECTORY_CONTROL_POINTS, contract.FUTURE_STEPS)
-        self.register_buffer("curve_basis", full_basis[:, 1:], persistent=False)
-        self.register_buffer("curve_start_weight", full_basis[:, 0], persistent=False)
         self.register_buffer(
             "anchor_ramp",
             torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32)
@@ -305,49 +258,26 @@ class ModeDecoder(nn.Module):
     def unit_anchors(self):
         return self.anchor_offsets
 
-    def log_standard_deviation_curve(self, control_points, ceiling):
-        started_at_the_floor = (
-            MINIMUM_LOG_STANDARD_DEVIATION * self.curve_start_weight[None, None, :, None]
-        )
-        return (
-            started_at_the_floor + torch.matmul(self.curve_basis, control_points)
-        ).clamp(MINIMUM_LOG_STANDARD_DEVIATION, ceiling)
-
     def emit(self, queries, unit_anchors, mode_valid, batch_size):
-        head_output = self.trajectory_head(queries)
-        heading_slice = POSITION_CONTROL_VALUES + HEADING_CONTROL_VALUES
-        position_sigma_slice = heading_slice + LOG_STANDARD_DEVIATION_CONTROL_VALUES
-        control_shape = (batch_size, self.query_count, TRAJECTORY_CONTROL_POINTS, 2)
-        control_points = head_output[..., :POSITION_CONTROL_VALUES].view(control_shape)
-        heading_control_points = head_output[..., POSITION_CONTROL_VALUES:heading_slice].view(
-            control_shape
+        head_output = self.trajectory_head(queries).float().view(
+            batch_size, self.query_count, len(TRAJECTORY_QUANTITIES), contract.FUTURE_STEPS, 2
         )
-        log_standard_deviation_control_points = head_output[
-            ..., heading_slice:position_sigma_slice
-        ].view(control_shape)
-        heading_sigma_slice = position_sigma_slice + HEADING_LOG_STANDARD_DEVIATION_CONTROL_VALUES
-        heading_log_standard_deviation_control_points = head_output[
-            ..., position_sigma_slice:heading_sigma_slice
-        ].view(control_shape)
-        speed_log_standard_deviation_control_points = head_output[
-            ..., heading_sigma_slice:
-        ].view(batch_size, self.query_count, TRAJECTORY_CONTROL_POINTS, 1)
-        heading_cosine_sine = (
-            torch.matmul(self.curve_basis, heading_control_points)
-            + self.heading_at_now.to(head_output.dtype)
+        (
+            step_offsets, heading_offsets,
+            position_log_standard_deviation, heading_log_standard_deviation,
+        ) = head_output.unbind(dim=2)
+        heading_cosine_sine = heading_offsets + self.heading_at_now.to(head_output.dtype)
+        position_log_standard_deviation = position_log_standard_deviation.clamp(
+            MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
         )
-        position_log_standard_deviation = self.log_standard_deviation_curve(
-            log_standard_deviation_control_points, MAXIMUM_LOG_STANDARD_DEVIATION
-        )
-        heading_log_standard_deviation = self.log_standard_deviation_curve(
-            heading_log_standard_deviation_control_points, HEADING_MAXIMUM_LOG_STANDARD_DEVIATION
+        heading_log_standard_deviation = heading_log_standard_deviation.clamp(
+            MINIMUM_LOG_STANDARD_DEVIATION, HEADING_MAXIMUM_LOG_STANDARD_DEVIATION
         )
         confidence_logits = self.confidence_head(queries).squeeze(-1).masked_fill(
             ~mode_valid, float("-inf")
         )
         anchored_position = (
-            torch.matmul(self.curve_basis, control_points)
-            + unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
+            step_offsets + unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
         )
         emitted_step_positions = torch.cat(
             [torch.zeros_like(anchored_position[..., :1, :]), anchored_position], dim=-2
@@ -355,48 +285,21 @@ class ModeDecoder(nn.Module):
         predicted_speed = emitted_step_positions.diff(dim=-2).norm(
             dim=-1
         ) / contract.TIMESTEP_SECONDS
-        speed_log_standard_deviation = self.log_standard_deviation_curve(
-            speed_log_standard_deviation_control_points, MAXIMUM_LOG_STANDARD_DEVIATION
-        ).squeeze(-1)
         return (
             anchored_position, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
-            speed_log_standard_deviation,
         )
-
-    def map_focus_bias(self, draft_points, map_chunk_centres, token_count):
-        if map_chunk_centres is None:
-            return None
-        with torch.no_grad():
-            distances = draft_to_chunk_distances(draft_points.detach().float(), map_chunk_centres)
-        focus = nn.functional.softplus(self.map_focus_scale)
-        map_bias = -focus[None, :, None, None] * (
-            distances[:, None, :, :] / contract.DISTANCE_NORMALISER_METRES
-        )
-        batch_size, query_count, chunk_count = distances.shape
-        bias = map_bias.new_zeros(batch_size, ATTENTION_HEAD_COUNT, query_count, token_count)
-        bias[..., token_count - chunk_count:] = map_bias
-        return bias
 
     def decode_from_anchors(
         self, normed_tokens, token_present, unit_anchors, mode_valid, batch_size,
-        map_chunk_centres=None,
     ):
         queries = self.queries + self.anchor_projection(
             unit_anchors / contract.DISTANCE_NORMALISER_METRES
         )
-        draft_points = (
-            unit_anchors[:, :, None, :] * self.anchor_ramp[self.draft_step_indices][None, None, :, None]
-        )
         round_outputs = []
         for round_index in range(DECODER_ROUNDS):
-            self_normed = self.round_self_norms[round_index](queries)
-            queries = queries + self.round_self_attention[round_index](
-                self_normed, self_normed, mode_valid
-            )
             queries = queries + self.round_attention[round_index](
                 self.round_norms[round_index](queries), normed_tokens, token_present,
-                self.map_focus_bias(draft_points, map_chunk_centres, normed_tokens.shape[1]),
             )
             emitted = self.emit(queries, unit_anchors, mode_valid, batch_size)
             round_outputs.append(emitted)
@@ -405,17 +308,15 @@ class ModeDecoder(nn.Module):
                 queries = queries + self.draft_projection(
                     draft_endpoint / contract.DISTANCE_NORMALISER_METRES
                 )
-                draft_points = emitted[0][..., self.draft_step_indices, :]
         return round_outputs
 
-    def forward(self, tokens, token_present, predicted_type_index, map_chunk_centres=None):
+    def forward(self, tokens, token_present, predicted_type_index):
         batch_size = tokens.shape[0]
         normed_tokens = self.scene_norm(tokens)
         selected_unit_anchors = self.unit_anchors[predicted_type_index]
         mode_valid = mode_validity(self.anchor_counts, predicted_type_index, self.query_count)
         round_outputs = self.decode_from_anchors(
             normed_tokens, token_present, selected_unit_anchors, mode_valid, batch_size,
-            map_chunk_centres,
         )
         return round_outputs, selected_unit_anchors, mode_valid
 
@@ -576,10 +477,6 @@ class MotionPredictor(nn.Module):
         )
         round_outputs, selected_unit_anchors, mode_valid = self.mode_decoder(
             tokens, token_present, predicted_type_index(batch["agent_history"]),
-            map_chunk_centres(
-                batch["map_rows"], batch["map_dot_polyline_slot"],
-                tokens.shape[0], int(batch["max_polylines_in_batch"]),
-            ),
         )
         return (
             tokens, round_outputs, selected_unit_anchors, mode_valid,
@@ -604,17 +501,16 @@ class MotionPredictor(nn.Module):
         (
             trajectories, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
-            speed_log_standard_deviation,
         ) = round_outputs[-1]
         return (
             trajectories, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speed,
-            speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+            selected_unit_anchors, mode_valid,
             neighbour_future_positions, neighbour_log_standard_deviation,
         )
 
     def forward(self, batch):
-        trajectories, _, _, _, confidence_logits, _, _, _, _, _, _ = self.predict_with_heading(batch)
+        trajectories, _, _, _, confidence_logits, _, _, _, _, _ = self.predict_with_heading(batch)
         return trajectories, confidence_logits
 
 def parameter_fingerprint(model_state):

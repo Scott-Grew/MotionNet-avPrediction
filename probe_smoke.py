@@ -4,11 +4,10 @@ import math
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 
 import train
-from womd import baseline, contract, loss, metrics, model, pipeline
+from womd import baseline, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
 def first_scenario_paths(staged_directory, needed):
@@ -58,16 +57,19 @@ def main():
                 round_outputs, selected_unit_anchors, mode_valid,
                 neighbour_future_positions, neighbour_log_standard_deviation,
             ) = predictor.predict_every_round(batch)
-            total, regression, heading, classification, speed = train.round_summed_prediction_loss(
-                round_outputs, batch, selected_unit_anchors, mode_valid,
+            (
+                trajectories, heading_cosine_sine, position_log_standard_deviation,
+                heading_log_standard_deviation, confidence_logits, predicted_speed,
+            ) = round_outputs[-1]
+            total, regression, heading, classification, speed = loss.prediction_loss(
+                *round_outputs[-1],
+                batch["future_positions"], batch["future_headings"], batch["future_mask"],
+                selected_unit_anchors,
                 train.HEADING_LOSS_WEIGHT,
                 train.CLASSIFICATION_LOSS_WEIGHT,
                 train.SPEED_LOSS_WEIGHT,
+                mode_valid,
             )
-            (
-                trajectories, heading_cosine_sine, position_log_standard_deviation,
-                heading_log_standard_deviation, confidence_logits, predicted_speed, _,
-            ) = round_outputs[-1]
             neighbour_future = loss.neighbour_future_loss(
                 neighbour_future_positions, neighbour_log_standard_deviation,
                 batch["neighbour_future_positions"],

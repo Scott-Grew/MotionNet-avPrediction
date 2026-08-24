@@ -6,18 +6,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
 
 from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
-LEARNING_RATE = 3e-3
+LEARNING_RATE = 2e-3
 WEIGHT_DECAY = 0.01
 HEADING_LOSS_WEIGHT = 0.5
 CLASSIFICATION_LOSS_WEIGHT = 1.0
 NEIGHBOUR_FUTURE_LOSS_WEIGHT = 0.5
 SPEED_LOSS_WEIGHT = 0.5
-DECAY_EPOCHS = 1
 LOG_EVERY_BATCHES = 20
 
 GradScaler = getattr(torch.amp, "GradScaler", torch.cuda.amp.GradScaler)
@@ -51,122 +49,53 @@ def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designat
         steps += math.ceil(stream_sample_count / batch_size)
     return steps
 
-def scheduled_learning_rate(
-    completed_steps, warmup_steps, total_steps, decay_steps,
-    elapsed_seconds=0.0, budget_seconds=float("inf"), seconds_per_step=None,
-    process_steps=None,
-):
+def scheduled_learning_rate(completed_steps, warmup_steps, total_steps, process_steps=None):
     if process_steps is None:
         process_steps = completed_steps
     if process_steps < warmup_steps:
         return LEARNING_RATE * (process_steps + 1) / warmup_steps
-    decay_start = max(total_steps - decay_steps, warmup_steps)
-    rate_by_steps = LEARNING_RATE
-    if completed_steps >= decay_start:
-        rate_by_steps = LEARNING_RATE * max(total_steps - completed_steps, 0) / max(
-            total_steps - decay_start, 1
-        )
-    rate_by_clock = LEARNING_RATE
-    if seconds_per_step is not None and math.isfinite(budget_seconds):
-        decay_window_seconds = decay_steps * seconds_per_step
-        remaining_seconds = budget_seconds - elapsed_seconds
-        rate_by_clock = LEARNING_RATE * min(
-            max(remaining_seconds / max(decay_window_seconds, 1e-9), 0.0), 1.0
-        )
-    return min(rate_by_steps, rate_by_clock)
+    annealing_progress = min(
+        max(completed_steps - warmup_steps, 0) / max(total_steps - warmup_steps, 1), 1.0
+    )
+    return LEARNING_RATE * 0.5 * (1.0 + math.cos(math.pi * annealing_progress))
 
-def round_summed_prediction_loss(
-    round_outputs, batch, selected_unit_anchors, mode_valid,
-    heading_loss_weight, classification_loss_weight, speed_loss_weight,
+def training_losses(
+    predictor, batch,
+    heading_loss_weight, classification_loss_weight,
+    neighbour_future_loss_weight, speed_loss_weight,
 ):
-    summed = None
-    for round_output in round_outputs:
-        components = loss.prediction_loss(
-            *round_output,
-            batch["future_positions"], batch["future_headings"], batch["future_mask"],
-            selected_unit_anchors,
-            heading_loss_weight, classification_loss_weight, speed_loss_weight,
-            mode_valid,
-        )
-        summed = components if summed is None else tuple(
-            running + component for running, component in zip(summed, components)
-        )
-    return summed
-
-class TrainingStep(nn.Module):
-    def __init__(
-        self, predictor, heading_loss_weight, classification_loss_weight,
-        neighbour_future_loss_weight, speed_loss_weight,
-    ):
-        super().__init__()
-        self.predictor = predictor
-        self.heading_loss_weight = heading_loss_weight
-        self.classification_loss_weight = classification_loss_weight
-        self.neighbour_future_loss_weight = neighbour_future_loss_weight
-        self.speed_loss_weight = speed_loss_weight
-
-    def forward(self, batch):
-        (
-            round_outputs, selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        ) = self.predictor.predict_every_round(batch)
-        total, regression, heading, classification, speed = round_summed_prediction_loss(
-            round_outputs, batch, selected_unit_anchors, mode_valid,
-            self.heading_loss_weight, self.classification_loss_weight, self.speed_loss_weight,
-        )
-        neighbour_future = loss.neighbour_future_loss(
-            neighbour_future_positions, neighbour_log_standard_deviation,
-            batch["neighbour_future_positions"],
-            batch["neighbour_future_mask"],
-            batch["neighbour_history_mask"].any(dim=-1),
-        )
-        total = total + self.neighbour_future_loss_weight * neighbour_future
-        sample_count = batch["agent_history"].shape[0]
-        weight = torch.full((1,), float(sample_count), device=total.device, dtype=torch.float32)
-        trajectories, heading_cosine_sine, _, _, confidence_logits, _, _ = round_outputs[-1]
-        return {
-            "sample_count": weight,
-            "total": total[None] * weight,
-            "regression": regression[None] * weight,
-            "heading": heading[None] * weight,
-            "classification": classification[None] * weight,
-            "neighbour_future": neighbour_future[None] * weight,
-            "speed": speed[None] * weight,
-            "trajectories": trajectories,
-            "heading_cosine_sine": heading_cosine_sine,
-            "confidence_logits": confidence_logits,
-            "mode_valid": mode_valid,
-        }
-
-
-def combine_step_outputs(outputs):
-    sample_count = outputs["sample_count"].sum()
+    (
+        round_outputs, selected_unit_anchors, mode_valid,
+        neighbour_future_positions, neighbour_log_standard_deviation,
+    ) = predictor.predict_every_round(batch)
+    final_round = round_outputs[-1]
+    total, regression, heading, classification, speed = loss.prediction_loss(
+        *final_round,
+        batch["future_positions"], batch["future_headings"], batch["future_mask"],
+        selected_unit_anchors,
+        heading_loss_weight, classification_loss_weight, speed_loss_weight,
+        mode_valid,
+    )
+    neighbour_future = loss.neighbour_future_loss(
+        neighbour_future_positions, neighbour_log_standard_deviation,
+        batch["neighbour_future_positions"],
+        batch["neighbour_future_mask"],
+        batch["neighbour_history_mask"].any(dim=-1),
+    )
+    total = total + neighbour_future_loss_weight * neighbour_future
+    trajectories, heading_cosine_sine, _, _, confidence_logits, _ = final_round
     return {
-        name: (value.sum() / sample_count if name in LOSS_COMPONENT_NAMES else value)
-        for name, value in outputs.items()
+        "total": total,
+        "regression": regression,
+        "heading": heading,
+        "classification": classification,
+        "neighbour_future": neighbour_future,
+        "speed": speed,
+        "trajectories": trajectories,
+        "heading_cosine_sine": heading_cosine_sine,
+        "confidence_logits": confidence_logits,
+        "mode_valid": mode_valid,
     }
-
-
-LOSS_COMPONENT_NAMES = ("total", "regression", "heading", "classification", "neighbour_future", "speed")
-
-
-class SampleSplittingDataParallel(nn.DataParallel):
-    def scatter(self, inputs, kwargs, device_ids):
-        (batch,) = inputs
-        parts = pipeline.split_batch_by_samples(batch, len(device_ids))
-        scattered = [
-            (({name: tensor.to(device_id, non_blocking=True) for name, tensor in part.items()},), {})
-            for part, device_id in zip(parts, device_ids)
-        ]
-        return [pair[0] for pair in scattered], [pair[1] for pair in scattered]
-
-
-def training_step_module(predictor, weights, device):
-    step = TrainingStep(predictor, *weights)
-    device_ids = list(range(torch.cuda.device_count())) if device.type == "cuda" else []
-    if len(device_ids) > 1:
-        return SampleSplittingDataParallel(step, device_ids=device_ids), len(device_ids)
-    return step, 1
 
 
 def checkpoint_state(predictor, optimizer, gradient_scaler, seed, completed_epochs, batch_index):
@@ -203,16 +132,13 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path.replace(checkpoint_path)
 
 def train_epoch(
-    predictor, step_module, optimizer, batches, device, gradient_scaler,
+    predictor, loss_weights, optimizer, batches, device, gradient_scaler,
     checkpoint_path, previous_checkpoint_path,
     checkpoint_every_seconds, epoch_index, seed,
-    completed_steps_before_epoch, warmup_steps, total_optimiser_steps, decay_steps,
-    gradient_clip_norm, training_start, stop_after_seconds, process_steps_before_epoch,
+    completed_steps_before_epoch, warmup_steps, total_optimiser_steps,
+    gradient_clip_norm, process_steps_before_epoch,
 ):
-    step = step_module.module if isinstance(step_module, nn.DataParallel) else step_module
-    heading_loss_weight = step.heading_loss_weight
-    neighbour_future_loss_weight = step.neighbour_future_loss_weight
-    speed_loss_weight = step.speed_loss_weight
+    heading_loss_weight, _, neighbour_future_loss_weight, speed_loss_weight = loss_weights
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
     loss_sums = {
@@ -237,7 +163,7 @@ def train_epoch(
         step_start = time.perf_counter()
         batch = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
         with torch.amp.autocast(device_type=device.type, enabled=gradient_scaler.is_enabled()):
-            step_outputs = combine_step_outputs(step_module(batch))
+            step_outputs = training_losses(predictor, batch, *loss_weights)
             total = step_outputs["total"]
             regression = step_outputs["regression"]
             heading = step_outputs["heading"]
@@ -248,14 +174,10 @@ def train_epoch(
             heading_cosine_sine = step_outputs["heading_cosine_sine"]
             confidence_logits = step_outputs["confidence_logits"]
             mode_valid = step_outputs["mode_valid"]
-        elapsed_seconds = time.perf_counter() - training_start
         process_steps = process_steps_before_epoch + batch_count
         learning_rate = scheduled_learning_rate(
             completed_steps_before_epoch + batch_count, warmup_steps,
-            total_optimiser_steps, decay_steps,
-            elapsed_seconds, stop_after_seconds,
-            elapsed_seconds / process_steps if process_steps else None,
-            process_steps,
+            total_optimiser_steps, process_steps,
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
@@ -378,24 +300,9 @@ def train_epoch(
                     flush=True,
                 )
             checkpoint_wait_start = time.perf_counter()
-        if time.perf_counter() - training_start >= stop_after_seconds:
-            if math.isfinite(component_values["total"]):
-                save_checkpoint(
-                    checkpoint_path, previous_checkpoint_path,
-                    checkpoint_state(predictor, optimizer, gradient_scaler, seed, epoch_index, batch_count),
-                )
-            print(
-                f"STOPPING ON THE CLOCK: {(time.perf_counter() - training_start) / 3600:.2f} h"
-                f" elapsed against a --stop-after-seconds budget of {stop_after_seconds / 3600:.2f} h,"
-                f" {batch_count} batches into epoch {epoch_index + 1} at learning rate"
-                f" {learning_rate:.3e}; {checkpoint_path} holds this point.",
-                flush=True,
-            )
-            averages = {name: value / max(batch_count, 1) for name, value in loss_sums.items()}
-            return averages, accumulator.results(), seconds, True
         wait_start = time.perf_counter()
     averages = {name: value / max(batch_count, 1) for name, value in loss_sums.items()}
-    return averages, accumulator.results(), seconds, False
+    return averages, accumulator.results(), seconds
 
 def main():
     parser = argparse.ArgumentParser()
@@ -410,7 +317,6 @@ def main():
     parser.add_argument("--speed-loss-weight", type=float, default=SPEED_LOSS_WEIGHT)
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint-every-seconds", type=int, required=True)
-    parser.add_argument("--stop-after-seconds", type=float, required=True)
     parser.add_argument("--warmup-steps", type=int, required=True)
     parser.add_argument("--gradient-clip-norm", type=float, required=True)
     parser.add_argument("--average-last-epochs", type=int, required=True)
@@ -435,25 +341,19 @@ def main():
         not arguments.all_eligible_agents,
     )
     total_optimiser_steps = steps_per_epoch * arguments.epochs
-    decay_steps = steps_per_epoch * DECAY_EPOCHS
     print(
         f"{steps_per_epoch} optimiser steps per epoch,"
         f" {total_optimiser_steps} over {arguments.epochs} epochs,"
         f" peak learning rate {LEARNING_RATE} after {arguments.warmup_steps} warmup steps,"
-        f" linear decay to zero over the last {decay_steps} steps or the last"
-        f" {decay_steps} steps' worth of the --stop-after-seconds budget, whichever comes first,"
+        f" cosine decay to zero over the remaining steps,"
         f" anchors per type {anchor_counts.tolist()}",
         flush=True,
     )
-    step_module, device_count = training_step_module(
-        predictor,
-        (
-            arguments.heading_loss_weight, arguments.classification_loss_weight,
-            arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
-        ),
-        device,
+    loss_weights = (
+        arguments.heading_loss_weight, arguments.classification_loss_weight,
+        arguments.neighbour_future_loss_weight, arguments.speed_loss_weight,
     )
-    print(f"training on {device_count} {device.type} device(s)", flush=True)
+    print(f"training on {device.type}", flush=True)
     previous_checkpoint_path = arguments.checkpoint_path.with_suffix(
         arguments.checkpoint_path.suffix + ".previous"
     )
@@ -495,7 +395,6 @@ def main():
     if arguments.compile:
         predictor = torch.compile(predictor, dynamic=True)
 
-    training_start = time.perf_counter()
     averaged_weights = None
     averaged_epoch_count = 0
     averaged_checkpoint_path = arguments.checkpoint_path.with_name(
@@ -518,19 +417,18 @@ def main():
             arguments.prefetch, arguments.seed + epoch_index,
             not arguments.all_eligible_agents,
         )
-        averages, monitor, seconds, stopped_on_the_clock = train_epoch(
-            predictor, step_module, optimizer, batches, device, gradient_scaler,
+        averages, monitor, seconds = train_epoch(
+            predictor, loss_weights, optimizer, batches, device, gradient_scaler,
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             epoch_index * steps_per_epoch,
-            arguments.warmup_steps, total_optimiser_steps, decay_steps,
+            arguments.warmup_steps, total_optimiser_steps,
             arguments.gradient_clip_norm,
-            training_start, arguments.stop_after_seconds, process_steps_before_epoch,
+            process_steps_before_epoch,
         )
         process_steps_before_epoch += steps_per_epoch
         print(
-            f"epoch {epoch_index + 1}/{arguments.epochs}"
-            f"{' (partial, stopped on the clock)' if stopped_on_the_clock else ''} | "
+            f"epoch {epoch_index + 1}/{arguments.epochs} | "
             f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
             f" + hdg {averages['heading']:.4f}"
             f" + cls {averages['classification']:.4f}"
@@ -544,8 +442,6 @@ def main():
             f" · monitor {seconds['monitor']:.0f} s",
             flush=True,
         )
-        if stopped_on_the_clock:
-            return
         if not math.isfinite(averages["total"]):
             print(
                 f"epoch {epoch_index + 1} mean total loss {averages['total']},"
@@ -572,16 +468,6 @@ def main():
                 f" {averaged_checkpoint_path}",
                 flush=True,
             )
-        elapsed_seconds = time.perf_counter() - training_start
-        if elapsed_seconds >= arguments.stop_after_seconds:
-            print(
-                f"STOPPING EARLY: {elapsed_seconds / 3600:.2f} h elapsed against a"
-                f" --stop-after-seconds budget of {arguments.stop_after_seconds / 3600:.2f} h."
-                f" {epoch_index + 1} of {arguments.epochs} epochs are complete and"
-                f" {arguments.checkpoint_path} holds them.",
-                flush=True,
-            )
-            return
 
 if __name__ == "__main__":
     main()

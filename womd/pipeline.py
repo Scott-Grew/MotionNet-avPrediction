@@ -66,27 +66,3 @@ def batches(scenario_paths, worker_count, batch_size, prefetch_batches, seed, de
         prefetch_factor=prefetch_batches if worker_count > 0 else None,
         pin_memory=torch.cuda.is_available(),
     )
-
-
-def split_batch_by_samples(batch, part_count):
-    sample_count = batch["agent_history"].shape[0]
-    max_chunks = int(batch["max_polylines_in_batch"])
-    bounds = [round(part_index * sample_count / part_count) for part_index in range(part_count + 1)]
-    dot_sample = batch["map_dot_polyline_slot"] // max_chunks
-    parts = []
-    for first_sample, end_sample in zip(bounds[:-1], bounds[1:]):
-        if end_sample == first_sample:
-            continue
-        dot_belongs = (dot_sample >= first_sample) & (dot_sample < end_sample)
-        part = {}
-        for name, tensor in batch.items():
-            if name == "map_rows":
-                part[name] = tensor[dot_belongs]
-            elif name == "map_dot_polyline_slot":
-                part[name] = tensor[dot_belongs] - first_sample * max_chunks
-            elif name == "max_polylines_in_batch":
-                part[name] = tensor
-            else:
-                part[name] = tensor[first_sample:end_sample]
-        parts.append(part)
-    return parts

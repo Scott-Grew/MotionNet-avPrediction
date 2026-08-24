@@ -199,48 +199,6 @@ def test_later_decoder_rounds_move_when_the_previous_draft_changes():
     assert not torch.allclose(following_draft, ignoring_draft, atol=1e-4)
 
 
-def test_queries_read_each_other_inside_every_decoder_round():
-    torch.manual_seed(42)
-    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
-    tokens = torch.randn(2, 7, model.HIDDEN_DIM)
-    token_present = torch.ones(2, 7, dtype=torch.bool)
-    unit_anchors = model.unit_anchor_offsets().expand(2, -1, -1) * 40.0
-    mode_valid = torch.ones(2, model.QUERY_COUNT, dtype=torch.bool)
-    normed = decoder.scene_norm(tokens)
-    with torch.no_grad():
-        talking = decoder.decode_from_anchors(normed, token_present, unit_anchors, mode_valid, 2)
-        for self_attention in decoder.round_self_attention:
-            self_attention.output_projection.weight.zero_()
-            self_attention.output_projection.bias.zero_()
-        silent = decoder.decode_from_anchors(normed, token_present, unit_anchors, mode_valid, 2)
-    assert len(talking) == model.DECODER_ROUNDS
-    for round_index in range(model.DECODER_ROUNDS):
-        assert not torch.allclose(talking[round_index][0], silent[round_index][0], atol=1e-4)
-
-
-def test_every_decoder_round_is_scored_by_the_training_loss():
-    torch.manual_seed(44)
-    predictor = model.MotionPredictor(model.unit_anchor_offsets_per_type()).eval()
-    batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 2, 2, 10)
-    with torch.no_grad():
-        round_outputs, selected_unit_anchors, mode_valid, _, _ = predictor.predict_every_round(batch)
-    assert len(round_outputs) == model.DECODER_ROUNDS
-
-    def summed_total(outputs):
-        return train.round_summed_prediction_loss(
-            outputs, batch, selected_unit_anchors, mode_valid, 1.0, 1.0, 1.0
-        )[0]
-
-    unperturbed = summed_total(round_outputs)
-    for round_index in range(model.DECODER_ROUNDS):
-        perturbed = list(round_outputs)
-        trajectories, *rest = round_outputs[round_index]
-        perturbed[round_index] = (trajectories + 1.0, *rest)
-        assert not torch.equal(summed_total(perturbed), unperturbed), (
-            f"round {round_index}'s trajectories moved without moving the loss"
-        )
-
-
 def test_padded_modes_are_never_assigned_kept_or_believed():
     torch.manual_seed(46)
     anchor_counts = torch.tensor([model.QUERY_COUNT, contract.NUM_PREDICTED_MODES + 2, model.QUERY_COUNT])
@@ -249,7 +207,7 @@ def test_padded_modes_are_never_assigned_kept_or_believed():
     pedestrian_row = contract.PREDICTED_OBJECT_TYPES.index("TYPE_PEDESTRIAN")
     with torch.no_grad():
         (
-            trajectories, _, _, _, confidence_logits, _, _, selected_unit_anchors, mode_valid, _, _,
+            trajectories, _, _, _, confidence_logits, _, selected_unit_anchors, mode_valid, _, _,
         ) = predictor.predict_with_heading(batch)
     valid_count = int(anchor_counts[pedestrian_row])
     assert mode_valid[pedestrian_row].tolist() == [True] * valid_count + [False] * (
@@ -735,84 +693,6 @@ def test_batched_pruning_walk_matches_the_single_sample_walk():
         assert torch.equal(walked_logits, batched_logits[sample_index])
 
 
-def total_turning_degrees(polyline):
-    steps = polyline.diff(dim=-2)
-    leading, trailing = steps[..., :-1, :], steps[..., 1:, :]
-    cross = leading[..., 0] * trailing[..., 1] - leading[..., 1] * trailing[..., 0]
-    return torch.atan2(cross.abs(), (leading * trailing).sum(dim=-1)).rad2deg().sum(dim=-1)
-
-
-def test_a_trajectory_cannot_outrun_or_outturn_the_control_polygon_it_is_drawn_through():
-    torch.manual_seed(23)
-    assert model.TRAJECTORY_CONTROL_POINTS < contract.FUTURE_STEPS
-
-    curve_basis = model.bernstein_curve_basis(
-        model.TRAJECTORY_CONTROL_POINTS, contract.FUTURE_STEPS
-    )
-    control_points = 20.0 * torch.randn(512, model.TRAJECTORY_CONTROL_POINTS, 2)
-    curve = torch.matmul(curve_basis[:, 1:], control_points)
-    walked = torch.cat([torch.zeros(512, 1, 2), curve], dim=1)
-    control_polygon = torch.cat([torch.zeros(512, 1, 2), control_points], dim=1)
-
-    assert curve_basis.shape == (contract.FUTURE_STEPS, model.TRAJECTORY_CONTROL_POINTS + 1)
-    assert torch.allclose(curve[:, -1], control_points[:, -1], atol=1e-4)
-    assert (
-        walked.diff(dim=1).norm(dim=-1).sum(dim=-1)
-        <= control_polygon.diff(dim=1).norm(dim=-1).sum(dim=-1)
-    ).all()
-    assert (total_turning_degrees(walked) <= total_turning_degrees(control_polygon)).all()
-
-
-def test_every_emitted_trajectory_stays_in_the_curve_family_after_the_anchor_ramp_is_added():
-    torch.manual_seed(31)
-    predictor = model.MotionPredictor(model.unit_anchor_offsets_per_type()).eval()
-    with torch.no_grad():
-        predictor.mode_decoder.trajectory_head[-1].weight.mul_(50.0)
-
-    agent_history = torch.randn(3, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM)
-    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = torch.tensor(
-        [[0.0, 0.0], [12.0, 0.0], [0.0, -25.0]]
-    )
-    map_rows = torch.randn(30, contract.MAP_FEATURE_DIM)
-    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = 0.0
-    batch = {
-        "agent_history": agent_history,
-        "agent_history_mask": torch.ones(3, contract.HISTORY_STEPS, dtype=torch.bool),
-        "neighbour_history": torch.randn(3, 2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM),
-        "neighbour_history_mask": torch.ones(3, 2, contract.HISTORY_STEPS, dtype=torch.bool),
-        "agent_signal_history": torch.zeros(
-            3, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
-        ),
-        "neighbour_signal_history": torch.zeros(
-            3, 2, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
-        ),
-        "map_rows": map_rows,
-        "map_dot_polyline_slot": torch.arange(30) // 10,
-        "map_chunk_signal_history": torch.zeros(
-            3, 1, contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES
-        ),
-        "map_chunk_lane_context": torch.zeros(3, 1, contract.LANE_CONTEXT_DIM),
-        "max_polylines_in_batch": torch.tensor(1),
-    }
-
-    with torch.no_grad():
-        trajectories, _ = predictor(batch)
-    flattened = trajectories.permute(2, 0, 1, 3).reshape(contract.FUTURE_STEPS, -1)
-    curve_basis = predictor.mode_decoder.curve_basis
-    projected = curve_basis @ torch.linalg.lstsq(curve_basis, flattened).solution
-
-    independent_positions = trajectories.std() * torch.randn_like(flattened)
-    independent_residual = (
-        independent_positions - curve_basis @ torch.linalg.lstsq(
-            curve_basis, independent_positions
-        ).solution
-    ).norm()
-
-    assert trajectories.abs().max() > 1.0
-    assert (projected - flattened).norm() < 1e-3 * flattened.norm()
-    assert independent_residual > 0.1 * independent_positions.norm()
-
-
 def test_swapping_two_anchors_swaps_the_modes_that_carry_them():
     torch.manual_seed(29)
     unit_anchors = model.unit_anchor_offsets_per_type() * 40.0
@@ -967,7 +847,7 @@ def test_two_agents_alike_but_for_their_object_type_get_their_own_types_anchor_s
 
     with torch.no_grad():
         (
-            trajectories, _, _, _, _, _, _, selected_unit_anchors, _, _, _,
+            trajectories, _, _, _, _, _, selected_unit_anchors, _, _, _,
         ) = predictor.predict_with_heading(batch)
     endpoints = trajectories[:, :, -1]
 
@@ -1045,7 +925,7 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     (
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+        selected_unit_anchors, mode_valid,
         neighbour_future_positions, neighbour_log_standard_deviation,
     ) = predictor.predict_with_heading(batch)
     assert neighbour_future_positions.shape == (
@@ -1057,7 +937,6 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     components = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        speed_log_standard_deviation,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
         selected_unit_anchors, 1.0, 1.0, 1.0, mode_valid,
     )
@@ -1135,124 +1014,43 @@ def test_submission_world_frame_returns_the_logged_future_to_its_logged_place():
     )
 
 
-def test_the_heading_rides_one_bernstein_curve_of_its_own_control_pairs():
-    torch.manual_seed(43)
-    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
-    with torch.no_grad():
-        decoder.trajectory_head[-1].weight.mul_(20.0)
-    tokens = torch.randn(2, 9, model.HIDDEN_DIM)
-    token_present = torch.ones(2, 9, dtype=torch.bool)
-
-    with torch.no_grad():
-        round_outputs, _, _ = decoder(tokens, token_present, torch.zeros(2, dtype=torch.long))
-        heading_cosine_sine = round_outputs[-1][1]
-
-    time_fractions = (
-        torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32) / contract.FUTURE_STEPS
-    )
-    degree = model.TRAJECTORY_CONTROL_POINTS
-    independent_basis = torch.stack(
-        [
-            math.comb(degree, index)
-            * time_fractions ** index
-            * (1.0 - time_fractions) ** (degree - index)
-            for index in range(1, degree + 1)
-        ],
-        dim=1,
-    )
-    assert heading_cosine_sine.shape == (2, model.QUERY_COUNT, contract.FUTURE_STEPS, 2)
-
-    heading_at_now = torch.tensor(model.HEADING_AT_NOW)
-    flattened = (heading_cosine_sine - heading_at_now).permute(2, 0, 1, 3).reshape(
-        contract.FUTURE_STEPS, -1
-    )
-    fitted_control_pairs = torch.linalg.lstsq(independent_basis, flattened).solution
-    reconstructed = independent_basis @ fitted_control_pairs
-    assert flattened.abs().max() > 0.1
-    assert (reconstructed - flattened).norm() < 1e-4 * flattened.norm()
-
-    control_polygon = torch.cat(
-        [
-            torch.zeros(2, model.QUERY_COUNT, 1, 2),
-            fitted_control_pairs.view(degree, 2, model.QUERY_COUNT, 2).permute(1, 2, 0, 3),
-        ],
-        dim=2,
-    ) + heading_at_now
-    walked_heading = torch.cat(
-        [heading_at_now.expand(2, model.QUERY_COUNT, 1, 2), heading_cosine_sine], dim=2
-    )
-    assert (
-        total_turning_degrees(walked_heading) <= total_turning_degrees(control_polygon) + 1e-2
-    ).all()
-
-    smooth_control_angles = torch.tensor([0.05, 0.20, 0.30])
-    smooth_curve = independent_basis @ torch.stack(
-        [smooth_control_angles.cos(), smooth_control_angles.sin()], dim=-1
-    )
-    step_angle_changes = torch.atan2(smooth_curve[:, 1], smooth_curve[:, 0]).diff().abs()
-    assert step_angle_changes.max() <= smooth_control_angles.max() - smooth_control_angles.min()
-
-
-def test_the_step_uncertainty_rides_one_bernstein_curve_and_never_leaves_the_clamped_range():
+def test_no_emitted_uncertainty_can_leave_its_clamped_range():
     torch.manual_seed(59)
     decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
     tokens = torch.randn(2, 7, model.HIDDEN_DIM)
     token_present = torch.ones(2, 7, dtype=torch.bool)
-    log_standard_deviation_start = model.POSITION_CONTROL_VALUES + model.HEADING_CONTROL_VALUES
-    log_standard_deviation_end = (
-        log_standard_deviation_start + model.LOG_STANDARD_DEVIATION_CONTROL_VALUES
-    )
-    moderate_control_pairs = torch.tensor([[-1.0, 0.5], [0.4, -0.2], [1.2, 0.9]])
 
-    with torch.no_grad():
-        decoder.trajectory_head[-1].weight.zero_()
-        decoder.trajectory_head[-1].bias.zero_()
-        decoder.trajectory_head[-1].bias[log_standard_deviation_start:log_standard_deviation_end] = (
-            moderate_control_pairs.flatten()
+    for extreme_bias in (-1e3, 1e3):
+        with torch.no_grad():
+            decoder.trajectory_head[-1].weight.zero_()
+            decoder.trajectory_head[-1].bias.fill_(extreme_bias)
+            round_outputs, _, _ = decoder(tokens, token_present, torch.zeros(2, dtype=torch.long))
+        position_log_standard_deviation = round_outputs[-1][2]
+        heading_log_standard_deviation = round_outputs[-1][3]
+
+        assert position_log_standard_deviation.shape == (
+            2, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
         )
-        round_outputs, _, _ = decoder(tokens, token_present, torch.zeros(2, dtype=torch.long))
-        moderate_log_standard_deviation = round_outputs[-1][2]
+        assert (position_log_standard_deviation >= model.MINIMUM_LOG_STANDARD_DEVIATION).all()
+        assert (position_log_standard_deviation <= model.MAXIMUM_LOG_STANDARD_DEVIATION).all()
+        assert (heading_log_standard_deviation >= model.MINIMUM_LOG_STANDARD_DEVIATION).all()
+        assert (
+            heading_log_standard_deviation <= model.HEADING_MAXIMUM_LOG_STANDARD_DEVIATION
+        ).all()
+        if extreme_bias < 0:
+            assert float(position_log_standard_deviation.max()) == pytest.approx(
+                model.MINIMUM_LOG_STANDARD_DEVIATION
+            )
+        else:
+            assert float(position_log_standard_deviation.min()) == pytest.approx(
+                model.MAXIMUM_LOG_STANDARD_DEVIATION
+            )
+            assert float(heading_log_standard_deviation.min()) == pytest.approx(
+                model.HEADING_MAXIMUM_LOG_STANDARD_DEVIATION
+            )
 
-    time_fractions = (
-        torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32) / contract.FUTURE_STEPS
-    )
-    degree = model.TRAJECTORY_CONTROL_POINTS
-    independent_basis = torch.stack(
-        [
-            math.comb(degree, index)
-            * time_fractions ** index
-            * (1.0 - time_fractions) ** (degree - index)
-            for index in range(1, degree + 1)
-        ],
-        dim=1,
-    )
-
-    assert moderate_log_standard_deviation.shape == (
-        2, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
-    )
-    floor_at_now = model.MINIMUM_LOG_STANDARD_DEVIATION * (1.0 - time_fractions) ** degree
-    assert torch.allclose(
-        moderate_log_standard_deviation,
-        floor_at_now[:, None] + independent_basis @ moderate_control_pairs,
-        atol=1e-5,
-    )
-    assert float(moderate_log_standard_deviation[..., 0, :].min()) < -1.5
-
-    with torch.no_grad():
-        decoder.trajectory_head[-1].bias[log_standard_deviation_start:log_standard_deviation_end] = (
-            torch.tensor([-1e3, 1e3, -1e3, 1e3, -1e3, 1e3])
-        )
-        round_outputs, _, _ = decoder(tokens, token_present, torch.zeros(2, dtype=torch.long))
-        extreme_log_standard_deviation = round_outputs[-1][2]
-    extreme_standard_deviation = extreme_log_standard_deviation.exp()
-    floor_metres = math.exp(model.MINIMUM_LOG_STANDARD_DEVIATION)
-    ceiling_metres = math.exp(model.MAXIMUM_LOG_STANDARD_DEVIATION)
-
-    assert (extreme_standard_deviation >= floor_metres).all()
-    assert (extreme_standard_deviation <= ceiling_metres).all()
-    assert float(extreme_standard_deviation.min()) == pytest.approx(floor_metres, rel=1e-6)
-    assert float(extreme_standard_deviation.max()) == pytest.approx(ceiling_metres, rel=1e-6)
-    assert floor_metres == pytest.approx(0.2, abs=1e-3)
+    assert math.exp(model.MINIMUM_LOG_STANDARD_DEVIATION) == pytest.approx(0.2, abs=1e-3)
+    assert math.exp(model.HEADING_MAXIMUM_LOG_STANDARD_DEVIATION) == pytest.approx(2.0)
 
 
 def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stated_uncertainty():
@@ -1277,7 +1075,7 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
             trajectories, heading_cosine_sine,
             torch.full_like(trajectories, log_standard_deviation),
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed, torch.zeros_like(predicted_speed),
+            predicted_speed,
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1298,20 +1096,22 @@ def test_the_regression_term_is_the_gaussian_negative_log_likelihood_at_the_stat
         )
 
 
-def test_a_straight_constant_speed_control_polygon_predicts_that_constant_speed_analytically():
+def test_a_straight_constant_speed_step_pattern_predicts_that_constant_speed_analytically():
     torch.manual_seed(61)
     decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
-    control_point_spacing = torch.tensor([3.0, 4.0])
-    equally_spaced_control_points = control_point_spacing * torch.arange(
-        1, model.TRAJECTORY_CONTROL_POINTS + 1, dtype=torch.float32
-    )[:, None]
+    step_velocity = torch.tensor([3.0, 4.0])
+    per_step_positions = (
+        step_velocity[None, :]
+        * torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32)[:, None]
+        * contract.TIMESTEP_SECONDS
+    )
 
     with torch.no_grad():
         decoder.trajectory_head[-1].weight.zero_()
         decoder.trajectory_head[-1].bias.zero_()
-        decoder.trajectory_head[-1].bias[: model.POSITION_CONTROL_VALUES] = (
-            equally_spaced_control_points.flatten()
-        )
+        decoder.trajectory_head[-1].bias.view(
+            len(model.TRAJECTORY_QUANTITIES), contract.FUTURE_STEPS, 2
+        )[0] = per_step_positions
         normed_tokens = decoder.scene_norm(torch.randn(2, 7, model.HIDDEN_DIM))
         token_present = torch.ones(2, 7, dtype=torch.bool)
         predicted_speed = decoder.decode_from_anchors(
@@ -1319,10 +1119,7 @@ def test_a_straight_constant_speed_control_polygon_predicts_that_constant_speed_
             torch.ones(2, model.QUERY_COUNT, dtype=torch.bool), 2,
         )[-1][5]
 
-    expected_speed = float(
-        (model.TRAJECTORY_CONTROL_POINTS * control_point_spacing).norm()
-        / contract.FUTURE_HORIZON_SECONDS
-    )
+    expected_speed = float(step_velocity.norm())
     assert torch.allclose(predicted_speed, torch.full_like(predicted_speed, expected_speed), atol=1e-4)
 
 
@@ -1336,7 +1133,7 @@ def test_predicted_speed_carries_the_anchor_motion_the_emitted_trajectory_carrie
         decoder.trajectory_head[-1].bias.zero_()
         normed_tokens = decoder.scene_norm(torch.randn(2, 7, model.HIDDEN_DIM))
         token_present = torch.ones(2, 7, dtype=torch.bool)
-        anchored_position, _, _, _, _, predicted_speed, _ = decoder.decode_from_anchors(
+        anchored_position, _, _, _, _, predicted_speed = decoder.decode_from_anchors(
             normed_tokens, token_present,
             anchor_endpoint.expand(2, model.QUERY_COUNT, 2),
             torch.ones(2, model.QUERY_COUNT, dtype=torch.bool), 2,
@@ -1381,7 +1178,7 @@ def test_heading_term_is_the_gaussian_negative_log_likelihood_on_the_unit_pair()
         _, _, heading, _, _ = loss.prediction_loss(
             trajectories, heading_cosine_sine, log_standard_deviation,
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed, torch.zeros_like(predicted_speed),
+            predicted_speed,
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1395,30 +1192,6 @@ def test_heading_term_is_the_gaussian_negative_log_likelihood_on_the_unit_pair()
     assert heading_term(exact) == pytest.approx(exact_nll, rel=1e-5)
     assert heading_term(quarter_turn) > heading_term(exact)
     assert heading_term(shrunken_exact) == pytest.approx(exact_nll, rel=1e-4)
-
-
-def test_heading_log_sigma_cannot_exceed_the_unit_pair_support():
-    torch.manual_seed(59)
-    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type()).eval()
-    heading_log_start = (
-        model.POSITION_CONTROL_VALUES
-        + model.HEADING_CONTROL_VALUES
-        + model.LOG_STANDARD_DEVIATION_CONTROL_VALUES
-    )
-    with torch.no_grad():
-        decoder.trajectory_head[-1].weight.zero_()
-        decoder.trajectory_head[-1].bias.zero_()
-        decoder.trajectory_head[-1].bias[heading_log_start:] = 1e3
-        round_outputs, _, _ = decoder(
-            torch.randn(1, 5, model.HIDDEN_DIM),
-            torch.ones(1, 5, dtype=torch.bool),
-            torch.zeros(1, dtype=torch.long),
-        )
-        heading_log_standard_deviation = round_outputs[-1][3]
-    assert heading_log_standard_deviation.max() == pytest.approx(
-        model.HEADING_MAXIMUM_LOG_STANDARD_DEVIATION, abs=1e-5
-    )
-    assert math.exp(model.HEADING_MAXIMUM_LOG_STANDARD_DEVIATION) == pytest.approx(2.0)
 
 
 def test_classification_is_softmax_cross_entropy_on_the_assigned_mode():
@@ -1437,14 +1210,13 @@ def test_classification_is_softmax_cross_entropy_on_the_assigned_mode():
         trajectories, heading_cosine_sine, torch.zeros_like(trajectories),
         torch.zeros_like(trajectories), confidence_logits,
         torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS),
-        torch.zeros(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS),
         future_positions, future_headings, future_mask,
         unit_anchors, 1.0, 1.0, 1.0,
     )
     assert float(classification) == pytest.approx(math.log(model.QUERY_COUNT), rel=1e-5)
 
 
-def test_speed_term_is_gaussian_nll_at_the_emitted_speed_sigma():
+def test_speed_term_is_gaussian_nll_at_the_fixed_speed_sigma():
     sample_count = 2
     step_speed = contract.VELOCITY_NORMALISER_METRES_PER_SECOND
     future_positions = torch.zeros(sample_count, contract.FUTURE_STEPS, 2)
@@ -1463,11 +1235,13 @@ def test_speed_term_is_gaussian_nll_at_the_emitted_speed_sigma():
     )
     doubled_speed = exact_speed * 2.0
 
+    assert loss.SPEED_STANDARD_DEVIATION_METRES_PER_SECOND == step_speed
+
     def speed_term(predicted_speed):
         _, _, _, _, speed = loss.prediction_loss(
             trajectories, heading_cosine_sine, torch.zeros_like(trajectories),
             torch.zeros_like(trajectories), torch.zeros(sample_count, model.QUERY_COUNT),
-            predicted_speed, torch.full_like(predicted_speed, math.log(step_speed)),
+            predicted_speed,
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1539,7 +1313,6 @@ EMITTED_QUANTITY_NAMES = (
     "heading_log_standard_deviation",
     "confidence_logits",
     "predicted_speed",
-    "speed_log_standard_deviation",
     "selected_unit_anchors",
     "mode_valid",
     "neighbour_future_positions",
@@ -1555,13 +1328,12 @@ def combined_training_loss(emitted_quantities, batch):
     (
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        speed_log_standard_deviation, selected_unit_anchors, mode_valid,
+        selected_unit_anchors, mode_valid,
         neighbour_future_positions, neighbour_log_standard_deviation,
     ) = emitted_quantities
     total, _, _, _, _ = loss.prediction_loss(
         trajectories, heading_cosine_sine, position_log_standard_deviation,
         heading_log_standard_deviation, confidence_logits, predicted_speed,
-        speed_log_standard_deviation,
         batch["future_positions"], batch["future_headings"], batch["future_mask"],
         selected_unit_anchors, 1.0, 1.0, 1.0, mode_valid,
     )
@@ -1596,7 +1368,6 @@ def test_every_quantity_the_model_emits_is_pinned_by_the_loss_that_trains_it():
             [value[..., :1] + 1.0, value[..., 1:]], dim=-1
         ),
         "predicted_speed": lambda value: value + 1.0,
-        "speed_log_standard_deviation": lambda value: value + 1.0,
         "selected_unit_anchors": lambda value: -value,
         "mode_valid": lambda value: torch.zeros_like(value),
         "neighbour_future_positions": lambda value: value + 1.0,
@@ -1674,7 +1445,7 @@ def test_the_position_likelihood_never_reads_the_predicted_heading():
         _, regression, heading, _, _ = loss.prediction_loss(
             trajectories, predicted_pair, position_log_standard_deviation,
             torch.zeros_like(trajectories), confidence_logits,
-            predicted_speed, torch.zeros_like(predicted_speed),
+            predicted_speed,
             future_positions, future_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         )
@@ -1697,7 +1468,7 @@ def test_no_step_uncertainty_starts_saturated_and_both_axes_start_carrying_sprea
     with torch.no_grad():
         (
             _, _, position_log_standard_deviation, heading_log_standard_deviation,
-            _, _, _, _, _, _, _,
+            _, _, _, _, _, _,
         ) = predictor.predict_with_heading(batch)
 
     saturated_low = position_log_standard_deviation == model.MINIMUM_LOG_STANDARD_DEVIATION
@@ -1733,14 +1504,12 @@ def test_v2_a_masked_future_step_moves_no_term_of_the_prediction_loss():
     heading_log_standard_deviation = torch.randn_like(trajectories)
     confidence_logits = torch.randn(sample_count, model.QUERY_COUNT)
     predicted_speed = torch.rand(sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS)
-    speed_log_standard_deviation = torch.randn_like(predicted_speed)
     unit_anchors = model.unit_anchor_offsets().expand(sample_count, -1, -1) * 40.0
 
     def loss_components(logged_positions, logged_headings, predicted_positions, predicted_speeds):
         return torch.stack(loss.prediction_loss(
             predicted_positions, heading_cosine_sine, position_log_standard_deviation,
             heading_log_standard_deviation, confidence_logits, predicted_speeds,
-            speed_log_standard_deviation,
             logged_positions, logged_headings, future_mask,
             unit_anchors, 1.0, 1.0, 1.0,
         ))
@@ -1937,7 +1706,7 @@ def test_untrained_modes_are_finite_and_not_the_same_point():
     predictor = model.MotionPredictor(model.unit_anchor_offsets_per_type()).eval()
     batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 2, 2, 10)
     with torch.no_grad():
-        trajectories, heading_cosine_sine, _, _, _, predicted_speed, _, _, _, _, _ = (
+        trajectories, heading_cosine_sine, _, _, _, predicted_speed, _, _, _, _ = (
             predictor.predict_with_heading(batch)
         )
     assert trajectories.isfinite().all()
@@ -1972,17 +1741,19 @@ def test_autocast_forward_keeps_every_likelihood_input_in_float32_and_steps_stay
                 neighbour_future_positions, neighbour_log_standard_deviation,
             ) = predictor.predict_every_round(batch)
             for round_output in round_outputs:
-                trajectories, _, position_log_standard_deviation, heading_log_standard_deviation, _, _, speed_log_standard_deviation = round_output
+                trajectories, _, position_log_standard_deviation, heading_log_standard_deviation, _, _ = round_output
                 assert trajectories.dtype == torch.float32
                 assert position_log_standard_deviation.dtype == torch.float32
                 assert heading_log_standard_deviation.dtype == torch.float32
-                assert speed_log_standard_deviation.dtype == torch.float32
             assert neighbour_future_positions.dtype == torch.float32
-            total, *_ = train.round_summed_prediction_loss(
-                round_outputs, batch, selected_unit_anchors, mode_valid,
+            total, *_ = loss.prediction_loss(
+                *round_outputs[-1],
+                batch["future_positions"], batch["future_headings"], batch["future_mask"],
+                selected_unit_anchors,
                 train.HEADING_LOSS_WEIGHT,
                 train.CLASSIFICATION_LOSS_WEIGHT,
                 train.SPEED_LOSS_WEIGHT,
+                mode_valid,
             )
             total = total + train.NEIGHBOUR_FUTURE_LOSS_WEIGHT * loss.neighbour_future_loss(
                 neighbour_future_positions, neighbour_log_standard_deviation,
@@ -2001,7 +1772,7 @@ def test_autocast_forward_keeps_every_likelihood_input_in_float32_and_steps_stay
         scaler.update()
 
 
-def test_a_zeroed_head_emits_the_known_now_boundary_heading_straight_ahead_at_the_sigma_floor():
+def test_a_zeroed_head_emits_the_heading_straight_ahead_at_unit_sigma():
     torch.manual_seed(115)
     decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type() * 40.0).eval()
     with torch.no_grad():
@@ -2012,22 +1783,18 @@ def test_a_zeroed_head_emits_the_known_now_boundary_heading_straight_ahead_at_th
             torch.ones(2, 5, dtype=torch.bool),
             torch.zeros(2, dtype=torch.long),
         )
-    _, heading_cosine_sine, position_log_standard_deviation, heading_log_standard_deviation, _, _, speed_log_standard_deviation = (
+    _, heading_cosine_sine, position_log_standard_deviation, heading_log_standard_deviation, _, _ = (
         round_outputs[-1]
     )
     assert torch.allclose(
         heading_cosine_sine, torch.tensor(model.HEADING_AT_NOW).expand_as(heading_cosine_sine)
     )
-    first_step_weight = (1.0 - 1.0 / contract.FUTURE_STEPS) ** model.TRAJECTORY_CONTROL_POINTS
     for log_standard_deviation in (
         position_log_standard_deviation, heading_log_standard_deviation,
-        speed_log_standard_deviation[..., None],
     ):
-        assert float(log_standard_deviation[..., 0, :].min()) == pytest.approx(
-            model.MINIMUM_LOG_STANDARD_DEVIATION * first_step_weight, rel=1e-5
+        assert torch.equal(
+            log_standard_deviation, torch.zeros_like(log_standard_deviation)
         )
-        assert float(log_standard_deviation[..., -1, :].max()) == pytest.approx(0.0, abs=1e-6)
-        assert (log_standard_deviation.diff(dim=-2) >= 0.0).all()
 
 
 def test_neighbour_futures_are_displacements_from_the_neighbours_last_seen_position():
@@ -2038,7 +1805,7 @@ def test_neighbour_futures_are_displacements_from_the_neighbours_last_seen_posit
     with torch.no_grad():
         predictor.neighbour_future_head.network[-1].weight.zero_()
         predictor.neighbour_future_head.network[-1].bias.zero_()
-        _, _, _, _, _, _, _, _, _, neighbour_future_positions, _ = predictor.predict_with_heading(batch)
+        _, _, _, _, _, _, _, _, neighbour_future_positions, _ = predictor.predict_with_heading(batch)
     now_positions = batch["neighbour_history"][:, :, contract.CURRENT_STEP_INDEX, contract.AGENT_POSITION]
     last_seen_positions = batch["neighbour_history"][
         :, :, contract.CURRENT_STEP_INDEX - 3, contract.AGENT_POSITION
@@ -2088,47 +1855,3 @@ def test_the_anchor_count_search_keeps_every_anchor_clear_of_the_prune_radius():
     assert fit_anchors.minimum_pairwise_distance(crowded_fitted) >= model.PRUNE_DISTANCE_METRES
 
 
-def test_map_chunk_centres_are_the_mean_dot_position_per_slot():
-    map_rows = torch.zeros(6, contract.MAP_FEATURE_DIM)
-    map_rows[:, contract.MAP_POSITION] = torch.tensor(
-        [[0.0, 0.0], [2.0, 0.0], [10.0, 10.0], [30.0, 0.0], [30.0, 4.0], [30.0, 8.0]]
-    )
-    centres = model.map_chunk_centres(map_rows, torch.tensor([0, 0, 1, 3, 3, 3]), 2, 2)
-    assert centres.shape == (2, 2, 2)
-    assert torch.allclose(centres[0, 0], torch.tensor([1.0, 0.0]))
-    assert torch.allclose(centres[0, 1], torch.tensor([10.0, 10.0]))
-    assert torch.allclose(centres[1, 0], torch.tensor([0.0, 0.0]))
-    assert torch.allclose(centres[1, 1], torch.tensor([30.0, 4.0]))
-
-
-def test_a_focused_decoder_reads_the_map_chunk_near_its_draft_more_than_a_far_one():
-    torch.manual_seed(121)
-    unit_anchors = model.unit_anchor_offsets_per_type() * 40.0
-    decoder = model.ModeDecoder(unit_anchors).eval()
-    with torch.no_grad():
-        decoder.map_focus_scale.fill_(20.0)
-    neighbour_count = 2
-    tokens = torch.randn(1, 1 + neighbour_count + 2, model.HIDDEN_DIM)
-    token_present = torch.ones(1, tokens.shape[1], dtype=torch.bool)
-    chunk_centres = torch.tensor([[[40.0, 0.0], [-380.0, 0.0]]])
-    near_token, far_token = 1 + neighbour_count, 2 + neighbour_count
-    forward_mode = model.ANCHOR_DISTANCE_COUNT - 1
-    vehicle = torch.zeros(1, dtype=torch.long)
-
-    def endpoint(token_set):
-        with torch.no_grad():
-            round_outputs, _, _ = decoder(token_set, token_present, vehicle, chunk_centres)
-        return round_outputs[-1][0][0, forward_mode, -1]
-
-    base = endpoint(tokens)
-    near_perturbed = tokens.clone()
-    near_perturbed[0, near_token] += 3.0
-    far_perturbed = tokens.clone()
-    far_perturbed[0, far_token] += 3.0
-    near_shift = float((endpoint(near_perturbed) - base).norm())
-    far_shift = float((endpoint(far_perturbed) - base).norm())
-    assert near_shift > 10.0 * far_shift
-    with torch.no_grad():
-        decoder.map_focus_scale.fill_(-20.0)
-    unfocused_far_shift = float((endpoint(far_perturbed) - endpoint(tokens)).norm())
-    assert unfocused_far_shift > far_shift
