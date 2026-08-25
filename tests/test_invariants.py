@@ -792,4 +792,4 @@ def test_submitted_confidences_conserve_probability_mass_and_hand_a_duplicates_s
     assert float(kept_trajectories[0, 0, -1, 0]) == 0.0
     assert not (kept_trajectories[0, :, -1, 0] == 0.5).any()
     assert float(confidences[0, 0]) == pytest.approx(float(probabilities[0] + probabilities[1]), rel=1e-6)
-    assert float(confidences[0, 0]) > float(torch.softmax(kept_logits, dim=-1)[0, 0])
+    assert float(confidences[0, 1:].sum()) == pytest.approx(1.0 - float(probabilities[0] + probabilities[1]), rel=1e-5)
