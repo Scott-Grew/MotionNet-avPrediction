@@ -793,3 +793,29 @@ def test_submitted_confidences_conserve_probability_mass_and_hand_a_duplicates_s
     assert not (kept_trajectories[0, :, -1, 0] == 0.5).any()
     assert float(confidences[0, 0]) == pytest.approx(float(probabilities[0] + probabilities[1]), rel=1e-6)
     assert float(confidences[0, 1:].sum()) == pytest.approx(1.0 - float(probabilities[0] + probabilities[1]), rel=1e-5)
+
+
+def test_a_constant_step_head_walks_a_straight_line_and_a_rotating_step_head_walks_an_arc():
+    torch.manual_seed(137)
+    decoder = model.ModeDecoder(model.unit_anchor_offsets_per_type() * 0.0).eval()
+    tokens = torch.randn(1, 5, model.HIDDEN_DIM)
+    token_present = torch.ones(1, 5, dtype=torch.bool)
+    with torch.no_grad():
+        decoder.trajectory_head[-1].weight.zero_()
+        bias = decoder.trajectory_head[-1].bias.view(2, contract.FUTURE_STEPS, 2)
+        bias.zero_()
+        bias[0, :, 0] = 0.5
+        straight, _, _, _ = decoder(tokens, token_present, torch.zeros(1, dtype=torch.long))
+        angles = 0.02 * torch.arange(contract.FUTURE_STEPS, dtype=torch.float32)
+        bias[0, :, 0] = 0.5 * angles.cos()
+        bias[0, :, 1] = 0.5 * angles.sin()
+        arc, _, _, _ = decoder(tokens, token_present, torch.zeros(1, dtype=torch.long))
+    expected_straight = torch.stack(
+        [0.5 * torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32), torch.zeros(contract.FUTURE_STEPS)],
+        dim=-1,
+    )
+    assert torch.allclose(straight[0, 0], expected_straight, atol=1e-5)
+    steps = arc[0, 0].diff(dim=0)
+    assert torch.allclose(steps.norm(dim=-1), torch.full((contract.FUTURE_STEPS - 1,), 0.5), atol=1e-5)
+    turning = torch.atan2(steps[:, 1], steps[:, 0]).diff()
+    assert torch.allclose(turning, torch.full_like(turning, 0.02), atol=1e-5)

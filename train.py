@@ -45,10 +45,10 @@ def optimiser_steps_per_epoch(scenario_paths, worker_count, batch_size, designat
         steps += math.ceil(stream_sample_count / batch_size)
     return steps
 
-def scheduled_learning_rate(process_steps, warmup_steps):
+def scheduled_learning_rate(process_steps, warmup_steps, learning_rate=LEARNING_RATE):
     if process_steps < warmup_steps:
-        return LEARNING_RATE * (process_steps + 1) / warmup_steps
-    return LEARNING_RATE
+        return learning_rate * (process_steps + 1) / warmup_steps
+    return learning_rate
 
 def training_losses(predictor, batch):
     trajectories, log_standard_deviation, confidence_logits, unit_anchors = predictor.predict(batch)
@@ -83,7 +83,7 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
 def train_epoch(
     predictor, optimizer, batches, device, gradient_scaler,
     checkpoint_path, previous_checkpoint_path, checkpoint_every_seconds,
-    epoch_index, seed, warmup_steps, gradient_clip_norm, process_steps_before_epoch,
+    epoch_index, seed, warmup_steps, gradient_clip_norm, process_steps_before_epoch, learning_rate,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
@@ -107,9 +107,11 @@ def train_epoch(
             total, regression, classification, trajectories, confidence_logits = training_losses(
                 predictor, batch
             )
-        learning_rate = scheduled_learning_rate(process_steps_before_epoch + batch_count, warmup_steps)
+        step_learning_rate = scheduled_learning_rate(
+            process_steps_before_epoch + batch_count, warmup_steps, learning_rate
+        )
         for parameter_group in optimizer.param_groups:
-            parameter_group["lr"] = learning_rate
+            parameter_group["lr"] = step_learning_rate
         optimizer.zero_grad()
         gradient_scaler.scale(total).backward()
         gradient_scaler.unscale_(optimizer)
@@ -162,7 +164,7 @@ def train_epoch(
                 f"backfilled {100 * window_monitor['backfill_rate']:.0f}% "
                 f"never-win {never_win_count}/{QUERY_COUNT} | "
                 f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} "
-                f"clipped {clipped_step_count} | lr {learning_rate:.3e} | "
+                f"clipped {clipped_step_count} | lr {step_learning_rate:.3e} | "
                 f"{sample_count / elapsed:.1f} samples/s | "
                 f"wait {100 * seconds['data_wait'] / elapsed:.0f}% "
                 f"step {100 * seconds['step'] / elapsed:.0f}% "
@@ -195,6 +197,7 @@ def main():
     parser.add_argument("--stop-after-seconds", type=float, required=True)
     parser.add_argument("--warmup-steps", type=int, required=True)
     parser.add_argument("--gradient-clip-norm", type=float, required=True)
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
@@ -205,7 +208,7 @@ def main():
     torch.manual_seed(arguments.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     predictor = MotionPredictor(model.load_anchor_file(arguments.anchors)).to(device)
-    optimizer = torch.optim.AdamW(parameter_groups(predictor), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(parameter_groups(predictor), lr=arguments.learning_rate)
     gradient_scaler = GradScaler(enabled=arguments.mixed_precision and device.type == "cuda")
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
@@ -214,7 +217,7 @@ def main():
     )
     print(
         f"{steps_per_epoch} optimiser steps per epoch, {steps_per_epoch * arguments.epochs} over"
-        f" {arguments.epochs} epochs, learning rate {LEARNING_RATE} held after"
+        f" {arguments.epochs} epochs, learning rate {arguments.learning_rate} held after"
         f" {arguments.warmup_steps} warmup steps",
         flush=True,
     )
@@ -258,6 +261,7 @@ def main():
             arguments.checkpoint_path, previous_checkpoint_path,
             arguments.checkpoint_every_seconds, epoch_index, arguments.seed,
             arguments.warmup_steps, arguments.gradient_clip_norm, process_steps_before_epoch,
+            arguments.learning_rate,
         )
         process_steps_before_epoch += steps_per_epoch
         print(

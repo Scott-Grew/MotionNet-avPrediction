@@ -43,6 +43,7 @@ def test_warmup_rises_to_the_learning_rate_then_holds_it():
     assert rates[0] < rates[warmup_steps - 1]
     assert all(later >= earlier for earlier, later in zip(rates[:warmup_steps], rates[1:warmup_steps]))
     assert all(rate == train.LEARNING_RATE for rate in rates[warmup_steps:])
+    assert train.scheduled_learning_rate(warmup_steps + 5, warmup_steps, 1e-4) == 1e-4
 
 
 def test_resuming_never_skips_a_completed_epoch():

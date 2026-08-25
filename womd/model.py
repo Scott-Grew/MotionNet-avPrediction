@@ -223,9 +223,10 @@ class ModeDecoder(nn.Module):
         head_output = self.trajectory_head(queries).float().view(
             batch_size, QUERY_COUNT, 2, contract.FUTURE_STEPS, 2
         )
-        step_offsets, log_standard_deviation = head_output.unbind(dim=2)
+        step_displacements, log_standard_deviation = head_output.unbind(dim=2)
         trajectories = (
-            step_offsets + selected_unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
+            step_displacements.cumsum(dim=-2)
+            + selected_unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
         )
         log_standard_deviation = log_standard_deviation.clamp(
             MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
