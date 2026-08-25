@@ -305,6 +305,15 @@ def prune_modes_batched(trajectories, confidence_logits):
     )
     return kept_trajectories, kept_confidence_logits
 
+def aggregated_confidences(trajectories, confidence_logits, kept_trajectories):
+    probabilities = torch.softmax(confidence_logits, dim=-1)
+    separations = torch.cdist(trajectories[:, :, -1], kept_trajectories[:, :, -1])
+    nearest_kept = separations.argmin(dim=-1)
+    aggregated = torch.zeros(
+        kept_trajectories.shape[:2], dtype=probabilities.dtype, device=probabilities.device
+    )
+    return aggregated.scatter_add(1, nearest_kept, probabilities)
+
 class MotionPredictor(nn.Module):
     def __init__(self, unit_anchors):
         super().__init__()

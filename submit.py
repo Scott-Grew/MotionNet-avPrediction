@@ -58,9 +58,10 @@ def submission_trajectories_and_confidences(predictor, samples):
             trajectories, confidence_logits = baseline.constant_velocity(batch)
         else:
             trajectories, confidence_logits = predictor(batch)
-    pruned_trajectories, pruned_logits = model.prune_modes_batched(trajectories, confidence_logits)
+    pruned_trajectories, _ = model.prune_modes_batched(trajectories, confidence_logits)
+    confidences = model.aggregated_confidences(trajectories, confidence_logits, pruned_trajectories)
     decimated = pruned_trajectories.index_select(2, SUBMISSION_STEP_SELECTOR)
-    return decimated.numpy(), torch.softmax(pruned_logits, dim=-1).numpy()
+    return decimated.numpy(), confidences.numpy()
 
 
 def load_predictor(checkpoint_path, anchors_path):

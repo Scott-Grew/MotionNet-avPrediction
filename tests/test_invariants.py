@@ -775,3 +775,21 @@ def test_one_training_step_runs_the_whole_path_over_staged_scenarios(tmp_path):
     torch.save(predictor.state_dict(), checkpoint_path)
     reloaded_state = torch.load(checkpoint_path)
     assert all(torch.equal(reloaded_state[name], parameter) for name, parameter in predictor.state_dict().items())
+
+
+def test_submitted_confidences_conserve_probability_mass_and_hand_a_duplicates_share_to_its_keeper():
+    torch.manual_seed(131)
+    trajectories = torch.zeros(1, model.QUERY_COUNT, contract.FUTURE_STEPS, 2)
+    trajectories[0, :, -1, 0] = 10.0 * torch.arange(model.QUERY_COUNT, dtype=torch.float32)
+    trajectories[0, 1, -1, 0] = 0.5
+    confidence_logits = torch.zeros(1, model.QUERY_COUNT)
+    confidence_logits[0, 0] = 3.0
+    confidence_logits[0, 1] = 2.0
+    kept_trajectories, kept_logits = model.prune_modes_batched(trajectories, confidence_logits)
+    confidences = model.aggregated_confidences(trajectories, confidence_logits, kept_trajectories)
+    probabilities = torch.softmax(confidence_logits, dim=-1)[0]
+    assert float(confidences.sum()) == pytest.approx(1.0, rel=1e-6)
+    assert float(kept_trajectories[0, 0, -1, 0]) == 0.0
+    assert not (kept_trajectories[0, :, -1, 0] == 0.5).any()
+    assert float(confidences[0, 0]) == pytest.approx(float(probabilities[0] + probabilities[1]), rel=1e-6)
+    assert float(confidences[0, 0]) > float(torch.softmax(kept_logits, dim=-1)[0, 0])
