@@ -1,5 +1,4 @@
 import hashlib
-import math
 
 import torch
 from torch import nn
@@ -131,7 +130,6 @@ class SceneEncoder(nn.Module):
         self.neighbour_encoder = AgentHistoryEncoder()
         self.map_encoder = MapDotEncoder()
         self.signal_projection = nn.Linear(contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False)
-        self.lane_context_projection = nn.Linear(contract.LANE_CONTEXT_DIM, HIDDEN_DIM, bias=False)
         self.layers = nn.ModuleList(SceneAttentionLayer() for _ in range(SCENE_ATTENTION_ROUNDS))
 
     def forward(self, batch):
@@ -146,10 +144,8 @@ class SceneEncoder(nn.Module):
             self.map_encoder(batch["map_rows"]), batch["map_dot_polyline_slot"],
             agent_token.shape[0], int(batch["max_polylines_in_batch"]),
         )
-        map_tokens = (
-            map_tokens
-            + self.signal_projection(batch["map_chunk_signal_history"].flatten(start_dim=-2))
-            + self.lane_context_projection(batch["map_chunk_lane_context"])
+        map_tokens = map_tokens + self.signal_projection(
+            batch["map_chunk_signal_history"].flatten(start_dim=-2)
         )
 
         tokens = torch.cat([agent_token, neighbour_tokens, map_tokens], dim=1)
@@ -166,15 +162,8 @@ PRUNE_DISTANCE_METRES = 2.5
 ANCHOR_DIRECTION_COUNT = 9
 ANCHOR_DISTANCE_COUNT = 6
 assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
-DECODER_ROUNDS = 3
-TRAJECTORY_QUANTITIES = (
-    "step_offsets", "heading_offsets",
-    "position_log_standard_deviation", "heading_log_standard_deviation",
-)
 MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
-HEADING_MAXIMUM_LOG_STANDARD_DEVIATION = math.log(2.0)
-HEADING_AT_NOW = (1.0, 0.0)
 
 def unit_anchor_offsets():
     direction_indices = torch.arange(ANCHOR_DIRECTION_COUNT).repeat_interleave(ANCHOR_DISTANCE_COUNT)
@@ -197,142 +186,58 @@ def agent_reachable_distance(agent_history):
         + 0.5 * contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED * contract.FUTURE_HORIZON_SECONDS ** 2
     )
 
-def full_anchor_counts(query_count):
-    return torch.full((contract.NUM_OBJECT_TYPES,), query_count, dtype=torch.long)
-
-def mode_validity(anchor_counts, predicted_type_index, query_count):
-    mode_positions = torch.arange(query_count, device=predicted_type_index.device)
-    return mode_positions[None, :] < anchor_counts[predicted_type_index][:, None]
-
 class ModeDecoder(nn.Module):
-    def __init__(self, initial_unit_anchors, anchor_counts=None):
+    def __init__(self, unit_anchors):
         super().__init__()
-        query_count = int(initial_unit_anchors.shape[1])
-        assert initial_unit_anchors.shape == (contract.NUM_OBJECT_TYPES, query_count, 2), (
-            f"initial_unit_anchors has shape {tuple(initial_unit_anchors.shape)}, but the decoder"
-            f" holds one query-count-anchor set per predicted object type and needs"
-            f" ({contract.NUM_OBJECT_TYPES}, query_count, 2)."
-            f" Re-run fit_anchors.py to produce a per-type anchor file"
+        assert unit_anchors.shape == (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2), (
+            f"unit_anchors has shape {tuple(unit_anchors.shape)}; the decoder holds one"
+            f" {QUERY_COUNT}-anchor set per predicted object type"
         )
-        if anchor_counts is None:
-            anchor_counts = full_anchor_counts(query_count)
-        anchor_counts = torch.as_tensor(anchor_counts, dtype=torch.long)
-        assert anchor_counts.shape == (contract.NUM_OBJECT_TYPES,), (
-            f"anchor_counts has shape {tuple(anchor_counts.shape)}, one count per predicted type"
-            f" is needed"
-        )
-        assert bool((anchor_counts >= contract.NUM_PREDICTED_MODES).all()), (
-            f"anchor_counts {anchor_counts.tolist()} holds a type with fewer anchors than the"
-            f" {contract.NUM_PREDICTED_MODES} modes a submission needs"
-        )
-        assert bool((anchor_counts <= query_count).all()), (
-            f"anchor_counts {anchor_counts.tolist()} exceeds the {query_count} query slots"
-        )
-        self.query_count = query_count
-        self.queries = nn.Parameter(torch.randn(query_count, HIDDEN_DIM) * 0.02)
-        self.register_buffer("anchor_offsets", initial_unit_anchors.detach().clone().float())
-        self.register_buffer("anchor_counts", anchor_counts)
+        self.queries = nn.Parameter(torch.randn(QUERY_COUNT, HIDDEN_DIM) * 0.02)
+        self.register_buffer("unit_anchors", unit_anchors.detach().clone().float())
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.round_norms = nn.ModuleList(nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS))
-        self.round_attention = nn.ModuleList(MultiHeadAttention() for _ in range(DECODER_ROUNDS))
-        self.draft_projection = nn.Linear(2, HIDDEN_DIM, bias=False)
+        self.query_norm = nn.LayerNorm(HIDDEN_DIM)
+        self.attention = MultiHeadAttention()
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
-            nn.Linear(
-                FEEDFORWARD_DIM,
-                len(TRAJECTORY_QUANTITIES) * contract.FUTURE_STEPS * 2,
-            ),
+            nn.Linear(FEEDFORWARD_DIM, 2 * contract.FUTURE_STEPS * 2),
         )
         self.confidence_head = nn.Linear(HIDDEN_DIM, 1)
         self.register_buffer(
             "anchor_ramp",
-            torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32)
-            / contract.FUTURE_STEPS,
+            torch.arange(1, contract.FUTURE_STEPS + 1, dtype=torch.float32) / contract.FUTURE_STEPS,
             persistent=False,
         )
-        self.register_buffer("heading_at_now", torch.tensor(HEADING_AT_NOW), persistent=False)
-
-    @property
-    def unit_anchors(self):
-        return self.anchor_offsets
-
-    def emit(self, queries, unit_anchors, mode_valid, batch_size):
-        head_output = self.trajectory_head(queries).float().view(
-            batch_size, self.query_count, len(TRAJECTORY_QUANTITIES), contract.FUTURE_STEPS, 2
-        )
-        (
-            step_offsets, heading_offsets,
-            position_log_standard_deviation, heading_log_standard_deviation,
-        ) = head_output.unbind(dim=2)
-        heading_cosine_sine = heading_offsets + self.heading_at_now.to(head_output.dtype)
-        position_log_standard_deviation = position_log_standard_deviation.clamp(
-            MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
-        )
-        heading_log_standard_deviation = heading_log_standard_deviation.clamp(
-            MINIMUM_LOG_STANDARD_DEVIATION, HEADING_MAXIMUM_LOG_STANDARD_DEVIATION
-        )
-        confidence_logits = self.confidence_head(queries).squeeze(-1).masked_fill(
-            ~mode_valid, float("-inf")
-        )
-        anchored_position = (
-            step_offsets + unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
-        )
-        emitted_step_positions = torch.cat(
-            [torch.zeros_like(anchored_position[..., :1, :]), anchored_position], dim=-2
-        )
-        predicted_speed = emitted_step_positions.diff(dim=-2).norm(
-            dim=-1
-        ) / contract.TIMESTEP_SECONDS
-        return (
-            anchored_position, heading_cosine_sine, position_log_standard_deviation,
-            heading_log_standard_deviation, confidence_logits, predicted_speed,
-        )
-
-    def decode_from_anchors(
-        self, normed_tokens, token_present, unit_anchors, mode_valid, batch_size,
-    ):
-        queries = self.queries + self.anchor_projection(
-            unit_anchors / contract.DISTANCE_NORMALISER_METRES
-        )
-        round_outputs = []
-        for round_index in range(DECODER_ROUNDS):
-            queries = queries + self.round_attention[round_index](
-                self.round_norms[round_index](queries), normed_tokens, token_present,
-            )
-            emitted = self.emit(queries, unit_anchors, mode_valid, batch_size)
-            round_outputs.append(emitted)
-            if round_index + 1 < DECODER_ROUNDS:
-                draft_endpoint = emitted[0][..., -1, :]
-                queries = queries + self.draft_projection(
-                    draft_endpoint / contract.DISTANCE_NORMALISER_METRES
-                )
-        return round_outputs
 
     def forward(self, tokens, token_present, predicted_type_index):
         batch_size = tokens.shape[0]
-        normed_tokens = self.scene_norm(tokens)
         selected_unit_anchors = self.unit_anchors[predicted_type_index]
-        mode_valid = mode_validity(self.anchor_counts, predicted_type_index, self.query_count)
-        round_outputs = self.decode_from_anchors(
-            normed_tokens, token_present, selected_unit_anchors, mode_valid, batch_size,
+        queries = self.queries + self.anchor_projection(
+            selected_unit_anchors / contract.DISTANCE_NORMALISER_METRES
         )
-        return round_outputs, selected_unit_anchors, mode_valid
+        queries = queries + self.attention(
+            self.query_norm(queries), self.scene_norm(tokens), token_present
+        )
+        head_output = self.trajectory_head(queries).float().view(
+            batch_size, QUERY_COUNT, 2, contract.FUTURE_STEPS, 2
+        )
+        step_offsets, log_standard_deviation = head_output.unbind(dim=2)
+        trajectories = (
+            step_offsets + selected_unit_anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
+        )
+        log_standard_deviation = log_standard_deviation.clamp(
+            MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
+        )
+        confidence_logits = self.confidence_head(queries).squeeze(-1)
+        return trajectories, log_standard_deviation, confidence_logits, selected_unit_anchors
 
-def validity_or_finite_logits(confidence_logits, mode_valid):
-    if mode_valid is None:
-        return confidence_logits > float("-inf")
-    return mode_valid
-
-def prune_modes(trajectories, confidence_logits, mode_valid=None):
-    mode_valid = validity_or_finite_logits(confidence_logits, mode_valid)
+def prune_modes(trajectories, confidence_logits):
     kept_indices = []
     dropped_indices = []
     endpoints = trajectories[:, -1]
     for mode_index in torch.argsort(confidence_logits, descending=True).tolist():
-        if not bool(mode_valid[mode_index]):
-            continue
         if kept_indices and bool(
             (torch.cdist(endpoints[mode_index][None], endpoints[kept_indices]) < PRUNE_DISTANCE_METRES).any()
         ):
@@ -345,12 +250,7 @@ def prune_modes(trajectories, confidence_logits, mode_valid=None):
     kept = torch.tensor(kept_indices, device=trajectories.device)
     return trajectories[kept], confidence_logits[kept]
 
-def prune_modes_batched_with_kept_count(trajectories, confidence_logits, mode_valid=None):
-    mode_valid = validity_or_finite_logits(confidence_logits, mode_valid)
-    assert bool(mode_valid[:, 0].all()), (
-        "the prune walk backfills from mode 0 when fewer than"
-        f" {contract.NUM_PREDICTED_MODES} modes are kept, so mode 0 must be valid for every sample"
-    )
+def prune_modes_batched_with_kept_count(trajectories, confidence_logits):
     batch_size, mode_count = confidence_logits.shape
     device = trajectories.device
     endpoints = trajectories[:, :, -1]
@@ -366,11 +266,10 @@ def prune_modes_batched_with_kept_count(trajectories, confidence_logits, mode_va
 
     for walk_position in range(mode_count):
         candidate_index = confidence_order[:, walk_position]
-        candidate_valid = mode_valid.gather(1, candidate_index[:, None]).squeeze(1)
         candidate_endpoint = endpoints.gather(1, candidate_index[:, None, None].expand(-1, -1, 2))
         separations = torch.cdist(candidate_endpoint, kept_endpoints).squeeze(1)
         too_close = ((separations < PRUNE_DISTANCE_METRES) & kept_slot_filled).any(dim=-1)
-        still_walking = (kept_count < contract.NUM_PREDICTED_MODES) & candidate_valid
+        still_walking = kept_count < contract.NUM_PREDICTED_MODES
 
         keeps = still_walking & ~too_close
         keep_slot = keeps[:, None] & (slot_positions[None, :] == kept_count[:, None])
@@ -400,117 +299,28 @@ def prune_modes_batched_with_kept_count(trajectories, confidence_logits, mode_va
         kept_count,
     )
 
-def prune_modes_batched(trajectories, confidence_logits, mode_valid=None):
+def prune_modes_batched(trajectories, confidence_logits):
     kept_trajectories, kept_confidence_logits, _ = prune_modes_batched_with_kept_count(
-        trajectories, confidence_logits, mode_valid
+        trajectories, confidence_logits
     )
     return kept_trajectories, kept_confidence_logits
 
-def last_valid_history_position(neighbour_history, neighbour_history_mask):
-    step_positions = torch.arange(
-        contract.HISTORY_STEPS, device=neighbour_history.device, dtype=torch.long
-    )
-    last_valid_step = torch.where(
-        neighbour_history_mask, step_positions, torch.full_like(step_positions, -1)
-    ).max(dim=-1).values.clamp(min=0)
-    selector = last_valid_step[..., None, None].expand(-1, -1, 1, contract.AGENT_FEATURE_DIM)
-    last_rows = neighbour_history.gather(2, selector).squeeze(2)
-    return last_rows[..., contract.AGENT_POSITION]
-
-class NeighbourFutureHead(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.token_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.network = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
-            nn.ReLU(),
-            nn.Linear(FEEDFORWARD_DIM, 4 * contract.FUTURE_STEPS),
-        )
-
-    def forward(self, neighbour_tokens, neighbour_reference_positions):
-        head_output = self.network(self.token_norm(neighbour_tokens))
-        displacements = head_output[..., : 2 * contract.FUTURE_STEPS].view(
-            *neighbour_tokens.shape[:2], contract.FUTURE_STEPS, 2
-        )
-        positions = displacements + neighbour_reference_positions[..., None, :]
-        position_log_standard_deviation = head_output[..., 2 * contract.FUTURE_STEPS:].view(
-            *neighbour_tokens.shape[:2], contract.FUTURE_STEPS, 2
-        ).clamp(MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION)
-        return positions, displacements, position_log_standard_deviation
-
 class MotionPredictor(nn.Module):
-    def __init__(self, initial_unit_anchors, anchor_counts=None):
+    def __init__(self, unit_anchors):
         super().__init__()
         self.scene_encoder = SceneEncoder()
-        self.mode_decoder = ModeDecoder(initial_unit_anchors, anchor_counts)
-        self.neighbour_future_head = NeighbourFutureHead()
-        self.neighbour_future_feedback_projection = nn.Linear(
-            2 * contract.FUTURE_STEPS, HIDDEN_DIM, bias=False
-        )
+        self.mode_decoder = ModeDecoder(unit_anchors)
 
     @property
     def unit_anchors(self):
         return self.mode_decoder.unit_anchors
 
-    def encode_scene_and_modes(self, batch):
+    def predict(self, batch):
         tokens, token_present = self.scene_encoder(batch)
-        neighbour_count = batch["neighbour_history"].shape[1]
-        neighbour_tokens = tokens[:, 1:1 + neighbour_count]
-        neighbour_present = token_present[:, 1:1 + neighbour_count]
-        (
-            neighbour_future_positions, neighbour_displacements, neighbour_log_standard_deviation,
-        ) = self.neighbour_future_head(
-            neighbour_tokens,
-            last_valid_history_position(
-                batch["neighbour_history"], batch["neighbour_history_mask"]
-            ),
-        )
-        neighbour_feedback = self.neighbour_future_feedback_projection(
-            (neighbour_displacements / contract.DISTANCE_NORMALISER_METRES).flatten(start_dim=-2)
-        )
-        neighbour_feedback = (
-            neighbour_feedback * neighbour_present.unsqueeze(-1).to(neighbour_feedback.dtype)
-        )
-        tokens = torch.cat(
-            [tokens[:, :1], neighbour_tokens + neighbour_feedback, tokens[:, 1 + neighbour_count:]],
-            dim=1,
-        )
-        round_outputs, selected_unit_anchors, mode_valid = self.mode_decoder(
-            tokens, token_present, predicted_type_index(batch["agent_history"]),
-        )
-        return (
-            tokens, round_outputs, selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        )
-
-    def predict_every_round(self, batch):
-        (
-            _, round_outputs, selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        ) = self.encode_scene_and_modes(batch)
-        return (
-            round_outputs, selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        )
-
-    def predict_with_heading(self, batch):
-        (
-            round_outputs, selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        ) = self.predict_every_round(batch)
-        (
-            trajectories, heading_cosine_sine, position_log_standard_deviation,
-            heading_log_standard_deviation, confidence_logits, predicted_speed,
-        ) = round_outputs[-1]
-        return (
-            trajectories, heading_cosine_sine, position_log_standard_deviation,
-            heading_log_standard_deviation, confidence_logits, predicted_speed,
-            selected_unit_anchors, mode_valid,
-            neighbour_future_positions, neighbour_log_standard_deviation,
-        )
+        return self.mode_decoder(tokens, token_present, predicted_type_index(batch["agent_history"]))
 
     def forward(self, batch):
-        trajectories, _, _, _, confidence_logits, _, _, _, _, _ = self.predict_with_heading(batch)
+        trajectories, _, confidence_logits, _ = self.predict(batch)
         return trajectories, confidence_logits
 
 def parameter_fingerprint(model_state):
@@ -548,15 +358,8 @@ def load_anchor_file(anchors_path):
             anchors_path, "Refit them with fit_anchors.py.",
         )
         unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
-        assert "anchor_counts" in anchors_file, (
-            f"{anchors_path} carries no anchor_counts, so it predates per-type anchor counts."
-            f" Refit it with fit_anchors.py."
-        )
-        anchor_counts = torch.from_numpy(anchors_file["anchor_counts"])
     assert unit_anchors.shape == (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2), (
-        f"{anchors_path} holds unit_anchors of shape {tuple(unit_anchors.shape)},"
-        f" but the model has {QUERY_COUNT} query slots and one anchor set per predicted object"
-        f" type, so it needs ({contract.NUM_OBJECT_TYPES}, {QUERY_COUNT}, 2)."
-        f" Re-run fit_anchors.py to produce a per-type file"
+        f"{anchors_path} holds unit_anchors of shape {tuple(unit_anchors.shape)}, but the model"
+        f" needs ({contract.NUM_OBJECT_TYPES}, {QUERY_COUNT}, 2). Re-run fit_anchors.py"
     )
-    return unit_anchors, anchor_counts
+    return unit_anchors

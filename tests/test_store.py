@@ -140,67 +140,6 @@ def test_boundary_crossing_codes_resolve_raw_indices_through_resampling():
     assert np.all(rows[:, contract.MAP_RIGHT_BOUNDARY_CROSSING] == 0.0)
 
 
-def test_lane_graph_resolves_raw_polyline_indices_not_resampled_rows():
-    lane = polyline_feature("lane", [(0.0, 0.0), (30.0, 0.0), (60.0, 0.0)], feature_id=11)
-    lane.lane.entry_lanes.append(14)
-    lane.lane.exit_lanes.append(13)
-    left_boundary = lane.lane.left_boundaries.add()
-    left_boundary.lane_start_index = 0
-    left_boundary.lane_end_index = 1
-    left_boundary.boundary_feature_id = 16
-    left_boundary.boundary_type = 2
-    right_neighbour = lane.lane.right_neighbors.add()
-    right_neighbour.feature_id = 12
-    right_neighbour.self_start_index = 1
-    right_neighbour.self_end_index = 2
-    right_neighbour.neighbor_start_index = 0
-    right_neighbour.neighbor_end_index = 2
-    shared_boundary = right_neighbour.boundaries.add()
-    shared_boundary.lane_start_index = 1
-    shared_boundary.lane_end_index = 2
-    shared_boundary.boundary_feature_id = 15
-    shared_boundary.boundary_type = 4
-
-    neighbour_lane = polyline_feature(
-        "lane", [(0.0, 3.0), (30.0, 3.0), (60.0, 3.0)], feature_id=12
-    )
-    stop_sign = map_pb2.MapFeature()
-    stop_sign.id = 20
-    stop_sign.stop_sign.position.x = 5.0
-    stop_sign.stop_sign.lane.extend([11, 13])
-
-    scenario = scenario_pb2.Scenario()
-    scenario.map_features.extend([lane, neighbour_lane, stop_sign])
-
-    (lane_connections, lane_neighbour_ids, lane_neighbour_bounds, lane_boundary_ids,
-     lane_boundary_bounds, stop_sign_controlled_lanes) = store.scenario_lane_graph_arrays(
-        scenario, WORLD_ORIGIN, WORLD_HEADING, {11, 12, 20}
-    )
-
-    assert lane_connections.tolist() == [[14, 11, 0], [11, 13, 1]]
-    assert lane_neighbour_ids.tolist() == [[11, 12, 1]]
-    assert lane_neighbour_bounds.tolist() == [[30.0, 0.0, 60.0, 0.0, 0.0, 3.0, 60.0, 3.0]]
-    assert lane_boundary_ids.tolist() == [[11, -1, 16, 0, 2], [11, 12, 15, 1, 4]]
-    assert lane_boundary_bounds.tolist() == [[0.0, 0.0, 30.0, 0.0], [30.0, 0.0, 60.0, 0.0]]
-    assert stop_sign_controlled_lanes.tolist() == [[20, 11], [20, 13]]
-
-
-def test_lane_graph_arrays_are_empty_and_correctly_shaped_without_relations():
-    scenario = scenario_pb2.Scenario()
-    scenario.map_features.append(polyline_feature("lane", [(0.0, 0.0), (10.0, 0.0)], feature_id=1))
-
-    graph_arrays = store.scenario_lane_graph_arrays(scenario, WORLD_ORIGIN, WORLD_HEADING, {1})
-    widths = (
-        contract.LANE_CONNECTION_WIDTH,
-        contract.LANE_NEIGHBOUR_ID_WIDTH,
-        contract.LANE_NEIGHBOUR_BOUND_WIDTH,
-        contract.LANE_BOUNDARY_ID_WIDTH,
-        contract.LANE_BOUNDARY_BOUND_WIDTH,
-        contract.STOP_SIGN_LANE_WIDTH,
-    )
-    assert [array.shape for array in graph_arrays] == [(0, width) for width in widths]
-
-
 def test_feature_row_layout_is_pinned():
     assert contract.MAP_FEATURE_DIM == 32
     assert contract.AGENT_FEATURE_DIM == 13

@@ -249,113 +249,6 @@ def scenario_map_arrays(scenario):
         np.array(feature_is_interpolating, dtype=bool),
     )
 
-def lane_raw_polylines(scenario):
-    polylines = {}
-    for feature in scenario.map_features:
-        if feature.WhichOneof("feature_data") == "lane" and len(feature.lane.polyline) > 0:
-            polylines[feature.id] = np.array([[point.x, point.y] for point in feature.lane.polyline])
-    return polylines
-
-def boundary_segment_rows(lane_id, shared_neighbour_lane_id, side_index, segments, lane_points):
-    identity_rows = []
-    endpoint_rows = []
-    for segment in segments:
-        assert 0 <= segment.lane_start_index < len(lane_points), (
-            f"boundary start {segment.lane_start_index} off lane {lane_id}"
-        )
-        assert 0 <= segment.lane_end_index < len(lane_points), (
-            f"boundary end {segment.lane_end_index} off lane {lane_id}"
-        )
-        assert segment.boundary_type < len(contract.ROAD_LINE_TYPES)
-        identity_rows.append([lane_id, shared_neighbour_lane_id, segment.boundary_feature_id,
-                              side_index, segment.boundary_type])
-        endpoint_rows.append(np.concatenate([lane_points[segment.lane_start_index],
-                                             lane_points[segment.lane_end_index]]))
-    return identity_rows, endpoint_rows
-
-def world_point_rows_to_storage_frame(packed_rows, row_width, origin, heading):
-    packed_points = np.array(packed_rows, dtype=np.float64).reshape(-1, 2)
-    reframed = frame_ops.positions_to_agent_frame(packed_points, origin, heading)
-    return reframed.reshape(-1, row_width)
-
-def scenario_lane_graph_arrays(scenario, origin, heading, stored_feature_ids):
-    raw_polylines = lane_raw_polylines(scenario)
-
-    connection_rows = []
-    neighbour_identity_rows = []
-    neighbour_extent_rows = []
-    boundary_identity_rows = []
-    boundary_endpoint_rows = []
-    stop_sign_rows = []
-
-    for feature in scenario.map_features:
-        if feature.id not in stored_feature_ids:
-            continue
-        kind = feature.WhichOneof("feature_data")
-        if kind == "stop_sign":
-            for controlled_lane_id in feature.stop_sign.lane:
-                stop_sign_rows.append([feature.id, controlled_lane_id])
-            continue
-        if kind != "lane":
-            continue
-
-        lane_points = raw_polylines[feature.id]
-        for entry_lane_id in feature.lane.entry_lanes:
-            connection_rows.append(
-                [entry_lane_id, feature.id, contract.LANE_CONNECTION_KINDS.index("entry")]
-            )
-        for exit_lane_id in feature.lane.exit_lanes:
-            connection_rows.append(
-                [feature.id, exit_lane_id, contract.LANE_CONNECTION_KINDS.index("exit")]
-            )
-
-        for side_index, side_name in enumerate(contract.LANE_SIDES):
-            side_identities, side_endpoints = boundary_segment_rows(
-                feature.id,
-                contract.NO_SHARED_NEIGHBOUR_LANE,
-                side_index,
-                getattr(feature.lane, f"{side_name}_boundaries"),
-                lane_points,
-            )
-            boundary_identity_rows.extend(side_identities)
-            boundary_endpoint_rows.extend(side_endpoints)
-
-            for neighbour in getattr(feature.lane, f"{side_name}_neighbors"):
-                assert neighbour.feature_id in raw_polylines, (
-                    f"neighbour lane {neighbour.feature_id} of lane {feature.id}"
-                    f" absent from scenario {scenario.scenario_id}"
-                )
-                neighbour_points = raw_polylines[neighbour.feature_id]
-                assert 0 <= neighbour.self_start_index < len(lane_points)
-                assert 0 <= neighbour.self_end_index < len(lane_points)
-                assert 0 <= neighbour.neighbor_start_index < len(neighbour_points)
-                assert 0 <= neighbour.neighbor_end_index < len(neighbour_points)
-                neighbour_identity_rows.append([feature.id, neighbour.feature_id, side_index])
-                neighbour_extent_rows.append(np.concatenate([
-                    lane_points[neighbour.self_start_index],
-                    lane_points[neighbour.self_end_index],
-                    neighbour_points[neighbour.neighbor_start_index],
-                    neighbour_points[neighbour.neighbor_end_index],
-                ]))
-                shared_identities, shared_endpoints = boundary_segment_rows(
-                    feature.id, neighbour.feature_id, side_index, neighbour.boundaries, lane_points
-                )
-                boundary_identity_rows.extend(shared_identities)
-                boundary_endpoint_rows.extend(shared_endpoints)
-
-    return (
-        np.array(connection_rows, dtype=np.int64).reshape(-1, contract.LANE_CONNECTION_WIDTH),
-        np.array(neighbour_identity_rows, dtype=np.int64).reshape(-1, contract.LANE_NEIGHBOUR_ID_WIDTH),
-        world_point_rows_to_storage_frame(
-            neighbour_extent_rows, contract.LANE_NEIGHBOUR_BOUND_WIDTH, origin, heading
-        ),
-        np.array(boundary_identity_rows, dtype=np.int64).reshape(-1, contract.LANE_BOUNDARY_ID_WIDTH),
-        world_point_rows_to_storage_frame(
-            boundary_endpoint_rows, contract.LANE_BOUNDARY_BOUND_WIDTH, origin, heading
-        ),
-        np.array(stop_sign_rows, dtype=np.int64).reshape(-1, contract.STOP_SIGN_LANE_WIDTH),
-    )
-
 def write_scenario(scenario, output_path):
     assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
         f"current_time_index {scenario.current_time_index}, scenario {scenario.scenario_id}"
@@ -367,10 +260,6 @@ def write_scenario(scenario, output_path):
     (map_rows, feature_lengths, feature_ids, polyline_signal_histories,
      feature_is_interpolating) = scenario_map_arrays(scenario)
     origin, heading = scenario_storage_frame(scenario)
-    (lane_connections, lane_neighbour_ids, lane_neighbour_bounds, lane_boundary_ids,
-     lane_boundary_bounds, stop_sign_controlled_lanes) = scenario_lane_graph_arrays(
-        scenario, origin, heading, set(feature_ids.tolist())
-    )
 
     partial_path = output_path.with_suffix(output_path.suffix + ".partial")
     with open(partial_path, "wb") as partial_file:
@@ -386,12 +275,6 @@ def write_scenario(scenario, output_path):
             feature_ids=feature_ids,
             feature_is_interpolating=feature_is_interpolating,
             polyline_signal_histories=polyline_signal_histories.astype(np.float32),
-            lane_connections=lane_connections,
-            lane_neighbour_ids=lane_neighbour_ids,
-            lane_neighbour_bounds=lane_neighbour_bounds.astype(np.float32),
-            lane_boundary_ids=lane_boundary_ids,
-            lane_boundary_bounds=lane_boundary_bounds.astype(np.float32),
-            stop_sign_controlled_lanes=stop_sign_controlled_lanes,
             frame_origin=origin.astype(np.float32),
             frame_heading=np.float32(heading),
             scenario_id=scenario.scenario_id,

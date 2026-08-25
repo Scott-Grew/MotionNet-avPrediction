@@ -108,23 +108,6 @@ def minimum_pairwise_distance(anchors):
     return float(separations.min())
 
 
-def largest_count_kept_apart_by_the_prune(endpoints, type_name):
-    for centre_count in range(model.QUERY_COUNT, contract.NUM_PREDICTED_MODES - 1, -1):
-        fitted = fit_unit_anchors(endpoints, centre_count)
-        separation = minimum_pairwise_distance(fitted[0])
-        print(
-            f"  {type_name}: {centre_count} anchors, minimum pairwise {separation:.3f} m,"
-            f" {'kept apart by' if separation >= model.PRUNE_DISTANCE_METRES else 'inside'}"
-            f" the {model.PRUNE_DISTANCE_METRES} m prune radius"
-        )
-        if separation >= model.PRUNE_DISTANCE_METRES:
-            return centre_count, fitted
-    raise SystemExit(
-        f"{type_name}: even {contract.NUM_PREDICTED_MODES} anchors sit inside the"
-        f" {model.PRUNE_DISTANCE_METRES} m prune radius"
-    )
-
-
 def print_one_type(
     type_name, type_sample_count, fitted_anchors, fitted_counts,
     iteration_count, stopped_by_convergence,
@@ -224,33 +207,28 @@ def main():
     )
     print()
 
-    unit_anchors = torch.zeros(contract.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2)
-    anchor_counts = torch.zeros(contract.NUM_OBJECT_TYPES, dtype=torch.long)
+    fitted_anchors_per_type = []
     for type_index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES):
         type_endpoints = endpoints[predicted_type_index == type_index]
-        centre_count, (
-            centres, assignment, _, iteration_count, stopped_by_convergence
-        ) = largest_count_kept_apart_by_the_prune(type_endpoints, type_name)
-        fitted_counts = endpoints_per_centre(assignment, centre_count)
+        centres, assignment, _, iteration_count, stopped_by_convergence = fit_unit_anchors(type_endpoints)
+        fitted_counts = endpoints_per_centre(assignment, model.QUERY_COUNT)
         share_order = torch.argsort(fitted_counts, descending=True, stable=True)
         fitted_anchors = centres[share_order]
-        unit_anchors[type_index, :centre_count] = fitted_anchors
-        anchor_counts[type_index] = centre_count
+        fitted_anchors_per_type.append(fitted_anchors)
         print_one_type(
             type_name, type_endpoints.shape[0], fitted_anchors, fitted_counts[share_order],
             iteration_count, stopped_by_convergence,
         )
 
+    unit_anchors = torch.stack(fitted_anchors_per_type)
     np.savez(
         output_path,
         unit_anchors=unit_anchors.numpy().astype(np.float32),
-        anchor_counts=anchor_counts.numpy().astype(np.int64),
         provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
     )
     print(
-        f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)} padded past each type's"
-        f" count, anchor_counts {anchor_counts.tolist()} per {contract.PREDICTED_OBJECT_TYPES}"
-        f" in that order, most-used anchor first"
+        f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)}, one set per"
+        f" {contract.PREDICTED_OBJECT_TYPES} in that order, most-used anchor first"
     )
 
 

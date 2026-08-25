@@ -64,8 +64,7 @@ def submission_trajectories_and_confidences(predictor, samples):
 
 
 def load_predictor(checkpoint_path, anchors_path):
-    unit_anchors, anchor_counts = model.load_anchor_file(anchors_path)
-    predictor = model.MotionPredictor(unit_anchors, anchor_counts)
+    predictor = model.MotionPredictor(model.load_anchor_file(anchors_path))
     predictor.load_state_dict(model.load_checkpoint_state(checkpoint_path)["model_state"])
     return predictor.eval()
 

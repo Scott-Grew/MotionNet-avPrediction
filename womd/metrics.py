@@ -3,13 +3,10 @@ import torch
 from womd import contract
 from womd.model import prune_modes_batched_with_kept_count
 
-def mean_distance_per_mode(trajectories, future_positions, future_mask, mode_valid=None):
+def mean_distance_per_mode(trajectories, future_positions, future_mask):
     step_distances = (trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
     validity = future_mask.unsqueeze(1).to(step_distances.dtype)
-    mean_distances = (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
-    if mode_valid is not None:
-        mean_distances = mean_distances.masked_fill(~mode_valid, float("inf"))
-    return mean_distances
+    return (step_distances * validity).sum(dim=-1) / validity.sum(dim=-1).clamp_min(1.0)
 
 class MetricAccumulator:
     def __init__(self):
@@ -21,9 +18,9 @@ class MetricAccumulator:
         self.backfilled_sample_count = 0
         self.sample_count = 0
 
-    def update(self, trajectories, confidence_logits, future_positions, future_mask, mode_valid=None):
+    def update(self, trajectories, confidence_logits, future_positions, future_mask):
         kept_trajectories, _, kept_mode_count = prune_modes_batched_with_kept_count(
-            trajectories, confidence_logits, mode_valid
+            trajectories, confidence_logits
         )
         distances = (kept_trajectories - future_positions.unsqueeze(1)).norm(dim=-1)
         valid_steps = future_mask.unsqueeze(1)
