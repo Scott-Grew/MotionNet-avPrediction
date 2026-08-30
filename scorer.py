@@ -19,8 +19,13 @@ def container_path(host_path):
 def build_container_image():
     subprocess.run(
         [
-            "docker", "build", "--platform", "linux/amd64",
-            "-t", CONTAINER_IMAGE_TAG, str(REWRITE_ROOT / "container"),
+            "docker",
+            "build",
+            "--platform",
+            "linux/amd64",
+            "-t",
+            CONTAINER_IMAGE_TAG,
+            str(REWRITE_ROOT / "container"),
         ],
         check=True,
     )
@@ -29,24 +34,33 @@ def build_container_image():
 def run_in_container(runner_arguments):
     subprocess.run(
         [
-            "docker", "run", "--rm", "--platform", "linux/amd64",
-            "-v", f"{WAYMO_PROJECT_ROOT}:{CONTAINER_MOUNT_POINT}",
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            "-v",
+            f"{WAYMO_PROJECT_ROOT}:{CONTAINER_MOUNT_POINT}",
             CONTAINER_IMAGE_TAG,
-            "python3", f"{CONTAINER_MOUNT_POINT}/rewrite/container/runner.py",
+            "python3",
+            f"{CONTAINER_MOUNT_POINT}/rewrite/container/runner.py",
             *runner_arguments,
         ],
         check=True,
     )
 
 
-def run_score(checkpoint_path, anchors_path, staged_directory, output_directory):
+def run_score(
+    checkpoint_path, anchors_path, staged_directory, output_directory
+):
     output_directory = Path(output_directory).resolve()
     output_directory.mkdir(parents=True, exist_ok=True)
     predictions_path = output_directory / "predictions.npz"
 
     subprocess.run(
         [
-            sys.executable, str(REWRITE_ROOT / "submit.py"),
+            sys.executable,
+            str(REWRITE_ROOT / "submit.py"),
             str(Path(checkpoint_path).resolve()),
             str(Path(staged_directory).resolve()),
             str(Path(anchors_path).resolve()),
@@ -56,12 +70,24 @@ def run_score(checkpoint_path, anchors_path, staged_directory, output_directory)
     )
 
     build_container_image()
-    run_in_container(["score", container_path(predictions_path), container_path(staged_directory)])
+    run_in_container(
+        [
+            "score",
+            container_path(predictions_path),
+            container_path(staged_directory),
+        ]
+    )
 
 
 def run_check_reader(shard_path, sample_count):
     build_container_image()
-    run_in_container(["check-reader", container_path(shard_path), str(sample_count)])
+    run_in_container(
+        [
+            "check-reader",
+            container_path(shard_path),
+            str(sample_count),
+        ]
+    )
 
 
 def main():
@@ -82,8 +108,10 @@ def main():
 
     if arguments.command == "score":
         run_score(
-            arguments.checkpoint_path, arguments.anchors_path,
-            arguments.staged_directory, arguments.output_directory,
+            arguments.checkpoint_path,
+            arguments.anchors_path,
+            arguments.staged_directory,
+            arguments.output_directory,
         )
     elif arguments.command == "check-reader":
         run_check_reader(arguments.shard_path, arguments.sample_count)

@@ -5,7 +5,11 @@ TOTAL_STEPS = HISTORY_STEPS + FUTURE_STEPS
 TIMESTEP_SECONDS = 0.1
 FUTURE_HORIZON_SECONDS = FUTURE_STEPS * TIMESTEP_SECONDS
 MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED = 3.56
-PREDICTED_OBJECT_TYPES = ("TYPE_VEHICLE", "TYPE_PEDESTRIAN", "TYPE_CYCLIST")
+PREDICTED_OBJECT_TYPES = (
+    "TYPE_VEHICLE",
+    "TYPE_PEDESTRIAN",
+    "TYPE_CYCLIST",
+)
 NUM_OBJECT_TYPES = len(PREDICTED_OBJECT_TYPES)
 AGENT_TYPES = PREDICTED_OBJECT_TYPES + ("TYPE_OTHER",)
 NUM_AGENT_TYPES = len(AGENT_TYPES)
@@ -18,8 +22,16 @@ STAGING_CODE_VERSION = "2026-08-19-a"
 SUBMISSION_STEPS = 16
 SUBMISSION_FIRST_SCENARIO_STEP = 15
 SUBMISSION_STEP_STRIDE = FUTURE_STEPS // SUBMISSION_STEPS
-SUBMISSION_FIRST_FUTURE_INDEX = SUBMISSION_FIRST_SCENARIO_STEP - (CURRENT_STEP_INDEX + 1)
-SUBMISSION_FUTURE_INDICES = tuple(range(SUBMISSION_FIRST_FUTURE_INDEX, FUTURE_STEPS, SUBMISSION_STEP_STRIDE))
+SUBMISSION_FIRST_FUTURE_INDEX = SUBMISSION_FIRST_SCENARIO_STEP - (
+    CURRENT_STEP_INDEX + 1
+)
+SUBMISSION_FUTURE_INDICES = tuple(
+    range(
+        SUBMISSION_FIRST_FUTURE_INDEX,
+        FUTURE_STEPS,
+        SUBMISSION_STEP_STRIDE,
+    )
+)
 assert len(SUBMISSION_FUTURE_INDICES) == SUBMISSION_STEPS
 assert SUBMISSION_FUTURE_INDICES[-1] == FUTURE_STEPS - 1
 
@@ -113,8 +125,12 @@ ROAD_EDGE_TYPES = (
 BOUNDARY_TYPES = ROAD_LINE_TYPES + ROAD_EDGE_TYPES
 NUM_BOUNDARY_TYPES = len(BOUNDARY_TYPES)
 
-MAP_BOUNDARY_TYPE = slice(MAP_SPEED_LIMIT + 1, MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES)
-MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
+MAP_BOUNDARY_TYPE = slice(
+    MAP_SPEED_LIMIT + 1, MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES
+)
+MAP_STOP_POINT = slice(
+    MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2
+)
 MAP_LEFT_BOUNDARY_CROSSING = MAP_STOP_POINT.stop
 MAP_RIGHT_BOUNDARY_CROSSING = MAP_LEFT_BOUNDARY_CROSSING + 1
 MAP_FEATURE_DIM = MAP_RIGHT_BOUNDARY_CROSSING + 1
@@ -122,16 +138,24 @@ NUM_BOUNDARY_CROSSING_CODES = len(ROAD_LINE_TYPES) + 1
 
 LANE_SIDES = ("left", "right")
 
+
 def artifact_provenance(producer, source):
     import json
-    return json.dumps({
-        "code_version": STAGING_CODE_VERSION,
-        "producer": producer,
-        "source": str(source),
-    })
 
-def check_artifact_provenance(stored_provenance, artifact_path, regenerate_hint):
+    return json.dumps(
+        {
+            "code_version": STAGING_CODE_VERSION,
+            "producer": producer,
+            "source": str(source),
+        }
+    )
+
+
+def check_artifact_provenance(
+    stored_provenance, artifact_path, regenerate_hint
+):
     import json
+
     assert stored_provenance is not None, (
         f"{artifact_path} carries no provenance stamp, so what produced it is unrecorded."
         f" {regenerate_hint}"

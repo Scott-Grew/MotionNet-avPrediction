@@ -25,12 +25,16 @@ def metre_endpoints(scenario_paths):
             True,
         )
         for track_index in eligible:
-            sample = loader.build_sample(scenario_array, int(track_index))
+            sample = loader.build_sample(
+                scenario_array, int(track_index)
+            )
             valid_future_steps = np.flatnonzero(sample["future_mask"])
             if valid_future_steps.size == 0:
                 continue
             agent_histories.append(sample["agent_history"])
-            logged_endpoints.append(sample["future_positions"][valid_future_steps[-1]])
+            logged_endpoints.append(
+                sample["future_positions"][valid_future_steps[-1]]
+            )
 
     agent_history = torch.from_numpy(np.stack(agent_histories))
     endpoints = torch.from_numpy(np.stack(logged_endpoints))
@@ -43,14 +47,23 @@ def metre_endpoints(scenario_paths):
 
 def endpoints_per_centre(assignment, centre_count):
     counts = torch.zeros(centre_count, dtype=torch.long)
-    return counts.index_add_(0, assignment, torch.ones_like(assignment))
+    return counts.index_add_(
+        0, assignment, torch.ones_like(assignment)
+    )
 
 
 def move_centres_to_assigned_means(endpoints, assignment, centres):
-    totals = torch.zeros_like(centres).index_add_(0, assignment, endpoints)
-    counts = endpoints_per_centre(assignment, centres.shape[0]).to(endpoints.dtype)
+    totals = torch.zeros_like(centres).index_add_(
+        0, assignment, endpoints
+    )
+    counts = endpoints_per_centre(assignment, centres.shape[0]).to(
+        endpoints.dtype
+    )
     means = totals / counts.clamp_min(1.0).unsqueeze(-1)
-    return torch.where(counts.unsqueeze(-1) > 0.0, means, centres), counts
+    return (
+        torch.where(counts.unsqueeze(-1) > 0.0, means, centres),
+        counts,
+    )
 
 
 def reseed_empty_centres(endpoints, assignment, centres, counts):
@@ -60,12 +73,16 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
     reseeded = centres.clone()
     splits_taken_from = torch.zeros_like(counts, dtype=torch.long)
     for empty_centre in empty_centres.tolist():
-        busiest_centre = int((counts / (1.0 + splits_taken_from)).argmax())
+        busiest_centre = int(
+            (counts / (1.0 + splits_taken_from)).argmax()
+        )
         endpoints_of_busiest = endpoints[assignment == busiest_centre]
         spread_within_busiest = (
             endpoints_of_busiest - centres[busiest_centre]
         ).norm(dim=-1)
-        spread_order = torch.argsort(spread_within_busiest, descending=True, stable=True)
+        spread_order = torch.argsort(
+            spread_within_busiest, descending=True, stable=True
+        )
         reseeded[empty_centre] = endpoints_of_busiest[
             spread_order[int(splits_taken_from[busiest_centre])]
         ]
@@ -74,32 +91,59 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
 
 
 def spread_out_seed_centres(endpoints, centre_count, generator):
-    first_seed = int(torch.randint(len(endpoints), (1,), generator=generator))
+    first_seed = int(
+        torch.randint(len(endpoints), (1,), generator=generator)
+    )
     centres = [endpoints[first_seed]]
     nearest_squared = (endpoints - centres[0]).pow(2).sum(dim=-1)
     while len(centres) < centre_count:
-        probabilities = nearest_squared / nearest_squared.sum().clamp_min(1e-12)
-        next_seed = int(torch.multinomial(probabilities, 1, generator=generator))
+        probabilities = (
+            nearest_squared / nearest_squared.sum().clamp_min(1e-12)
+        )
+        next_seed = int(
+            torch.multinomial(probabilities, 1, generator=generator)
+        )
         centres.append(endpoints[next_seed])
         nearest_squared = torch.minimum(
-            nearest_squared, (endpoints - centres[-1]).pow(2).sum(dim=-1)
+            nearest_squared,
+            (endpoints - centres[-1]).pow(2).sum(dim=-1),
         )
     return torch.stack(centres)
 
 
 def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     generator = torch.Generator().manual_seed(SEED_GENERATOR_SEED)
-    centres = spread_out_seed_centres(endpoints, centre_count, generator)
+    centres = spread_out_seed_centres(
+        endpoints, centre_count, generator
+    )
     initial_assignment = torch.cdist(endpoints, centres).argmin(dim=1)
     assignment = initial_assignment
     for iteration_count in range(1, MAXIMUM_ITERATIONS + 1):
-        centres, counts = move_centres_to_assigned_means(endpoints, assignment, centres)
-        centres = reseed_empty_centres(endpoints, assignment, centres, counts)
-        next_assignment = torch.cdist(endpoints, centres).argmin(dim=1)
+        centres, counts = move_centres_to_assigned_means(
+            endpoints, assignment, centres
+        )
+        centres = reseed_empty_centres(
+            endpoints, assignment, centres, counts
+        )
+        next_assignment = torch.cdist(endpoints, centres).argmin(
+            dim=1
+        )
         if torch.equal(next_assignment, assignment):
-            return centres, next_assignment, initial_assignment, iteration_count, True
+            return (
+                centres,
+                next_assignment,
+                initial_assignment,
+                iteration_count,
+                True,
+            )
         assignment = next_assignment
-    return centres, assignment, initial_assignment, MAXIMUM_ITERATIONS, False
+    return (
+        centres,
+        assignment,
+        initial_assignment,
+        MAXIMUM_ITERATIONS,
+        False,
+    )
 
 
 def minimum_pairwise_distance(anchors):
@@ -109,15 +153,21 @@ def minimum_pairwise_distance(anchors):
 
 
 def print_one_type(
-    type_name, type_sample_count, fitted_anchors, fitted_counts,
-    iteration_count, stopped_by_convergence,
+    type_name,
+    type_sample_count,
+    fitted_anchors,
+    fitted_counts,
+    iteration_count,
+    stopped_by_convergence,
 ):
     print(
         f"{type_name} | samples {type_sample_count} | {len(fitted_anchors)} anchors |"
         f" k-means ran {iteration_count} iterations, stopped by "
         f"{'an unchanged assignment' if stopped_by_convergence else f'the {MAXIMUM_ITERATIONS} iteration cap'}"
     )
-    print(f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}{'angle deg':>11}{'share':>9}")
+    print(
+        f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}{'angle deg':>11}{'share':>9}"
+    )
     for anchor_index in range(len(fitted_anchors)):
         offset_x, offset_y = fitted_anchors[anchor_index].tolist()
         print(
@@ -126,50 +176,81 @@ def print_one_type(
             f"{math.degrees(math.atan2(offset_y, offset_x)):>11.1f}"
             f"{int(fitted_counts[anchor_index]) / type_sample_count:>9.1%}"
         )
-    print(f"{'largest single share':<28}{int(fitted_counts.max()) / type_sample_count:>12.1%}")
-    print(f"{'minimum pairwise distance':<28}{minimum_pairwise_distance(fitted_anchors):>12.3f}")
+    print(
+        f"{'largest single share':<28}{int(fitted_counts.max()) / type_sample_count:>12.1%}"
+    )
+    print(
+        f"{'minimum pairwise distance':<28}{minimum_pairwise_distance(fitted_anchors):>12.3f}"
+    )
     print()
 
 
 def main():
     staged_directory = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
-    endpoints_cache_path = staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
+    endpoints_cache_path = (
+        staged_directory.parent
+        / f"{staged_directory.name}_endpoints_cache.npz"
+    )
 
     start_seconds = time.perf_counter()
     cached_arrays = None
     if endpoints_cache_path.exists():
         with np.load(endpoints_cache_path) as endpoints_cache:
             cache_provenance = (
-                endpoints_cache["provenance"] if "provenance" in endpoints_cache else None
+                endpoints_cache["provenance"]
+                if "provenance" in endpoints_cache
+                else None
             )
             try:
                 contract.check_artifact_provenance(
-                    cache_provenance, endpoints_cache_path, "Re-extracting endpoints now."
+                    cache_provenance,
+                    endpoints_cache_path,
+                    "Re-extracting endpoints now.",
                 )
-                cached_arrays = {name: endpoints_cache[name] for name in
-                                 ("endpoints", "predicted_type_index", "reachable_distance_metres")}
+                cached_arrays = {
+                    name: endpoints_cache[name]
+                    for name in (
+                        "endpoints",
+                        "predicted_type_index",
+                        "reachable_distance_metres",
+                    )
+                }
             except AssertionError as refusal:
                 print(refusal)
     if cached_arrays is not None:
         endpoints = torch.from_numpy(cached_arrays["endpoints"])
-        predicted_type_index = torch.from_numpy(cached_arrays["predicted_type_index"])
-        reachable_distance_metres = torch.from_numpy(cached_arrays["reachable_distance_metres"])
+        predicted_type_index = torch.from_numpy(
+            cached_arrays["predicted_type_index"]
+        )
+        reachable_distance_metres = torch.from_numpy(
+            cached_arrays["reachable_distance_metres"]
+        )
         print(f"endpoints read from {endpoints_cache_path}")
     else:
         scenario_paths = sorted(staged_directory.glob("*.npz"))
-        endpoints, predicted_type_index, reachable_distance_metres = metre_endpoints(scenario_paths)
+        endpoints, predicted_type_index, reachable_distance_metres = (
+            metre_endpoints(scenario_paths)
+        )
         np.savez(
             endpoints_cache_path,
             endpoints=endpoints.numpy().astype(np.float32),
-            predicted_type_index=predicted_type_index.numpy().astype(np.int64),
-            reachable_distance_metres=reachable_distance_metres.numpy().astype(np.float32),
-            provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
+            predicted_type_index=predicted_type_index.numpy().astype(
+                np.int64
+            ),
+            reachable_distance_metres=reachable_distance_metres.numpy().astype(
+                np.float32
+            ),
+            provenance=contract.artifact_provenance(
+                "fit_anchors.py", staged_directory
+            ),
         )
         print(f"endpoints cached to {endpoints_cache_path}")
     elapsed_seconds = time.perf_counter() - start_seconds
 
-    physically_reachable = endpoints.norm(dim=-1) <= reachable_distance_metres
+    physically_reachable = (
+        endpoints.norm(dim=-1) <= reachable_distance_metres
+    )
     excluded_count = int((~physically_reachable).sum())
     endpoints = endpoints[physically_reachable]
     predicted_type_index = predicted_type_index[physically_reachable]
@@ -191,7 +272,9 @@ def main():
     ]
     assert not starved_types, (
         f"a {model.QUERY_COUNT}-anchor search needs at least {model.QUERY_COUNT} endpoints per"
-        f" type, but " + ", ".join(starved_types) + f" over {len(endpoints)} endpoints of"
+        f" type, but "
+        + ", ".join(starved_types)
+        + f" over {len(endpoints)} endpoints of"
         f" {staged_directory}"
     )
 
@@ -208,23 +291,41 @@ def main():
     print()
 
     fitted_anchors_per_type = []
-    for type_index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES):
+    for type_index, type_name in enumerate(
+        contract.PREDICTED_OBJECT_TYPES
+    ):
         type_endpoints = endpoints[predicted_type_index == type_index]
-        centres, assignment, _, iteration_count, stopped_by_convergence = fit_unit_anchors(type_endpoints)
-        fitted_counts = endpoints_per_centre(assignment, model.QUERY_COUNT)
-        share_order = torch.argsort(fitted_counts, descending=True, stable=True)
+        (
+            centres,
+            assignment,
+            _,
+            iteration_count,
+            stopped_by_convergence,
+        ) = fit_unit_anchors(type_endpoints)
+        fitted_counts = endpoints_per_centre(
+            assignment, model.QUERY_COUNT
+        )
+        share_order = torch.argsort(
+            fitted_counts, descending=True, stable=True
+        )
         fitted_anchors = centres[share_order]
         fitted_anchors_per_type.append(fitted_anchors)
         print_one_type(
-            type_name, type_endpoints.shape[0], fitted_anchors, fitted_counts[share_order],
-            iteration_count, stopped_by_convergence,
+            type_name,
+            type_endpoints.shape[0],
+            fitted_anchors,
+            fitted_counts[share_order],
+            iteration_count,
+            stopped_by_convergence,
         )
 
     unit_anchors = torch.stack(fitted_anchors_per_type)
     np.savez(
         output_path,
         unit_anchors=unit_anchors.numpy().astype(np.float32),
-        provenance=contract.artifact_provenance("fit_anchors.py", staged_directory),
+        provenance=contract.artifact_provenance(
+            "fit_anchors.py", staged_directory
+        ),
     )
     print(
         f"wrote {output_path}, unit_anchors {tuple(unit_anchors.shape)}, one set per"
