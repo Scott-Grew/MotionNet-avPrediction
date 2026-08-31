@@ -11,7 +11,9 @@ def _build_crc32c_table():
         remainder = byte_value
         for _ in range(8):
             if remainder & 1:
-                remainder = (remainder >> 1) ^ CASTAGNOLI_REVERSED_POLYNOMIAL
+                remainder = (
+                    remainder >> 1
+                ) ^ CASTAGNOLI_REVERSED_POLYNOMIAL
             else:
                 remainder >>= 1
         table.append(remainder)
@@ -24,7 +26,9 @@ _CRC32C_TABLE = _build_crc32c_table()
 def crc32c(payload):
     remainder = 0xFFFFFFFF
     for byte_value in payload:
-        remainder = _CRC32C_TABLE[(remainder ^ byte_value) & 0xFF] ^ (remainder >> 8)
+        remainder = _CRC32C_TABLE[(remainder ^ byte_value) & 0xFF] ^ (
+            remainder >> 8
+        )
     return remainder ^ 0xFFFFFFFF
 
 
@@ -55,12 +59,23 @@ def read_records(stream, verify_checksums=True):
         if len(payload_checksum_bytes) != 4:
             raise CorruptRecordError("truncated payload checksum")
         if verify_checksums:
-            expected_length_checksum = struct.unpack("<I", length_checksum_bytes)[0]
-            if mask_crc(crc32c(length_bytes)) != expected_length_checksum:
-                raise CorruptRecordError("record length checksum mismatch")
-            expected_payload_checksum = struct.unpack("<I", payload_checksum_bytes)[0]
+            expected_length_checksum = struct.unpack(
+                "<I", length_checksum_bytes
+            )[0]
+            if (
+                mask_crc(crc32c(length_bytes))
+                != expected_length_checksum
+            ):
+                raise CorruptRecordError(
+                    "record length checksum mismatch"
+                )
+            expected_payload_checksum = struct.unpack(
+                "<I", payload_checksum_bytes
+            )[0]
             if mask_crc(crc32c(payload)) != expected_payload_checksum:
-                raise CorruptRecordError("record payload checksum mismatch")
+                raise CorruptRecordError(
+                    "record payload checksum mismatch"
+                )
         yield payload
 
 
@@ -72,7 +87,9 @@ def write_record(stream, payload):
     stream.write(struct.pack("<I", mask_crc(crc32c(payload))))
 
 
-def read_scenarios(path, scenario_message_type, verify_checksums=True):
+def read_scenarios(
+    path, scenario_message_type, verify_checksums=True
+):
     with open(path, "rb") as stream:
         for payload in read_records(stream, verify_checksums):
             scenario = scenario_message_type()

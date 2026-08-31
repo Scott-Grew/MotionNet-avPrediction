@@ -19,7 +19,7 @@ syntax = "proto2";
 
 package waymo.open_dataset;
 
-import "waymo_open_dataset/protos/map.proto";
+import "womd_protos/map.proto";
 
 
 

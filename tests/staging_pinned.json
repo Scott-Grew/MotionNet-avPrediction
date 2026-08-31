@@ -1,0 +1,86 @@
+{
+  "feature_ids": {
+    "shape": [
+      4
+    ],
+    "dtype": "int64"
+  },
+  "feature_is_interpolating": {
+    "shape": [
+      4
+    ],
+    "dtype": "bool"
+  },
+  "feature_lengths": {
+    "shape": [
+      4
+    ],
+    "dtype": "int64"
+  },
+  "frame_heading": {
+    "shape": [],
+    "dtype": "float32"
+  },
+  "frame_origin": {
+    "shape": [
+      2
+    ],
+    "dtype": "float32"
+  },
+  "is_designated_target": {
+    "shape": [
+      3
+    ],
+    "dtype": "bool"
+  },
+  "is_object_of_interest": {
+    "shape": [
+      3
+    ],
+    "dtype": "bool"
+  },
+  "map_rows": {
+    "shape": [
+      74,
+      32
+    ],
+    "dtype": "float32"
+  },
+  "polyline_signal_histories": {
+    "shape": [
+      4,
+      11,
+      9
+    ],
+    "dtype": "float32"
+  },
+  "provenance": {
+    "shape": [],
+    "dtype": "str"
+  },
+  "scenario_id": {
+    "shape": [],
+    "dtype": "str"
+  },
+  "track_ids": {
+    "shape": [
+      3
+    ],
+    "dtype": "int64"
+  },
+  "track_rows": {
+    "shape": [
+      3,
+      91,
+      13
+    ],
+    "dtype": "float32"
+  },
+  "track_valid": {
+    "shape": [
+      3,
+      91
+    ],
+    "dtype": "bool"
+  }
+}

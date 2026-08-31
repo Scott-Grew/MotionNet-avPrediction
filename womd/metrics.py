@@ -1,117 +1,94 @@
 import torch
 
 from womd import contract
+from womd.model import prune_modes_batched_with_kept_count
 
 
-def _horizon_slice(tensor, horizon_steps):
-    return tensor[..., :horizon_steps, :]
-
-
-def minimum_average_displacement(trajectories, future_positions, future_mask, horizon_steps):
-    distances = torch.linalg.vector_norm(
-        _horizon_slice(trajectories, horizon_steps)
-        - _horizon_slice(future_positions, horizon_steps).unsqueeze(1),
-        dim=-1,
-    )
-    weights = future_mask[..., :horizon_steps].unsqueeze(1).to(distances.dtype)
-    per_mode = (distances * weights).sum(dim=-1) / weights.sum(dim=-1).clamp(min=1.0)
-    return per_mode.min(dim=1).values
-
-
-def minimum_final_displacement(trajectories, future_positions, future_mask, horizon_steps):
-    final_index = horizon_steps - 1
-    distances = torch.linalg.vector_norm(
-        trajectories[:, :, final_index] - future_positions[:, final_index].unsqueeze(1), dim=-1
-    )
-    present = future_mask[:, final_index]
-    minimum = distances.min(dim=1).values
-    return minimum, present
-
-
-ENDPOINT_PRESENT_PREFIX = "endpointPresent"
-
-
-def per_sample_metrics(
-    trajectories,
-    future_positions,
-    future_mask,
-    horizons=contract.EVALUATED_HORIZON_STEPS,
-    miss_threshold=contract.MISS_RATE_THRESHOLD_METRES,
+def mean_distance_per_mode(
+    trajectories, future_positions, future_mask
 ):
-    per_sample = {}
-    for horizon_steps in horizons:
-        seconds = horizon_steps / 10.0
-        average = minimum_average_displacement(
-            trajectories, future_positions, future_mask, horizon_steps
-        )
-        final, final_present = minimum_final_displacement(
-            trajectories, future_positions, future_mask, horizon_steps
-        )
-        per_sample[f"minADE@{seconds:g}s"] = average
-        per_sample[f"minFDE@{seconds:g}s"] = final
-        per_sample[f"missRate@{seconds:g}s"] = (final > miss_threshold).to(final.dtype)
-        per_sample[f"{ENDPOINT_PRESENT_PREFIX}@{seconds:g}s"] = final_present
-    return per_sample
-
-
-def endpoint_presence_key(name):
-    if "@" not in name:
-        return None
-    return f"{ENDPOINT_PRESENT_PREFIX}@{name.split('@')[1]}"
-
-
-def reduce_per_sample(per_sample):
-    results = {}
-    for name, values in per_sample.items():
-        if name.startswith(ENDPOINT_PRESENT_PREFIX):
-            continue
-        presence_key = endpoint_presence_key(name)
-        if name.startswith("minADE") or presence_key not in per_sample:
-            results[name] = values.mean().item()
-            continue
-        present = per_sample[presence_key]
-        present_count = present.sum().clamp(min=1)
-        results[name] = (values * present).sum().item() / present_count.item()
-    return results
-
-
-def evaluate_predictions(
-    trajectories,
-    future_positions,
-    future_mask,
-    horizons=contract.EVALUATED_HORIZON_STEPS,
-    miss_threshold=contract.MISS_RATE_THRESHOLD_METRES,
-):
-    return reduce_per_sample(
-        per_sample_metrics(
-            trajectories, future_positions, future_mask, horizons, miss_threshold
-        )
-    )
-
-
-def breaches(pinned, measured, relative_tolerance):
-    found = {}
-    for name, pinned_value in pinned.items():
-        if name not in measured:
-            found[name] = (pinned_value, None)
-            continue
-        allowed = abs(pinned_value) * relative_tolerance
-        if abs(measured[name] - pinned_value) > allowed:
-            found[name] = (pinned_value, measured[name])
-    return found
+    step_distances = (
+        trajectories - future_positions.unsqueeze(1)
+    ).norm(dim=-1)
+    validity = future_mask.unsqueeze(1).to(step_distances.dtype)
+    return (step_distances * validity).sum(dim=-1) / validity.sum(
+        dim=-1
+    ).clamp_min(1.0)
 
 
 class MetricAccumulator:
     def __init__(self):
-        self.totals = {}
+        self.ade_sum = 0.0
+        self.ade_count = 0
+        self.fde_sum = 0.0
+        self.fde_count = 0
+        self.kept_mode_sum = 0
+        self.backfilled_sample_count = 0
         self.sample_count = 0
 
-    def update(self, batch_results, batch_size):
-        for name, value in batch_results.items():
-            self.totals[name] = self.totals.get(name, 0.0) + value * batch_size
-        self.sample_count += batch_size
+    def update(
+        self,
+        trajectories,
+        confidence_logits,
+        future_positions,
+        future_mask,
+    ):
+        kept_trajectories, _, kept_mode_count = (
+            prune_modes_batched_with_kept_count(
+                trajectories, confidence_logits
+            )
+        )
+        distances = (
+            kept_trajectories - future_positions.unsqueeze(1)
+        ).norm(dim=-1)
+        valid_steps = future_mask.unsqueeze(1)
+        summed = torch.where(
+            valid_steps, distances, torch.zeros_like(distances)
+        ).sum(dim=-1)
+        average_distances = summed / future_mask.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1)
 
-    def summary(self):
-        if self.sample_count == 0:
-            return {}
-        return {name: total / self.sample_count for name, total in self.totals.items()}
+        has_any_valid_step = future_mask.any(dim=-1)
+        self.ade_sum += (
+            average_distances.min(dim=-1).values * has_any_valid_step
+        ).sum()
+        self.ade_count += has_any_valid_step.sum()
+
+        final_step_valid = future_mask[:, -1]
+        self.fde_sum += (
+            distances[:, :, -1].min(dim=-1).values * final_step_valid
+        ).sum()
+        self.fde_count += final_step_valid.sum()
+
+        self.kept_mode_sum += kept_mode_count.sum()
+        self.backfilled_sample_count += (
+            kept_mode_count < contract.NUM_PREDICTED_MODES
+        ).sum()
+        self.sample_count += confidence_logits.shape[0]
+
+    def results(self):
+        return {
+            "min_ade": (
+                float(self.ade_sum / self.ade_count)
+                if self.ade_count
+                else float("nan")
+            ),
+            "min_fde": (
+                float(self.fde_sum / self.fde_count)
+                if self.fde_count
+                else float("nan")
+            ),
+            "mean_kept_modes": (
+                float(self.kept_mode_sum / self.sample_count)
+                if self.sample_count
+                else float("nan")
+            ),
+            "backfill_rate": (
+                float(
+                    self.backfilled_sample_count / self.sample_count
+                )
+                if self.sample_count
+                else float("nan")
+            ),
+        }
