@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 WAYMO_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REWRITE_ROOT = WAYMO_PROJECT_ROOT / "rewrite"
+TREE_ROOT = Path(__file__).resolve().parent
 CONTAINER_MOUNT_POINT = "/mnt"
 CONTAINER_IMAGE_TAG = "waymo-scorer"
 
@@ -25,7 +25,7 @@ def build_container_image():
             "linux/amd64",
             "-t",
             CONTAINER_IMAGE_TAG,
-            str(REWRITE_ROOT / "container"),
+            str(TREE_ROOT / "container"),
         ],
         check=True,
     )
@@ -43,7 +43,7 @@ def run_in_container(runner_arguments):
             f"{WAYMO_PROJECT_ROOT}:{CONTAINER_MOUNT_POINT}",
             CONTAINER_IMAGE_TAG,
             "python3",
-            f"{CONTAINER_MOUNT_POINT}/rewrite/container/runner.py",
+            f"{CONTAINER_MOUNT_POINT}/{TREE_ROOT.name}/container/runner.py",
             *runner_arguments,
         ],
         check=True,
@@ -60,7 +60,7 @@ def run_score(
     subprocess.run(
         [
             sys.executable,
-            str(REWRITE_ROOT / "submit.py"),
+            str(TREE_ROOT / "submit.py"),
             str(Path(checkpoint_path).resolve()),
             str(Path(staged_directory).resolve()),
             str(Path(anchors_path).resolve()),
