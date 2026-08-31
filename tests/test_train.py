@@ -83,6 +83,27 @@ def test_warmup_rises_to_the_learning_rate_then_holds_it():
     )
 
 
+def test_rate_holds_until_the_fall_then_reaches_zero_only_on_the_last_step():
+    rates = [
+        train.scheduled_learning_rate(
+            step,
+            20,
+            1e-3,
+            decay_start_step=100,
+            decay_end_step=200,
+        )
+        for step in range(200)
+    ]
+    assert all(rate == 1e-3 for rate in rates[20:100])
+    assert all(
+        later < earlier
+        for earlier, later in zip(rates[100:199], rates[101:200])
+    )
+    assert rates[150] < 1e-3 / 2
+    assert rates[198] > 0.0
+    assert rates[199] == 0.0
+
+
 def test_resuming_never_skips_a_completed_epoch():
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())

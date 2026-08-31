@@ -57,11 +57,24 @@ def optimiser_steps_per_epoch(
 
 
 def scheduled_learning_rate(
-    process_steps, warmup_steps, learning_rate=LEARNING_RATE
+    process_steps,
+    warmup_steps,
+    learning_rate=LEARNING_RATE,
+    decay_start_step=None,
+    decay_end_step=None,
 ):
     if process_steps < warmup_steps:
         return learning_rate * (process_steps + 1) / warmup_steps
-    return learning_rate
+    if decay_start_step is None or process_steps < decay_start_step:
+        return learning_rate
+    decay_fraction = (process_steps - decay_start_step) / max(
+        decay_end_step - 1 - decay_start_step, 1
+    )
+    return (
+        learning_rate
+        * 0.5
+        * (1.0 + math.cos(math.pi * min(decay_fraction, 1.0)))
+    )
 
 
 def training_losses(predictor, batch):
@@ -139,6 +152,8 @@ def train_epoch(
     gradient_clip_norm,
     process_steps_before_epoch,
     learning_rate,
+    decay_start_step,
+    decay_end_step,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
@@ -182,6 +197,8 @@ def train_epoch(
             process_steps_before_epoch + batch_count,
             warmup_steps,
             learning_rate,
+            decay_start_step,
+            decay_end_step,
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = step_learning_rate
@@ -312,6 +329,7 @@ def main():
     parser.add_argument(
         "--learning-rate", type=float, default=LEARNING_RATE
     )
+    parser.add_argument("--decay-from-epoch", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
@@ -393,6 +411,13 @@ def main():
 
     training_start = time.perf_counter()
     process_steps_before_epoch = completed_epochs * steps_per_epoch
+    decay_start_step = None
+    decay_end_step = None
+    if arguments.decay_from_epoch is not None:
+        decay_start_step = (
+            arguments.decay_from_epoch - 1
+        ) * steps_per_epoch
+        decay_end_step = arguments.epochs * steps_per_epoch
     last_epoch_seconds = 0.0
     for epoch_index in remaining_epochs:
         elapsed_seconds = time.perf_counter() - training_start
@@ -433,6 +458,8 @@ def main():
             arguments.gradient_clip_norm,
             process_steps_before_epoch,
             arguments.learning_rate,
+            decay_start_step,
+            decay_end_step,
         )
         process_steps_before_epoch += steps_per_epoch
         last_epoch_seconds = time.perf_counter() - epoch_start
