@@ -1,4 +1,4 @@
-# Sightline
+# MotionNet
 
 A Python program that predicts where cars, bikes and people are about to
 go in self-driving car data.
