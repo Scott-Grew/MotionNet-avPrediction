@@ -10,7 +10,7 @@ road user, each with a confidence, because a car rolling up to a
 junction might turn or might not, and a single guess would just split
 the difference.
 
-![Predicting a left turn](demo.gif)
+{{DATA DERVED IMAGE TO COME}}
 
 *The red car is being predicted. White dashes are where it actually
 went. The cyan lines are the six predictions — brighter means more
