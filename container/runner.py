@@ -434,7 +434,8 @@ def run_check_reader(shard_path, sample_count):
     )
     if disagreement_count == 0:
         print(
-            f"{len(ours_scenarios)} scenarios byte-exact: our reader agrees with Waymo's on every field"
+            f"{len(ours_scenarios)} scenarios decoded identically:"
+            f" our protos agree with Waymo's on every field"
         )
     else:
         print(

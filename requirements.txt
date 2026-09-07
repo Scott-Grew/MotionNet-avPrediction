@@ -1,0 +1,7 @@
+torch==2.2.2
+numpy==1.26.4
+tensorflow==2.16.2
+protobuf==4.25.9
+scikit-learn==1.8.0
+grpcio-tools==1.62.3
+pytest==9.0.3
