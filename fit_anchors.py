@@ -6,11 +6,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from sklearn.cluster import KMeans
 
 from womd import contract, loader, model
 
 MAXIMUM_ITERATIONS = 2000
-SEED_GENERATOR_SEED = 0
+RANDOM_STATE_SEED = 0
+RESTART_COUNT = 10
 
 
 def metre_endpoints(scenario_paths):
@@ -52,97 +54,20 @@ def endpoints_per_centre(assignment, centre_count):
     )
 
 
-def move_centres_to_assigned_means(endpoints, assignment, centres):
-    totals = torch.zeros_like(centres).index_add_(
-        0, assignment, endpoints
-    )
-    counts = endpoints_per_centre(assignment, centres.shape[0]).to(
-        endpoints.dtype
-    )
-    means = totals / counts.clamp_min(1.0).unsqueeze(-1)
-    return (
-        torch.where(counts.unsqueeze(-1) > 0.0, means, centres),
-        counts,
-    )
-
-
-def reseed_empty_centres(endpoints, assignment, centres, counts):
-    empty_centres = (counts == 0.0).nonzero(as_tuple=True)[0]
-    if empty_centres.numel() == 0:
-        return centres
-    reseeded = centres.clone()
-    splits_taken_from = torch.zeros_like(counts, dtype=torch.long)
-    for empty_centre in empty_centres.tolist():
-        busiest_centre = int(
-            (counts / (1.0 + splits_taken_from)).argmax()
-        )
-        endpoints_of_busiest = endpoints[assignment == busiest_centre]
-        spread_within_busiest = (
-            endpoints_of_busiest - centres[busiest_centre]
-        ).norm(dim=-1)
-        spread_order = torch.argsort(
-            spread_within_busiest, descending=True, stable=True
-        )
-        reseeded[empty_centre] = endpoints_of_busiest[
-            spread_order[int(splits_taken_from[busiest_centre])]
-        ]
-        splits_taken_from[busiest_centre] += 1
-    return reseeded
-
-
-def spread_out_seed_centres(endpoints, centre_count, generator):
-    first_seed = int(
-        torch.randint(len(endpoints), (1,), generator=generator)
-    )
-    centres = [endpoints[first_seed]]
-    nearest_squared = (endpoints - centres[0]).pow(2).sum(dim=-1)
-    while len(centres) < centre_count:
-        probabilities = (
-            nearest_squared / nearest_squared.sum().clamp_min(1e-12)
-        )
-        next_seed = int(
-            torch.multinomial(probabilities, 1, generator=generator)
-        )
-        centres.append(endpoints[next_seed])
-        nearest_squared = torch.minimum(
-            nearest_squared,
-            (endpoints - centres[-1]).pow(2).sum(dim=-1),
-        )
-    return torch.stack(centres)
-
-
 def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
-    generator = torch.Generator().manual_seed(SEED_GENERATOR_SEED)
-    centres = spread_out_seed_centres(
-        endpoints, centre_count, generator
-    )
-    initial_assignment = torch.cdist(endpoints, centres).argmin(dim=1)
-    assignment = initial_assignment
-    for iteration_count in range(1, MAXIMUM_ITERATIONS + 1):
-        centres, counts = move_centres_to_assigned_means(
-            endpoints, assignment, centres
-        )
-        centres = reseed_empty_centres(
-            endpoints, assignment, centres, counts
-        )
-        next_assignment = torch.cdist(endpoints, centres).argmin(
-            dim=1
-        )
-        if torch.equal(next_assignment, assignment):
-            return (
-                centres,
-                next_assignment,
-                initial_assignment,
-                iteration_count,
-                True,
-            )
-        assignment = next_assignment
+    fitted = KMeans(
+        n_clusters=centre_count,
+        init="k-means++",
+        n_init=RESTART_COUNT,
+        max_iter=MAXIMUM_ITERATIONS,
+        tol=0.0,
+        random_state=RANDOM_STATE_SEED,
+    ).fit(endpoints.numpy())
     return (
-        centres,
-        assignment,
-        initial_assignment,
-        MAXIMUM_ITERATIONS,
-        False,
+        torch.from_numpy(fitted.cluster_centers_).to(endpoints.dtype),
+        torch.from_numpy(fitted.labels_).to(torch.long),
+        fitted.n_iter_,
+        fitted.n_iter_ < MAXIMUM_ITERATIONS,
     )
 
 
@@ -298,7 +223,6 @@ def main():
         (
             centres,
             assignment,
-            _,
             iteration_count,
             stopped_by_convergence,
         ) = fit_unit_anchors(type_endpoints)

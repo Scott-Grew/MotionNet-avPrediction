@@ -416,7 +416,7 @@ def test_anchor_fitting_recovers_tight_well_separated_clusters_and_leaves_no_anc
         )
     ).reshape(-1, 2)
 
-    fitted, assignment, _, _, stopped_by_convergence = (
+    fitted, assignment, _, stopped_by_convergence = (
         fit_anchors.fit_unit_anchors(endpoints)
     )
     counts = fit_anchors.endpoints_per_centre(
