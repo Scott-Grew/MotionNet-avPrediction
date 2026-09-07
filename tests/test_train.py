@@ -175,7 +175,7 @@ def kernel_train_arguments():
     import ast as ast_module
 
     kernel_path = (
-        Path(__file__).parent.parent.parent
+        Path(__file__).parent.parent
         / "data"
         / "kaggle_upload"
         / "kernel"
