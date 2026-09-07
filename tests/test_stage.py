@@ -3,9 +3,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tensorflow
 
 import stage
-from womd import contract, tfrecord
+from womd import contract
 from womd_protos import map_pb2, scenario_pb2
 
 STAGING_PIN_PATH = Path(__file__).parent / "staging_pinned.json"
@@ -95,11 +96,9 @@ def build_fixture_scenario(scenario_id):
 
 
 def write_shard(shard_path, scenarios):
-    with open(shard_path, "wb") as stream:
+    with tensorflow.io.TFRecordWriter(str(shard_path)) as writer:
         for scenario in scenarios:
-            tfrecord.write_record(
-                stream, scenario.SerializeToString()
-            )
+            writer.write(scenario.SerializeToString())
 
 
 def stage_fixture(tmp_path):

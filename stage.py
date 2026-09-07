@@ -2,7 +2,9 @@ import womd.runtime_env
 import argparse
 from pathlib import Path
 
-from womd import store, tfrecord
+import tensorflow
+
+from womd import store
 from womd_protos import scenario_pb2
 
 
@@ -10,9 +12,10 @@ def stage_shard(shard_path, output_directory, skip_existing):
     written_paths = []
     spacing_deviations = []
     skipped_paths = []
-    for scenario in tfrecord.read_scenarios(
-        shard_path, scenario_pb2.Scenario
-    ):
+    for record_bytes in tensorflow.data.TFRecordDataset(
+        str(shard_path)
+    ).as_numpy_iterator():
+        scenario = scenario_pb2.Scenario.FromString(record_bytes)
         output_path = (
             Path(output_directory) / f"{scenario.scenario_id}.npz"
         )

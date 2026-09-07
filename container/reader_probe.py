@@ -69,21 +69,16 @@ def extract_scenario_fields(scenario):
 
 
 def extract_ours(shard_path, sample_count):
-    from womd import tfrecord
+    import tensorflow as tf
     from womd_protos import scenario_pb2
 
     extracted_scenarios = []
-    with open(shard_path, "rb") as stream:
-        for payload in tfrecord.read_records(
-            stream, verify_checksums=True
-        ):
-            if len(extracted_scenarios) >= sample_count:
-                break
-            scenario = scenario_pb2.Scenario()
-            scenario.ParseFromString(payload)
-            extracted_scenarios.append(
-                extract_scenario_fields(scenario)
-            )
+    for raw_record in tf.data.TFRecordDataset(str(shard_path)):
+        if len(extracted_scenarios) >= sample_count:
+            break
+        scenario = scenario_pb2.Scenario()
+        scenario.ParseFromString(raw_record.numpy())
+        extracted_scenarios.append(extract_scenario_fields(scenario))
     return extracted_scenarios
 
 

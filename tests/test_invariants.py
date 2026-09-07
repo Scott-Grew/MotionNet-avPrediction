@@ -1,4 +1,3 @@
-import io
 import math
 from pathlib import Path
 
@@ -20,7 +19,6 @@ from womd import (
     model,
     pipeline,
     store,
-    tfrecord,
 )
 
 STAGED_DIRECTORY = (
@@ -119,28 +117,6 @@ def synthetic_scene_batch(
             sample_count, contract.FUTURE_STEPS, dtype=torch.bool
         ),
     }
-
-
-def test_crc32c_matches_known_answer():
-    assert tfrecord.crc32c(b"123456789") == 0xE3069283
-
-
-def test_tfrecord_round_trips_payloads():
-    payloads = [b"", b"a", b"scenario-bytes" * 37]
-    buffer = io.BytesIO()
-    for payload in payloads:
-        tfrecord.write_record(buffer, payload)
-    buffer.seek(0)
-    assert list(tfrecord.read_records(buffer)) == payloads
-
-
-def test_tfrecord_rejects_corrupt_payload():
-    buffer = io.BytesIO()
-    tfrecord.write_record(buffer, b"intact-payload")
-    corrupted = bytearray(buffer.getvalue())
-    corrupted[14] ^= 0xFF
-    with pytest.raises(tfrecord.CorruptRecordError):
-        list(tfrecord.read_records(io.BytesIO(bytes(corrupted))))
 
 
 def test_v1_agent_frame_transform_inverts():
