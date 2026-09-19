@@ -5,6 +5,8 @@ from pathlib import Path
 from womd import contract
 
 
+# Fails if the Kaggle notebook's mounted code does not match this
+# working copy's staging code version.
 def assert_working_copy_current(mounted_contract_path):
     mounted_text = Path(mounted_contract_path).read_text()
     if (
@@ -16,6 +18,8 @@ def assert_working_copy_current(mounted_contract_path):
         )
 
 
+# Fails if any .json file under working_directory looks like a
+# credential file, so one never ends up in a saved Kaggle version.
 def assert_no_credentials(working_directory):
     credential_markers = ("private_key", "refresh_token")
     credential_paths = []

@@ -25,6 +25,8 @@ GradScaler = getattr(
 )
 
 
+# Splits parameters so weight decay applies to matrices only, not
+# to biases, norms or the learned anchor queries.
 def parameter_groups(predictor):
     decayed = []
     undecayed = []
@@ -39,6 +41,8 @@ def parameter_groups(predictor):
     ]
 
 
+# Steps per epoch: the sum over worker streams of ceil(targets /
+# batch size), because each worker fills its own batches.
 def optimiser_steps_per_epoch(
     scenario_paths, worker_count, batch_size, designated_targets_only
 ):
@@ -62,6 +66,8 @@ def optimiser_steps_per_epoch(
     return steps
 
 
+# Learning rate as a pure function of the global step: linear
+# warm-up, hold, then an optional cosine fall to zero.
 def scheduled_learning_rate(
     process_steps,
     warmup_steps,
@@ -83,6 +89,8 @@ def scheduled_learning_rate(
     )
 
 
+# Runs the model with likelihood outputs and returns the total
+# loss plus its two components alongside the raw predictions.
 def training_losses(predictor, batch):
     (
         trajectories,
@@ -107,12 +115,16 @@ def training_losses(predictor, batch):
     )
 
 
+# Returns the bare model under the DDP wrapper so a checkpoint
+# holds plain parameter names regardless of process count.
 def unwrapped(predictor):
     if isinstance(predictor, DistributedDataParallel):
         return predictor.module
     return predictor
 
 
+# Process 0 decides; every process must make this call or the
+# broadcast hangs.
 def agreed_with_main_process(decision, device):
     if not distributed.is_initialized():
         return decision
@@ -121,6 +133,8 @@ def agreed_with_main_process(decision, device):
     return bool(shared_decision.item())
 
 
+# Bundles everything needed to resume training exactly where it
+# stopped, including a fingerprint to catch a mismatched model.
 def checkpoint_state(
     predictor,
     optimizer,
@@ -142,10 +156,13 @@ def checkpoint_state(
     }
 
 
+# Epoch indices still to run, given how many are already done.
 def epochs_left_to_train(completed_epochs, requested_epochs):
     return range(completed_epochs, requested_epochs)
 
 
+# Writes to a temporary file, then swaps it in, so a crash never
+# truncates the checkpoint; the prior one is kept as a fallback.
 def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path = checkpoint_path.with_suffix(
         checkpoint_path.suffix + ".partial"
@@ -156,6 +173,8 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path.replace(checkpoint_path)
 
 
+# Writes one table of scalars to TensorBoard and prints the same
+# table as the log line, so the console and the board never drift.
 def report_scalars(summary_writer, heading, scalars, global_step):
     for name, value in scalars.items():
         summary_writer.add_scalar(name, value, global_step)
@@ -171,6 +190,8 @@ def report_scalars(summary_writer, heading, scalars, global_step):
     )
 
 
+# Runs one epoch; only process 0 logs and checkpoints. Under DDP
+# the caller wraps this in Join so uneven shards do not hang.
 def train_epoch(
     predictor,
     optimizer,
@@ -250,6 +271,8 @@ def train_epoch(
         gradient_scaler.step(optimizer)
         scale_before_update = gradient_scaler.get_scale()
         gradient_scaler.update()
+        # a scale drop means the step was skipped for non-finite
+        # gradients
         gradient_scaler_skip_count += int(
             gradient_scaler.get_scale() < scale_before_update
         )
@@ -367,6 +390,8 @@ def train_epoch(
     return averages, accumulator.results(), seconds
 
 
+# Trains single- or multi-process (torchrun sets WORLD_SIZE),
+# resumes if asked, and stops on the epoch count or time budget.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)
@@ -425,6 +450,7 @@ def main():
     gradient_scaler = GradScaler(
         enabled=arguments.mixed_precision and device.type == "cuda"
     )
+    # each process trains its own shard of scenario files
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))[
         process_rank::process_count
     ]
@@ -438,6 +464,8 @@ def main():
         not arguments.all_eligible_agents,
     )
     if process_count > 1:
+        # every process uses the longest shard's step count so the
+        # schedule is shared; Join lets shorter shards finish
         longest_process_steps = torch.tensor(
             steps_per_epoch, device=device
         )
@@ -457,6 +485,8 @@ def main():
 
     completed_epochs = 0
     resume_path = arguments.checkpoint_path
+    # falls back to the previous checkpoint if the current one is
+    # missing, e.g. a crash between save_checkpoint's rename steps
     if (
         arguments.resume
         and not resume_path.exists()
@@ -520,6 +550,8 @@ def main():
     last_epoch_seconds = 0.0
     for epoch_index in remaining_epochs:
         elapsed_seconds = time.perf_counter() - training_start
+        # the last epoch's duration predicts whether another fits;
+        # Kaggle ends the session without warning
         if agreed_with_main_process(
             elapsed_seconds + last_epoch_seconds
             > arguments.stop_after_seconds,

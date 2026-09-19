@@ -6,6 +6,8 @@ from pathlib import Path
 MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
 
 
+# Extracts one track state's fields into a plain list so it can
+# be compared across two different proto implementations.
 def track_state_row(state):
     return [
         bool(state.valid),
@@ -19,6 +21,8 @@ def track_state_row(state):
     ]
 
 
+# Reads one map feature's kind and points from whichever oneof
+# field is set: a single point, a polygon, or a polyline.
 def map_feature_points(feature):
     kind = feature.WhichOneof("feature_data")
     if kind is None:
@@ -34,6 +38,8 @@ def map_feature_points(feature):
     ]
 
 
+# Flattens one decoded scenario proto into plain nested dicts and
+# lists, so it can be JSON-encoded and diffed field by field.
 def extract_scenario_fields(scenario):
     tracks = [
         {
@@ -68,6 +74,8 @@ def extract_scenario_fields(scenario):
     }
 
 
+# Decodes the first sample_count records of a shard with this
+# repo's vendored scenario_pb2, for comparison against Waymo's.
 def extract_ours(shard_path, sample_count):
     import tensorflow as tf
     from womd_protos import scenario_pb2
@@ -82,6 +90,8 @@ def extract_ours(shard_path, sample_count):
     return extracted_scenarios
 
 
+# Decodes the first sample_count records of a shard with Waymo's
+# own installed scenario_pb2, for comparison against ours.
 def extract_theirs(shard_path, sample_count):
     import tensorflow as tf
     from waymo_open_dataset.protos import scenario_pb2
@@ -96,6 +106,8 @@ def extract_theirs(shard_path, sample_count):
     return extracted_scenarios
 
 
+# Decodes a shard with this repo's protos or Waymo's (--role) and
+# prints the scenarios as JSON for the caller to compare.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(

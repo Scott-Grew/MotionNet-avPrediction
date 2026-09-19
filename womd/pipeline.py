@@ -9,7 +9,11 @@ from torch.utils.data import (
 from womd import loader
 
 
+# Yields batches that each hold exactly targets_per_batch
+# predicted agents, splitting a scene's targets across batches.
 class SceneBatchStream(IterableDataset):
+    # Stores the shard list and batching config; the shuffle and
+    # batch assembly happen in __iter__.
     def __init__(
         self,
         scenario_paths,
@@ -22,10 +26,13 @@ class SceneBatchStream(IterableDataset):
         self.designated_targets_only = designated_targets_only
         self.targets_per_batch = targets_per_batch
 
+    # Shards scenario files across workers, shuffles scenes and
+    # targets, and yields a batch once targets_per_batch fill up.
     def __iter__(self):
         worker_info = get_worker_info()
         worker_index = worker_info.id if worker_info else 0
         worker_count = worker_info.num_workers if worker_info else 1
+        # Each worker takes every worker_count-th scenario path.
         worker_paths = self.scenario_paths[worker_index::worker_count]
         random_generator = np.random.default_rng(
             self.seed + worker_index
@@ -47,6 +54,8 @@ class SceneBatchStream(IterableDataset):
                 )
             ).tolist()
             while waiting_track_indices:
+                # Takes only as many targets as fit in the
+                # filling batch; leftovers start the next one.
                 scene_samples.append(
                     loader.build_scene_sample(
                         scenario_arrays,
@@ -65,6 +74,8 @@ class SceneBatchStream(IterableDataset):
             yield loader.build_scene_batch(scene_samples)
 
 
+# Wraps SceneBatchStream in a DataLoader. batch_size=None because
+# the dataset already yields finished batches.
 def batches(
     scenario_paths,
     worker_count,

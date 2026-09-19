@@ -36,15 +36,22 @@ OUTPUT_NAMES = ["trajectories", "confidence_logits"]
 WARMUP_RUNS = 2
 
 
+# Wraps the model so ONNX export sees positional tensor arguments
+# instead of the dict the model normally takes as input.
 class PositionalInputs(torch.nn.Module):
+    # Stores the model being wrapped.
     def __init__(self, predictor):
         super().__init__()
         self.predictor = predictor
 
+    # Rebuilds the model's dict input from positional tensors, in
+    # the fixed order INPUT_NAMES declares.
     def forward(self, *tensors):
         return self.predictor(dict(zip(INPUT_NAMES, tensors)))
 
 
+# Pads a tensor with zeros along one dimension up to length; the
+# added rows are absent tokens, not real agents or map chunks.
 def padded_along(tensor, dimension, length):
     padding_shape = list(tensor.shape)
     padding_shape[dimension] = length - tensor.shape[dimension]
@@ -53,6 +60,8 @@ def padded_along(tensor, dimension, length):
     )
 
 
+# Pads a tensor up to length by repeating its last row, which
+# leaves max-pooled chunk tokens and real predictions unchanged.
 def last_row_repeated_to(tensor, length):
     return torch.cat(
         [
@@ -64,6 +73,8 @@ def last_row_repeated_to(tensor, length):
     )
 
 
+# Pads one scene batch to fixed agent, chunk, dot and target
+# counts so differently sized scenes can share one exported graph.
 def padded_to_fixed_shape(
     batch, agent_count, chunk_count, dot_count, target_count
 ):
@@ -80,11 +91,15 @@ def padded_to_fixed_shape(
     fixed["map_rows"] = last_row_repeated_to(
         batch["map_rows"], dot_count
     )
+    # slot = scene index * chunk count + chunk index, so the stride
+    # changes when the chunk count is padded
     fixed["map_dot_polyline_slot"] = last_row_repeated_to(
         (slot // batch_chunk_count) * chunk_count
         + slot % batch_chunk_count,
         dot_count,
     )
+    # token axis is [scene agents, then map chunks], so each half
+    # is padded separately before being joined back together
     for name in ("token_visible", "token_pose"):
         fixed[name] = torch.cat(
             [
@@ -104,6 +119,8 @@ def padded_to_fixed_shape(
     return fixed
 
 
+# Times run_once over each fixed batch after a few warm-up calls,
+# returning one duration in milliseconds per scene.
 def milliseconds_per_scene(run_once, fixed_batches):
     for _ in range(WARMUP_RUNS):
         run_once(fixed_batches[0])
@@ -115,6 +132,8 @@ def milliseconds_per_scene(run_once, fixed_batches):
     return durations
 
 
+# Pads a bucket's scenes to its largest shape, exports at that
+# shape, measures padding and export error, and times both.
 def export_and_measure_bucket(
     predictor, batches, onnx_path, thread_count, device
 ):
@@ -149,6 +168,8 @@ def export_and_measure_bucket(
             )
             for batch, fixed_batch in zip(batches, fixed_batches)
         )
+    # the map-chunk axis is left symbolic; the exporter folds it
+    # incorrectly when treated as fixed like the other axes
     torch.onnx.export(
         PositionalInputs(predictor),
         tuple(fixed_batches[0][name] for name in INPUT_NAMES),
@@ -174,12 +195,14 @@ def export_and_measure_bucket(
     )
     device_predictor = PositionalInputs(predictor).to(device)
 
+    # Runs the exported graph on one fixed-shape batch.
     def run_onnx(fixed_batch):
         return session.run(
             OUTPUT_NAMES,
             {name: fixed_batch[name].numpy() for name in INPUT_NAMES},
         )
 
+    # Runs the torch model on one fixed-shape batch on device.
     def run_torch(fixed_batch):
         with torch.no_grad():
             trajectories, confidence_logits = device_predictor(
@@ -212,6 +235,8 @@ def export_and_measure_bucket(
     )
 
 
+# Yields one scene batch per scenario that has designated
+# targets, skipping any scenario with none.
 def designated_target_scene_batches(scenario_paths):
     for scenario_path in scenario_paths:
         scenario_array = loader.read_scenario(scenario_path)
@@ -235,6 +260,8 @@ def designated_target_scene_batches(scenario_paths):
         }
 
 
+# Sorts scenes by token count into --buckets groups, exports one
+# graph per group, and prints the errors and median timings.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)

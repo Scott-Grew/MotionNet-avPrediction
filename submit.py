@@ -18,6 +18,8 @@ SUBMISSION_STEP_SELECTOR = torch.tensor(
 )
 
 
+# Converts a prediction from the agent's own frame to world
+# coordinates via the scene frame stored on the sample.
 def agent_frame_to_world_frame(
     agent_frame_positions, sample, scenario_array
 ):
@@ -33,6 +35,8 @@ def agent_frame_to_world_frame(
     )
 
 
+# Yields one scene at a time, each built from only the targets
+# Waymo designated for scoring in that scenario.
 def designated_target_scenes(staged_directory):
     for scenario_path in sorted(Path(staged_directory).glob("*.npz")):
         scenario_array = loader.read_scenario(scenario_path)
@@ -54,6 +58,8 @@ def designated_target_scenes(staged_directory):
         )
 
 
+# Predicts one scene (constant velocity when predictor is None),
+# prunes 54 modes to 6, and keeps the 16 submission steps.
 def submission_trajectories_and_confidences(predictor, scene_sample):
     batch = {
         name: torch.from_numpy(array)
@@ -80,6 +86,8 @@ def submission_trajectories_and_confidences(predictor, scene_sample):
     return decimated.numpy(), confidences.numpy()
 
 
+# Builds the model from its anchor file and loads trained weights,
+# set to eval mode.
 def load_predictor(checkpoint_path, anchors_path):
     predictor = model.MotionPredictor(
         model.load_anchor_file(anchors_path)
@@ -90,6 +98,8 @@ def load_predictor(checkpoint_path, anchors_path):
     return predictor.eval()
 
 
+# Predicts every designated target, converts trajectories to world
+# coordinates, writes the .npz, and returns the target count.
 def write_submission_arrays(predictor, staged_directory, output_path):
     scenario_ids, track_ids, world_trajectories, confidences = (
         [],
@@ -138,6 +148,8 @@ def write_submission_arrays(predictor, staged_directory, output_path):
     return len(track_ids)
 
 
+# Writes a submission .npz from a trained model or from the
+# constant-velocity baseline.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--constant-velocity", action="store_true")

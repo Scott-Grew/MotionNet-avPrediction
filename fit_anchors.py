@@ -15,6 +15,8 @@ RANDOM_STATE_SEED = 0
 RESTART_COUNT = 10
 
 
+# Collects each target's last valid future position (agent frame,
+# metres) with its object type and reachable distance.
 def metre_endpoints(scenario_paths):
     agent_histories = []
     logged_endpoints = []
@@ -46,6 +48,7 @@ def metre_endpoints(scenario_paths):
     )
 
 
+# Counts how many endpoints were assigned to each cluster centre.
 def endpoints_per_centre(assignment, centre_count):
     counts = torch.zeros(centre_count, dtype=torch.long)
     return counts.index_add_(
@@ -53,6 +56,8 @@ def endpoints_per_centre(assignment, centre_count):
     )
 
 
+# Fits one k-means anchor set; returns the centres, each
+# endpoint's assigned centre, and whether the fit converged.
 def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     fitted = KMeans(
         n_clusters=centre_count,
@@ -70,12 +75,15 @@ def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     )
 
 
+# Smallest distance between any two distinct anchors, in metres.
 def minimum_pairwise_distance(anchors):
     separations = torch.cdist(anchors, anchors)
     separations.fill_diagonal_(float("inf"))
     return float(separations.min())
 
 
+# Prints one object type's fitted anchors with their offset,
+# distance, angle and share of endpoints assigned to them.
 def print_one_type(
     type_name,
     type_sample_count,
@@ -109,6 +117,8 @@ def print_one_type(
     print()
 
 
+# Gathers endpoints, drops those past their reachable distance,
+# fits 54 anchors per object type, and writes them most-used first.
 def main():
     staged_directory = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
@@ -127,6 +137,7 @@ def main():
                 else None
             )
             try:
+                # reuse the cache only if this code version made it
                 contract.check_artifact_provenance(
                     cache_provenance,
                     endpoints_cache_path,

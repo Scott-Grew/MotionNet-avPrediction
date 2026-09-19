@@ -5,6 +5,8 @@ from womd import frame_ops
 from womd_protos import map_pb2, scenario_pb2
 
 
+# Returns the scene frame's origin and heading: the SDC's world
+# position and heading at the current step.
 def scenario_storage_frame(scenario):
     sdc_track = scenario.tracks[scenario.sdc_track_index]
     sdc_state = sdc_track.states[contract.CURRENT_STEP_INDEX]
@@ -16,6 +18,8 @@ def scenario_storage_frame(scenario):
     return origin, heading
 
 
+# Converts one track's raw world-frame positions, headings and
+# velocities into the scene frame, step by step.
 def track_to_storage_frame(track, origin, heading):
     positions = np.array(
         [[state.center_x, state.center_y] for state in track.states]
@@ -42,6 +46,8 @@ def track_to_storage_frame(track, origin, heading):
     return stored_positions, stored_headings, stored_velocities, valid
 
 
+# Builds the (TOTAL_STEPS, AGENT_FEATURE_DIM) feature row array
+# for one track in the scene frame, plus its per-step validity.
 def track_to_feature_rows(track, origin, heading, is_sdc):
     positions, headings, velocities, valid = track_to_storage_frame(
         track, origin, heading
@@ -72,6 +78,8 @@ def track_to_feature_rows(track, origin, heading, is_sdc):
     return rows, valid
 
 
+# Stacks feature rows and validity for every track in the
+# scenario into (num_tracks, TOTAL_STEPS, ...) arrays.
 def scenario_track_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
 
@@ -90,6 +98,8 @@ def scenario_track_arrays(scenario):
     return np.stack(all_rows), np.stack(all_valid)
 
 
+# Per-track labels: track id, whether it is a designated
+# prediction target, and whether it is an object of interest.
 def scenario_track_labels(scenario):
     track_ids = np.array(
         [track.id for track in scenario.tracks], dtype=np.int64
@@ -111,9 +121,13 @@ def scenario_track_labels(scenario):
     return track_ids, is_designated_target, is_object_of_interest
 
 
+# Map feature kinds whose points form a closed polygon rather
+# than an open polyline.
 MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
 
 
+# Extracts one map feature's raw world-frame points and its kind
+# index, or (None, None) if the feature has no usable geometry.
 def map_feature_points(feature):
     kind = feature.WhichOneof("feature_data")
     if kind is None:
@@ -124,6 +138,7 @@ def map_feature_points(feature):
         corners = getattr(feature, kind).polygon
         if len(corners) < 2:
             return None, None
+        # Closes the polygon by repeating its first corner.
         raw_points = list(corners) + [corners[0]]
     else:
         raw_points = getattr(feature, kind).polyline
@@ -133,17 +148,23 @@ def map_feature_points(feature):
     return points, contract.MAP_POLYLINE_KINDS.index(kind)
 
 
+# Cumulative arc length along a polyline, starting at 0 for the
+# first point.
 def polyline_arc_lengths(points):
     segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
     return np.concatenate([[0.0], np.cumsum(segment_lengths)])
 
 
+# Arc length positions to resample at: evenly spaced, plus the
+# polyline's final endpoint.
 def polyline_sample_distances(arc_lengths, spacing):
     return np.append(
         np.arange(0.0, arc_lengths[-1], spacing), arc_lengths[-1]
     )
 
 
+# Resamples one column of values at fixed spacing along the
+# polyline's arc length by linear interpolation.
 def column_along_polyline(points, column_values, spacing):
     if len(points) < 2:
         return column_values
@@ -157,6 +178,8 @@ def column_along_polyline(points, column_values, spacing):
     )
 
 
+# Resamples x and y together at fixed spacing along the
+# polyline, producing one-metre-spaced map dots.
 def points_along_polyline(points, spacing):
     if len(points) < 2:
         return points
@@ -169,12 +192,16 @@ def points_along_polyline(points, spacing):
     )
 
 
+# Unit direction vector per point along a polyline; the last
+# point repeats the final segment's direction.
 def polyline_directions(points):
     if len(points) < 2:
         return np.zeros_like(points)
     steps = np.diff(points, axis=0)
     step_lengths = np.linalg.norm(steps, axis=1, keepdims=True)
     zero_step_indices = np.flatnonzero(step_lengths[:, 0] == 0.0)
+    # Avoids a divide by zero on coincident points; those
+    # directions get overwritten from the previous step below.
     step_lengths[zero_step_indices] = 1.0
     directions = steps / step_lengths
     for zero_index in zero_step_indices:
@@ -182,6 +209,8 @@ def polyline_directions(points):
     return np.concatenate([directions, directions[-1:]])
 
 
+# Per-dot left/right boundary crossing codes for a lane feature:
+# 0 means no boundary, otherwise 1 + the road line type.
 def map_feature_boundary_crossing_codes(
     feature, raw_points, dot_count
 ):
@@ -203,6 +232,8 @@ def map_feature_boundary_crossing_codes(
                 f" is past the {len(contract.ROAD_LINE_TYPES)} road line types a crossing code"
                 f" encodes, so it would store a code the map dot encoder cannot one-hot"
             )
+            # Maps the boundary segment's original lane-point
+            # range onto the resampled dot indices by arc length.
             first_dot = np.searchsorted(
                 sample_distances,
                 arc_lengths[segment.lane_start_index],
@@ -219,6 +250,8 @@ def map_feature_boundary_crossing_codes(
     return crossing_codes
 
 
+# Resamples a map feature to one-metre spacing, derives
+# directions and crossing codes, and crops it to the scene frame.
 def map_feature_to_storage_frame(feature, origin, heading):
     raw_points, kind_index = map_feature_points(feature)
     if raw_points is None:
@@ -248,6 +281,8 @@ def map_feature_to_storage_frame(feature, origin, heading):
     )
 
 
+# Per-lane one-hot signal state history over the history steps,
+# and each signalled lane's stop point in world coordinates.
 def scenario_traffic_signal_histories(scenario):
     histories = {}
     stop_points = {}
@@ -280,6 +315,8 @@ def scenario_traffic_signal_histories(scenario):
     return histories, stop_points
 
 
+# Builds the per-dot feature row array for one map feature,
+# including columns specific to its kind (lane, road line, ...).
 def map_feature_rows(
     feature, origin, heading, signal_histories, signal_stop_points
 ):
@@ -333,6 +370,8 @@ def map_feature_rows(
     return rows
 
 
+# A lane feature's signal history, or all zeros if it is not a
+# lane or carries no signal.
 def map_feature_signal_history(feature, signal_histories):
     if (
         feature.WhichOneof("feature_data") == "lane"
@@ -344,6 +383,7 @@ def map_feature_signal_history(feature, signal_histories):
     )
 
 
+# Whether a lane feature is flagged as interpolating.
 def map_feature_is_interpolating(feature):
     return (
         feature.WhichOneof("feature_data") == "lane"
@@ -351,6 +391,8 @@ def map_feature_is_interpolating(feature):
     )
 
 
+# Builds the concatenated map row array plus per-feature metadata
+# for every map feature with usable geometry.
 def scenario_map_arrays(scenario):
     origin, heading = scenario_storage_frame(scenario)
     signal_histories, signal_stop_points = (
@@ -408,6 +450,8 @@ def scenario_map_arrays(scenario):
     )
 
 
+# Writes one scenario's staged .npz: track and map arrays,
+# labels, the scene frame, and a provenance stamp.
 def write_scenario(scenario, output_path):
     assert (
         scenario.current_time_index == contract.CURRENT_STEP_INDEX
@@ -456,5 +500,7 @@ def write_scenario(scenario, output_path):
                 "stage.py", scenario.scenario_id
             ),
         )
+    # Renaming from a .partial path makes the write atomic: a
+    # killed process never leaves a half-written file in place.
     partial_path.replace(output_path)
     return worst_spacing_deviation

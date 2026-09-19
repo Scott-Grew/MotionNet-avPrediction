@@ -4,6 +4,8 @@ from womd import contract
 from womd.model import prune_modes_batched_with_kept_count
 
 
+# Averages per-step Euclidean distance to the ground truth over
+# valid future steps, separately for each mode.
 def mean_distance_per_mode(
     trajectories, future_positions, future_mask
 ):
@@ -16,7 +18,10 @@ def mean_distance_per_mode(
     ).clamp_min(1.0)
 
 
+# Accumulates minADE/minFDE and mode-pruning stats across batches
+# as a training-time monitor; not the reported score.
 class MetricAccumulator:
+    # Zeroes the running sums and counts.
     def __init__(self):
         self.ade_sum = 0.0
         self.ade_count = 0
@@ -26,6 +31,8 @@ class MetricAccumulator:
         self.backfilled_sample_count = 0
         self.sample_count = 0
 
+    # Prunes to the kept modes, then folds this batch's minADE,
+    # minFDE and mode-pruning counts into the running totals.
     def update(
         self,
         trajectories,
@@ -42,6 +49,8 @@ class MetricAccumulator:
             kept_trajectories - future_positions.unsqueeze(1)
         ).norm(dim=-1)
         valid_steps = future_mask.unsqueeze(1)
+        # Zeros invalid steps before summing so they don't bias
+        # the per-mode average distance.
         summed = torch.where(
             valid_steps, distances, torch.zeros_like(distances)
         ).sum(dim=-1)
@@ -67,6 +76,8 @@ class MetricAccumulator:
         ).sum()
         self.sample_count += confidence_logits.shape[0]
 
+    # Returns the accumulated metrics as plain floats, or nan for
+    # any that never saw a valid sample.
     def results(self):
         return {
             "min_ade": (

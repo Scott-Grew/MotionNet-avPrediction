@@ -7,6 +7,8 @@ from womd import contract
 HALF_LOG_TWO_PI = 0.5 * math.log(2.0 * math.pi)
 
 
+# Assigns each sample the anchor whose constant-speed straight
+# path is closest on average to the logged future.
 def anchor_assigned_mode(unit_anchors, future_positions, future_mask):
     step_count = future_positions.shape[1]
     ramp = (
@@ -18,6 +20,8 @@ def anchor_assigned_mode(unit_anchors, future_positions, future_mask):
         )
         / step_count
     )
+    # Scales each anchor endpoint down to a straight-line path over
+    # the future steps, to compare against the real trajectory.
     anchor_paths = (
         unit_anchors.unsqueeze(2) * ramp[None, None, :, None]
     )
@@ -31,6 +35,8 @@ def anchor_assigned_mode(unit_anchors, future_positions, future_mask):
     return mean_distance.argmin(dim=1)
 
 
+# Per-step, per-mode Gaussian NLL against the target trajectory,
+# diagonal covariance, log-std parameterised for stability.
 def gaussian_negative_log_likelihood(
     predicted_mean, log_standard_deviation, target
 ):
@@ -44,6 +50,8 @@ def gaussian_negative_log_likelihood(
     ).sum(dim=-1)
 
 
+# Combines the assigned anchor's Gaussian NLL with cross-entropy
+# over anchors, averaged only over samples with a valid future.
 def prediction_loss(
     trajectories,
     log_standard_deviation,
@@ -64,6 +72,8 @@ def prediction_loss(
     assigned_mode = anchor_assigned_mode(
         unit_anchors, future_positions, future_mask
     )
+    # Only the assigned anchor's per-mode NLL counts toward the
+    # regression term.
     regression = (
         mode_nll.gather(1, assigned_mode[:, None]).squeeze(1)
         * scoreable

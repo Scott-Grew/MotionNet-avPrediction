@@ -2,10 +2,14 @@ import numpy as np
 
 from womd import contract, frame_ops
 
+# Visibility crop shape in the target's agent frame: base radius,
+# and how much the forward half stretches per m/s of speed.
 BASE_RADIUS_METRES = 80.0
 STRETCH_GAIN = 0.5
 
 
+# Ellipse crop test in agent-frame coordinates: ahead of the
+# agent it stretches by forward_stretch; behind it is a circle.
 def inside_crop(agent_frame_points, base_radius, forward_stretch):
     x = agent_frame_points[:, 0]
     y = agent_frame_points[:, 1]
@@ -16,6 +20,8 @@ def inside_crop(agent_frame_points, base_radius, forward_stretch):
     return np.where(x > 0.0, forward, rear)
 
 
+# Indices of tracks valid at the current step and of a predicted
+# object type, optionally restricted to designated targets.
 def eligible_track_indices(
     track_rows,
     track_valid,
@@ -35,6 +41,8 @@ def eligible_track_indices(
     return np.flatnonzero(selected)
 
 
+# A track's agent frame at the current step: its position and
+# heading.
 def sample_frame(track_rows, track_index):
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     origin = now_row[contract.AGENT_POSITION]
@@ -45,6 +53,8 @@ def sample_frame(track_rows, track_index):
     return origin, heading
 
 
+# Re-expresses a track's per-step position, velocity and heading
+# columns in another agent's frame.
 def track_rows_to_agent_frame(rows, origin, heading):
     reframed = rows.copy()
     reframed[..., contract.AGENT_POSITION] = (
@@ -71,6 +81,8 @@ def track_rows_to_agent_frame(rows, origin, heading):
     return reframed
 
 
+# For each agent, the nearest lane dot facing its heading; if
+# none face it, falls back to the nearest dot of any direction.
 def nearest_lane_dot_facing_the_agent_way(
     lane_dot_rows, agent_distances, agent_heading_cosine_sine
 ):
@@ -87,6 +99,8 @@ def nearest_lane_dot_facing_the_agent_way(
     )
 
 
+# Selects the map rows and polyline indices belonging to
+# lane-kind dots only.
 def lane_dots_of_scenario(scenario_array):
     map_rows = scenario_array["map_rows"]
     dot_polyline_index = scenario_array["map_dot_polyline_index"]
@@ -103,6 +117,8 @@ def lane_dots_of_scenario(scenario_array):
     )
 
 
+# Assigns each agent at the current step the signal history of
+# its nearest facing lane dot's polyline; others get all zeros.
 def assigned_lane_signal_histories(
     lane_dot_rows,
     polyline_row_of_lane_dot,
@@ -125,6 +141,8 @@ def assigned_lane_signal_histories(
     assignable_rows = agent_now_rows[assignable]
     assignable_positions = assignable_rows[:, contract.AGENT_POSITION]
     lane_dot_positions = lane_dot_rows[:, contract.MAP_POSITION]
+    # Broadcasts every assignable agent against every lane dot to
+    # get one (agent, lane dot) distance matrix.
     offsets_x = (
         lane_dot_positions[None, :, 0] - assignable_positions[:, :1]
     )
@@ -149,6 +167,8 @@ def assigned_lane_signal_histories(
     return signal_histories
 
 
+# Adds map_dot_polyline_index (which polyline each map row
+# belongs to) and track_signal_histories to a loaded scenario.
 def with_derived_arrays(scenario_array):
     feature_lengths = scenario_array["feature_lengths"]
     scenario_array["map_dot_polyline_index"] = np.repeat(
@@ -173,6 +193,8 @@ def with_derived_arrays(scenario_array):
     return scenario_array
 
 
+# Loads one staged .npz scenario, checks its provenance stamp,
+# and returns it with derived arrays added.
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
         scenario_array = {
@@ -193,6 +215,8 @@ def read_scenario(scenario_path):
     return with_derived_arrays(scenario_array)
 
 
+# Groups each polyline's dots into chunks of up to MAP_CHUNK_DOTS
+# dots. Assumes dot_polyline_index is sorted by polyline.
 def chunk_index_of_dots(dot_polyline_index):
     (
         polylines,
@@ -205,6 +229,8 @@ def chunk_index_of_dots(dot_polyline_index):
         return_inverse=True,
         return_counts=True,
     )
+    # Position of each dot within its own polyline, counting
+    # from that polyline's first occurrence.
     position_within_polyline = (
         np.arange(len(compact_polyline_index))
         - first_dot_position[compact_polyline_index]
@@ -212,6 +238,8 @@ def chunk_index_of_dots(dot_polyline_index):
     chunks_per_polyline = (
         dots_per_polyline + contract.MAP_CHUNK_DOTS - 1
     ) // contract.MAP_CHUNK_DOTS
+    # Exclusive prefix sum: the first global chunk index used by
+    # each polyline.
     first_chunk_of_polyline = (
         np.cumsum(chunks_per_polyline) - chunks_per_polyline
     )
@@ -222,6 +250,8 @@ def chunk_index_of_dots(dot_polyline_index):
     return dot_chunk_index, np.repeat(polylines, chunks_per_polyline)
 
 
+# Concatenates position and direction, both re-expressed in the
+# target's agent frame, into one token pose row per input row.
 def poses_in_agent_frame(
     positions, direction_cosine_sine, origin, heading
 ):
@@ -238,6 +268,8 @@ def poses_in_agent_frame(
     ).astype(np.float32)
 
 
+# Builds one scene sample, plus per target its own history,
+# future, and tokens ordered [scene agents, then map chunks].
 def build_scene_sample(scenario_array, track_indices):
     track_rows = scenario_array["track_rows"]
     track_valid = scenario_array["track_valid"]
@@ -245,6 +277,8 @@ def build_scene_sample(scenario_array, track_indices):
     map_rows = scenario_array["map_rows"]
     history_valid = track_valid[:, : contract.HISTORY_STEPS]
     agent_present = history_valid.any(axis=1)
+    # Last valid history step: first True in the reversed mask is
+    # the last True in the original order.
     last_valid_step = (
         contract.HISTORY_STEPS
         - 1
@@ -268,6 +302,8 @@ def build_scene_sample(scenario_array, track_indices):
     _, first_dot_of_chunk, dots_per_chunk = np.unique(
         dot_chunk_index, return_index=True, return_counts=True
     )
+    # Uses the middle dot of each chunk as that chunk's reference
+    # pose.
     chunk_reference_rows = map_rows[
         first_dot_of_chunk + dots_per_chunk // 2
     ]
@@ -289,6 +325,8 @@ def build_scene_sample(scenario_array, track_indices):
             BASE_RADIUS_METRES,
             1.0 + STRETCH_GAIN * speed,
         )
+        # A chunk is visible if any of its dots falls inside the
+        # crop.
         chunk_visible = (
             np.bincount(
                 dot_chunk_index,
@@ -298,6 +336,7 @@ def build_scene_sample(scenario_array, track_indices):
             > 0
         )
         agent_visible = agent_present.copy()
+        # A target never sees itself as a scene token.
         agent_visible[track_index] = False
         targets.append(
             {
@@ -350,6 +389,8 @@ def build_scene_sample(scenario_array, track_indices):
     }
 
 
+# Stacks variable-length arrays into one (len(arrays), length,
+# ...) array, zero-padding each beyond its own length.
 def padded_stack(arrays, length, dtype):
     stacked = np.zeros(
         (len(arrays), length) + arrays[0].shape[1:], dtype=dtype
@@ -359,6 +400,8 @@ def padded_stack(arrays, length, dtype):
     return stacked
 
 
+# Batches scene samples: pads each scene's agents and map chunks
+# to the batch's largest counts, and flattens all targets.
 def build_scene_batch(scene_samples):
     max_agents = max(
         len(scene["scene_agent_history"]) for scene in scene_samples
@@ -373,9 +416,12 @@ def build_scene_batch(scene_samples):
         for target in scene["targets"]
     ]
 
+    # Stacks one named field across every target in the batch.
     def stacked_target(name):
         return np.stack([target[name] for _, target in targets])
 
+    # Stacks one named field across every target, padded scene
+    # agents concatenated with padded map chunks, in token order.
     def padded_target_tokens(agent_name, chunk_name, dtype):
         return np.concatenate(
             [
@@ -419,6 +465,7 @@ def build_scene_batch(scene_samples):
             [scene["map_rows"] for scene in scene_samples],
             dtype=np.float32,
         ),
+        # slot = scene index * max chunks + chunk index
         "map_dot_polyline_slot": np.concatenate(
             [
                 scene["map_chunk_index"] + scene_index * max_chunks

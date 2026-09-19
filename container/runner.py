@@ -45,6 +45,8 @@ max_predictions: 6
 """
 
 
+# Converts one agent's storage-frame track row to world-frame
+# position, dimensions, heading and velocity, one row per step.
 def track_row_world_frame_state(
     track_row, frame_origin, frame_heading
 ):
@@ -77,6 +79,8 @@ def track_row_world_frame_state(
     )
 
 
+# Builds world-frame ground truth state, validity, and object
+# type for every track in a scenario, for scoring against it.
 def scenario_world_frame_ground_truth(scenario_array):
     track_rows = scenario_array["track_rows"]
     frame_origin = scenario_array["frame_origin"]
@@ -100,12 +104,16 @@ def scenario_world_frame_ground_truth(scenario_array):
     )
 
 
+# Reshapes flat per-target predictions and staged ground truth
+# into the padded scenario-by-agent tensors the metrics op expects.
 def build_motion_metric_tensors(predictions, staged_directory):
     scenario_ids = predictions["scenario_id"]
     track_ids = predictions["track_id"]
     world_trajectories = predictions["world_trajectories"]
     confidences = predictions["confidences"]
 
+    # groups the flat per-target prediction rows back by scenario,
+    # since the metrics op wants one scenario-by-agent tensor
     prediction_rows_of_scenario = {}
     for prediction_index, scenario_id in enumerate(scenario_ids):
         prediction_rows_of_scenario.setdefault(
@@ -184,6 +192,7 @@ def build_motion_metric_tensors(predictions, staged_directory):
         for slot_index, prediction_index in enumerate(
             prediction_rows_of_scenario[scenario_id]
         ):
+            # the metrics op matches by agent index, not track id
             matching_track_indices = np.flatnonzero(
                 scenario_array["track_ids"]
                 == track_ids[prediction_index]
@@ -218,6 +227,8 @@ def build_motion_metric_tensors(predictions, staged_directory):
     }
 
 
+# Scores a submission .npz with Waymo's motion metrics op. The only
+# place waymo_open_dataset is imported; runs inside the container.
 def run_score(predictions_path, staged_directory):
     import tensorflow as tf
     from google.protobuf import text_format
@@ -298,6 +309,8 @@ def run_score(predictions_path, staged_directory):
         )
 
 
+# Copies the current environment with PYTHONPATH stripped, as a
+# base for building a child process environment from.
 def base_environment():
     return {
         key: value
@@ -306,6 +319,8 @@ def base_environment():
     }
 
 
+# Compiles the vendored .proto files apart from Waymo's installed
+# protos so the two sets can be imported and compared separately.
 def generate_container_local_protos(generated_root):
     generated_root.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -324,6 +339,8 @@ def generate_container_local_protos(generated_root):
     (generated_root / "womd_protos" / "__init__.py").touch()
 
 
+# Compares two decoded field values, using a tolerance for floats
+# and exact equality otherwise.
 def fields_disagree(ours_value, theirs_value):
     if isinstance(ours_value, float) or isinstance(
         theirs_value, float
@@ -335,6 +352,8 @@ def fields_disagree(ours_value, theirs_value):
     return ours_value != theirs_value
 
 
+# Recursively compares two decoded scenarios field by field,
+# printing each disagreement and returning the count found.
 def compare_scenario_fields(scenario_index, ours, theirs, path=""):
     if isinstance(ours, dict):
         assert set(ours.keys()) == set(theirs.keys()), (
@@ -373,6 +392,8 @@ def compare_scenario_fields(scenario_index, ours, theirs, path=""):
     return 0
 
 
+# Decodes one shard with our protos and with Waymo's, in separate
+# subprocesses, and compares every field for agreement.
 def run_check_reader(shard_path, sample_count):
     generated_root = Path("/tmp/container_local_protos")
     generate_container_local_protos(generated_root)
@@ -444,6 +465,8 @@ def run_check_reader(shard_path, sample_count):
         sys.exit(1)
 
 
+# Container entry point: scores a predictions file or checks the
+# vendored protos against Waymo's.
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)

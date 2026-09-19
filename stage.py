@@ -8,6 +8,8 @@ from womd import store
 from womd_protos import scenario_pb2
 
 
+# Reads one TFRecord shard and writes each scenario's .npz,
+# skipping scenarios already staged when skip_existing is set.
 def stage_shard(shard_path, output_directory, skip_existing):
     written_paths = []
     spacing_deviations = []
@@ -32,6 +34,8 @@ def stage_shard(shard_path, output_directory, skip_existing):
     return written_paths, spacing_deviations, skipped_paths
 
 
+# Runs stage_shard over every shard, asserts no two shards wrote
+# the same output path, and reports how many scenarios skipped.
 def stage_shards(shard_paths, output_directory, skip_existing=False):
     written_paths = []
     spacing_deviations = []
@@ -54,6 +58,8 @@ def stage_shards(shard_paths, output_directory, skip_existing=False):
     return written_paths, spacing_deviations
 
 
+# CLI entry point: stages the given shards and prints how many
+# scenarios were staged and how many had irregular spacing.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output_directory", type=Path)
