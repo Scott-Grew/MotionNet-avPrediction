@@ -49,20 +49,6 @@ AGENT_TYPE = slice(8, 8 + NUM_AGENT_TYPES)
 AGENT_IS_SDC = AGENT_TYPE.stop
 AGENT_FEATURE_DIM = AGENT_IS_SDC + 1
 
-PREDICTED_AGENT_ARRAY_SPEC = {
-    "agent_history": (HISTORY_STEPS, AGENT_FEATURE_DIM),
-    "agent_history_mask": (HISTORY_STEPS,),
-    "future_positions": (FUTURE_STEPS, 2),
-    "future_headings": (FUTURE_STEPS, 2),
-    "future_mask": (FUTURE_STEPS,),
-    "frame_origin": (2,),
-    "frame_heading": (),
-    "scenario_id": (),
-    "track_id": (),
-    "is_designated_target": (),
-    "is_object_of_interest": (),
-}
-
 TRAFFIC_SIGNAL_STATES = (
     "LANE_STATE_UNKNOWN",
     "LANE_STATE_ARROW_STOP",

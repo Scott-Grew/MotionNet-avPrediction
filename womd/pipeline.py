@@ -50,43 +50,6 @@ def collate_samples(samples):
     }
 
 
-def track_sample_batches(
-    staged_directory,
-    batch_size,
-    designated_targets_only,
-    scenario_order=None,
-):
-    scenario_paths = sorted(staged_directory.glob("*.npz"))
-    if scenario_order is not None:
-        scenario_paths = [
-            scenario_paths[scenario_index]
-            for scenario_index in scenario_order
-        ]
-    batch = []
-    for scenario_path in scenario_paths:
-        scenario_array = loader.read_scenario(scenario_path)
-        for track_index in loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
-            designated_targets_only,
-        ):
-            track_index = int(track_index)
-            batch.append(
-                (
-                    scenario_array,
-                    track_index,
-                    loader.build_sample(scenario_array, track_index),
-                )
-            )
-            if len(batch) < batch_size:
-                continue
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
 def batches(
     scenario_paths,
     worker_count,
