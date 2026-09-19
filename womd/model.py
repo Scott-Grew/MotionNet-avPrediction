@@ -528,7 +528,9 @@ class MotionPredictor(nn.Module):
             predicted_type_index(batch["agent_history"]),
         )
 
-    def forward(self, batch):
+    def forward(self, batch, with_likelihood_outputs=False):
+        if with_likelihood_outputs:
+            return self.predict(batch)
         trajectories, _, confidence_logits, _ = self.predict(batch)
         return trajectories, confidence_logits
 

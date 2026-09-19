@@ -1,11 +1,16 @@
 import womd.runtime_env
 import argparse
+import contextlib
 import math
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as distributed
+from torch.distributed.algorithms.join import Join
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from womd import contract, loader, loss, metrics, model, pipeline
@@ -84,7 +89,7 @@ def training_losses(predictor, batch):
         log_standard_deviation,
         confidence_logits,
         unit_anchors,
-    ) = predictor.predict(batch)
+    ) = predictor(batch, with_likelihood_outputs=True)
     total, regression, classification = loss.prediction_loss(
         trajectories,
         log_standard_deviation,
@@ -102,6 +107,20 @@ def training_losses(predictor, batch):
     )
 
 
+def unwrapped(predictor):
+    if isinstance(predictor, DistributedDataParallel):
+        return predictor.module
+    return predictor
+
+
+def agreed_with_main_process(decision, device):
+    if not distributed.is_initialized():
+        return decision
+    shared_decision = torch.tensor(int(decision), device=device)
+    distributed.broadcast(shared_decision, src=0)
+    return bool(shared_decision.item())
+
+
 def checkpoint_state(
     predictor,
     optimizer,
@@ -110,8 +129,9 @@ def checkpoint_state(
     completed_epochs,
     batch_index,
 ):
+    model_state = unwrapped(predictor).state_dict()
     return {
-        "model_state": predictor.state_dict(),
+        "model_state": model_state,
         "optimizer_state": optimizer.state_dict(),
         "gradient_scaler_state": gradient_scaler.state_dict(),
         "completed_epochs": completed_epochs,
@@ -119,7 +139,7 @@ def checkpoint_state(
         "seed": seed,
         "code_version": contract.STAGING_CODE_VERSION,
         "parameter_fingerprint": model.parameter_fingerprint(
-            predictor.state_dict()
+            model_state
         ),
     }
 
@@ -171,6 +191,7 @@ def train_epoch(
     decay_start_step,
     decay_end_step,
     summary_writer,
+    is_main_process,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
@@ -268,7 +289,7 @@ def train_epoch(
 
         batch_count += 1
         sample_count += batch["agent_history"].shape[0]
-        if batch_count % LOG_EVERY_BATCHES == 0:
+        if is_main_process and batch_count % LOG_EVERY_BATCHES == 0:
             elapsed = sum(seconds.values())
             monitor = accumulator.results()
             window_monitor = window_accumulator.results()
@@ -323,7 +344,8 @@ def train_epoch(
             window_loss_sums = dict.fromkeys(loss_sums, 0.0)
             window_winner_counts.zero_()
         if (
-            time.perf_counter() - checkpoint_wait_start
+            is_main_process
+            and time.perf_counter() - checkpoint_wait_start
             >= checkpoint_every_seconds
         ):
             if math.isfinite(component_values["total"]):
@@ -377,10 +399,26 @@ def main():
     parser.add_argument("--all-eligible-agents", action="store_true")
     arguments = parser.parse_args()
 
-    torch.manual_seed(arguments.seed)
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+    process_count = int(os.environ.get("WORLD_SIZE", "1"))
+    process_rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main_process = process_rank == 0
+    announce = print if is_main_process else lambda *_, **__: None
+    assert arguments.batch_size % process_count == 0, (
+        f"--batch-size {arguments.batch_size} does not split evenly"
+        f" over {process_count} processes"
     )
+    batch_size_per_process = arguments.batch_size // process_count
+
+    torch.manual_seed(arguments.seed)
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+    if process_count > 1:
+        distributed.init_process_group(
+            "nccl" if device.type == "cuda" else "gloo"
+        )
     predictor = MotionPredictor(
         model.load_anchor_file(arguments.anchors)
     ).to(device)
@@ -390,17 +428,27 @@ def main():
     gradient_scaler = GradScaler(
         enabled=arguments.mixed_precision and device.type == "cuda"
     )
-    scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))
+    scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))[
+        process_rank::process_count
+    ]
     assert (
         scenario_paths
     ), f"no .npz scenarios in {arguments.staged_directory}"
     steps_per_epoch = optimiser_steps_per_epoch(
         scenario_paths,
         arguments.workers,
-        arguments.batch_size,
+        batch_size_per_process,
         not arguments.all_eligible_agents,
     )
-    print(
+    if process_count > 1:
+        longest_process_steps = torch.tensor(
+            steps_per_epoch, device=device
+        )
+        distributed.all_reduce(
+            longest_process_steps, op=distributed.ReduceOp.MAX
+        )
+        steps_per_epoch = int(longest_process_steps.item())
+    announce(
         f"{steps_per_epoch} optimiser steps per epoch, {steps_per_epoch * arguments.epochs} over"
         f" {arguments.epochs} epochs, learning rate {arguments.learning_rate} held after"
         f" {arguments.warmup_steps} warmup steps",
@@ -418,7 +466,7 @@ def main():
         and previous_checkpoint_path.exists()
     ):
         resume_path = previous_checkpoint_path
-        print(
+        announce(
             f"{arguments.checkpoint_path} missing, resuming from {resume_path}",
             flush=True,
         )
@@ -433,7 +481,7 @@ def main():
                 checkpoint["gradient_scaler_state"]
             )
         completed_epochs = checkpoint["completed_epochs"]
-        print(
+        announce(
             f"resuming {resume_path}: {completed_epochs} epochs complete",
             flush=True,
         )
@@ -442,7 +490,7 @@ def main():
         completed_epochs, arguments.epochs
     )
     if not remaining_epochs:
-        print(
+        announce(
             f"NOTHING TO TRAIN: {arguments.checkpoint_path} already holds {completed_epochs}"
             f" completed epochs and --epochs is {arguments.epochs}.",
             flush=True,
@@ -451,9 +499,20 @@ def main():
 
     training_start = time.perf_counter()
     process_steps_before_epoch = completed_epochs * steps_per_epoch
-    summary_writer = SummaryWriter(
-        arguments.checkpoint_path.parent / "tensorboard"
+    summary_writer = (
+        SummaryWriter(
+            arguments.checkpoint_path.parent / "tensorboard"
+        )
+        if is_main_process
+        else None
     )
+    if process_count > 1:
+        predictor = DistributedDataParallel(
+            predictor,
+            device_ids=(
+                [local_rank] if device.type == "cuda" else None
+            ),
+        )
     decay_start_step = None
     decay_end_step = None
     if arguments.decay_from_epoch is not None:
@@ -464,11 +523,12 @@ def main():
     last_epoch_seconds = 0.0
     for epoch_index in remaining_epochs:
         elapsed_seconds = time.perf_counter() - training_start
-        if (
+        if agreed_with_main_process(
             elapsed_seconds + last_epoch_seconds
-            > arguments.stop_after_seconds
+            > arguments.stop_after_seconds,
+            device,
         ):
-            print(
+            announce(
                 f"STOPPING BEFORE EPOCH {epoch_index + 1}: {elapsed_seconds / 3600:.2f} h"
                 f" elapsed, the last epoch took {last_epoch_seconds / 3600:.2f} h, and the"
                 f" --stop-after-seconds budget is {arguments.stop_after_seconds / 3600:.2f} h."
@@ -481,73 +541,83 @@ def main():
         batches = pipeline.batches(
             scenario_paths,
             arguments.workers,
-            arguments.batch_size,
+            batch_size_per_process,
             arguments.prefetch,
             arguments.seed + epoch_index,
             not arguments.all_eligible_agents,
         )
-        averages, monitor, seconds = train_epoch(
-            predictor,
-            optimizer,
-            batches,
-            device,
-            gradient_scaler,
-            arguments.checkpoint_path,
-            previous_checkpoint_path,
-            arguments.checkpoint_every_seconds,
-            epoch_index,
-            arguments.seed,
-            arguments.warmup_steps,
-            arguments.gradient_clip_norm,
-            process_steps_before_epoch,
-            arguments.learning_rate,
-            decay_start_step,
-            decay_end_step,
-            summary_writer,
+        uneven_shard_context = (
+            Join([predictor])
+            if process_count > 1
+            else contextlib.nullcontext()
         )
+        with uneven_shard_context:
+            averages, monitor, seconds = train_epoch(
+                predictor,
+                optimizer,
+                batches,
+                device,
+                gradient_scaler,
+                arguments.checkpoint_path,
+                previous_checkpoint_path,
+                arguments.checkpoint_every_seconds,
+                epoch_index,
+                arguments.seed,
+                arguments.warmup_steps,
+                arguments.gradient_clip_norm,
+                process_steps_before_epoch,
+                arguments.learning_rate,
+                decay_start_step,
+                decay_end_step,
+                summary_writer,
+                is_main_process,
+            )
         process_steps_before_epoch += steps_per_epoch
         last_epoch_seconds = time.perf_counter() - epoch_start
-        report_scalars(
-            summary_writer,
-            f"epoch {epoch_index + 1}/{arguments.epochs}",
-            {
-                "epoch/loss_total": averages["total"],
-                "epoch/loss_regression": averages["regression"],
-                "epoch/loss_classification": averages[
-                    "classification"
-                ],
-                "epoch/ade_80step": monitor["min_ade"],
-                "epoch/fde_80step": monitor["min_fde"],
-                "epoch/kept_modes": monitor["mean_kept_modes"],
-                "epoch/backfill_rate": monitor["backfill_rate"],
-                "epoch/data_wait_seconds": seconds["data_wait"],
-                "epoch/step_seconds": seconds["step"],
-                "epoch/monitor_seconds": seconds["monitor"],
-            },
-            epoch_index + 1,
-        )
-        summary_writer.flush()
+        if is_main_process:
+            report_scalars(
+                summary_writer,
+                f"epoch {epoch_index + 1}/{arguments.epochs}",
+                {
+                    "epoch/loss_total": averages["total"],
+                    "epoch/loss_regression": averages["regression"],
+                    "epoch/loss_classification": averages[
+                        "classification"
+                    ],
+                    "epoch/ade_80step": monitor["min_ade"],
+                    "epoch/fde_80step": monitor["min_fde"],
+                    "epoch/kept_modes": monitor["mean_kept_modes"],
+                    "epoch/backfill_rate": monitor["backfill_rate"],
+                    "epoch/data_wait_seconds": seconds["data_wait"],
+                    "epoch/step_seconds": seconds["step"],
+                    "epoch/monitor_seconds": seconds["monitor"],
+                },
+                epoch_index + 1,
+            )
+            summary_writer.flush()
         if not math.isfinite(averages["total"]):
-            print(
+            announce(
                 f"epoch {epoch_index + 1} mean total loss {averages['total']}, checkpoint left as it was",
                 flush=True,
             )
-            continue
-        save_checkpoint(
-            arguments.checkpoint_path,
-            previous_checkpoint_path,
-            checkpoint_state(
-                predictor,
-                optimizer,
-                gradient_scaler,
-                arguments.seed,
-                epoch_index + 1,
-                None,
-            ),
-        )
+        elif is_main_process:
+            save_checkpoint(
+                arguments.checkpoint_path,
+                previous_checkpoint_path,
+                checkpoint_state(
+                    predictor,
+                    optimizer,
+                    gradient_scaler,
+                    arguments.seed,
+                    epoch_index + 1,
+                    None,
+                ),
+            )
         elapsed_seconds = time.perf_counter() - training_start
-        if elapsed_seconds >= arguments.stop_after_seconds:
-            print(
+        if agreed_with_main_process(
+            elapsed_seconds >= arguments.stop_after_seconds, device
+        ):
+            announce(
                 f"STOPPING EARLY: {elapsed_seconds / 3600:.2f} h elapsed against a"
                 f" --stop-after-seconds budget of {arguments.stop_after_seconds / 3600:.2f} h."
                 f" {epoch_index + 1} of {arguments.epochs} epochs are complete and"
@@ -559,3 +629,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    if distributed.is_initialized():
+        distributed.destroy_process_group()
