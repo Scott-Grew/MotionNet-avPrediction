@@ -5,6 +5,8 @@ CRC_MASK_DELTA = 0xA282EAD8
 UINT32_MODULUS = 0x100000000
 
 
+# Builds the 256-entry CRC-32C lookup table from the
+# Castagnoli polynomial, for the table-driven crc32c below.
 def _build_crc32c_table():
     table = []
     for byte_value in range(256):
@@ -23,6 +25,8 @@ def _build_crc32c_table():
 _CRC32C_TABLE = _build_crc32c_table()
 
 
+# Computes the CRC-32C checksum of payload bytes using the
+# table above; this is the checksum TFRecord framing uses.
 def crc32c(payload):
     remainder = 0xFFFFFFFF
     for byte_value in payload:
@@ -32,15 +36,21 @@ def crc32c(payload):
     return remainder ^ 0xFFFFFFFF
 
 
+# Applies TFRecord's CRC masking: rotates right 15 bits and
+# adds a magic delta, per the TFRecord/LevelDB framing spec.
 def mask_crc(value):
     rotated = ((value >> 15) | (value << 17)) % UINT32_MODULUS
     return (rotated + CRC_MASK_DELTA) % UINT32_MODULUS
 
 
+# Raised when a TFRecord record's framing or checksum comes
+# out truncated or wrong.
 class CorruptRecordError(Exception):
     pass
 
 
+# Reads length-prefixed TFRecord records from a binary stream
+# and yields their raw payloads, checking CRCs when asked.
 def read_records(stream, verify_checksums=True):
     while True:
         length_bytes = stream.read(8)
@@ -79,6 +89,8 @@ def read_records(stream, verify_checksums=True):
         yield payload
 
 
+# Writes one payload to a stream in TFRecord framing: length,
+# length checksum, payload, then payload checksum.
 def write_record(stream, payload):
     length_bytes = struct.pack("<Q", len(payload))
     stream.write(length_bytes)
@@ -87,6 +99,8 @@ def write_record(stream, payload):
     stream.write(struct.pack("<I", mask_crc(crc32c(payload))))
 
 
+# Opens a TFRecord shard and yields each record parsed into
+# scenario_message_type.
 def read_scenarios(
     path, scenario_message_type, verify_checksums=True
 ):

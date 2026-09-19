@@ -20,6 +20,8 @@ SUBMISSION_STEP_SELECTOR = torch.tensor(
 )
 
 
+# Converts a prediction from the agent's own frame to world
+# coordinates via the scene frame stored on the sample.
 def agent_frame_to_world_frame(
     agent_frame_positions, sample, scenario_array
 ):
@@ -35,6 +37,8 @@ def agent_frame_to_world_frame(
     )
 
 
+# Yields (scenario_array, sample) for every designated target
+# in every staged scenario, in scenario file order.
 def designated_target_samples(staged_directory):
     for scenario_path in sorted(Path(staged_directory).glob("*.npz")):
         scenario_array = loader.read_scenario(scenario_path)
@@ -57,6 +61,8 @@ def designated_target_samples(staged_directory):
             )
 
 
+# Splits an iterable into lists of group_size, with a shorter
+# final group for the remainder.
 def grouped(pairs, group_size):
     group = []
     for pair in pairs:
@@ -68,6 +74,8 @@ def grouped(pairs, group_size):
         yield group
 
 
+# Predicts a batch (or scores it with the constant-velocity
+# baseline), prunes modes, and decimates to submission steps.
 def submission_trajectories_and_confidences(predictor, samples):
     batch = pipeline.collate_samples(samples)
     with torch.no_grad():
@@ -89,6 +97,8 @@ def submission_trajectories_and_confidences(predictor, samples):
     return decimated.numpy(), confidences.numpy()
 
 
+# Builds the model from its anchor file and loads trained weights,
+# set to eval mode.
 def load_predictor(checkpoint_path, anchors_path):
     predictor = model.MotionPredictor(
         model.load_anchor_file(anchors_path)
@@ -99,6 +109,8 @@ def load_predictor(checkpoint_path, anchors_path):
     return predictor.eval()
 
 
+# Predicts every designated target, converts to world frame,
+# and writes a compressed submission .npz with provenance.
 def write_submission_arrays(predictor, staged_directory, output_path):
     scenario_ids, track_ids, world_trajectories, confidences = (
         [],
@@ -148,6 +160,8 @@ def write_submission_arrays(predictor, staged_directory, output_path):
     return len(track_ids)
 
 
+# Writes a submission .npz from a trained model or from the
+# constant-velocity baseline.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--constant-velocity", action="store_true")

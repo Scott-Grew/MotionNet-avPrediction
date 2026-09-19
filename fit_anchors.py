@@ -13,6 +13,8 @@ MAXIMUM_ITERATIONS = 2000
 SEED_GENERATOR_SEED = 0
 
 
+# For every designated target: its final valid future position,
+# predicted type index, and reachable-distance bound (metres).
 def metre_endpoints(scenario_paths):
     agent_histories = []
     logged_endpoints = []
@@ -45,6 +47,7 @@ def metre_endpoints(scenario_paths):
     )
 
 
+# Counts how many endpoints were assigned to each cluster centre.
 def endpoints_per_centre(assignment, centre_count):
     counts = torch.zeros(centre_count, dtype=torch.long)
     return counts.index_add_(
@@ -52,6 +55,8 @@ def endpoints_per_centre(assignment, centre_count):
     )
 
 
+# Moves each centre to the mean of its assigned endpoints;
+# a centre with no assignments is left where it was.
 def move_centres_to_assigned_means(endpoints, assignment, centres):
     totals = torch.zeros_like(centres).index_add_(
         0, assignment, endpoints
@@ -66,6 +71,8 @@ def move_centres_to_assigned_means(endpoints, assignment, centres):
     )
 
 
+# Reseeds each empty centre from a spread-out endpoint of
+# whichever centre currently holds the most assignments.
 def reseed_empty_centres(endpoints, assignment, centres, counts):
     empty_centres = (counts == 0.0).nonzero(as_tuple=True)[0]
     if empty_centres.numel() == 0:
@@ -90,6 +97,8 @@ def reseed_empty_centres(endpoints, assignment, centres, counts):
     return reseeded
 
 
+# k-means++ seeding: each new centre is sampled with probability
+# proportional to its squared distance from the nearest one picked.
 def spread_out_seed_centres(endpoints, centre_count, generator):
     first_seed = int(
         torch.randint(len(endpoints), (1,), generator=generator)
@@ -111,6 +120,8 @@ def spread_out_seed_centres(endpoints, centre_count, generator):
     return torch.stack(centres)
 
 
+# Runs Lloyd's k-means, k-means++ seeded with empty-centre
+# reseeding, until assignments settle or the iteration cap hits.
 def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     generator = torch.Generator().manual_seed(SEED_GENERATOR_SEED)
     centres = spread_out_seed_centres(
@@ -146,12 +157,15 @@ def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     )
 
 
+# Smallest distance between any two distinct anchors, in metres.
 def minimum_pairwise_distance(anchors):
     separations = torch.cdist(anchors, anchors)
     separations.fill_diagonal_(float("inf"))
     return float(separations.min())
 
 
+# Prints one object type's fitted anchors with their offset,
+# distance, angle and share of endpoints assigned to them.
 def print_one_type(
     type_name,
     type_sample_count,
@@ -185,6 +199,8 @@ def print_one_type(
     print()
 
 
+# Fits per-type anchor endpoints from a staged directory's cached
+# or freshly extracted endpoints, and writes them with provenance.
 def main():
     staged_directory = Path(sys.argv[1])
     output_path = Path(sys.argv[2])

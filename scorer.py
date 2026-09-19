@@ -10,12 +10,16 @@ CONTAINER_MOUNT_POINT = "/mnt"
 CONTAINER_IMAGE_TAG = "waymo-scorer"
 
 
+# Converts a host filesystem path under the project root to the
+# matching path inside the container's mounted volume.
 def container_path(host_path):
     resolved = Path(host_path).resolve()
     relative = resolved.relative_to(WAYMO_PROJECT_ROOT)
     return f"{CONTAINER_MOUNT_POINT}/{relative}"
 
 
+# Builds the linux/amd64 scorer image, since the waymo-open-dataset
+# package used inside it has no macOS build.
 def build_container_image():
     subprocess.run(
         [
@@ -31,6 +35,8 @@ def build_container_image():
     )
 
 
+# Runs container/runner.py inside the scorer image with the
+# project root mounted, forwarding runner_arguments to it.
 def run_in_container(runner_arguments):
     subprocess.run(
         [
@@ -50,6 +56,8 @@ def run_in_container(runner_arguments):
     )
 
 
+# Runs submit.py on the host to produce predictions, then scores
+# them inside the container against Waymo's own metrics.
 def run_score(
     checkpoint_path, anchors_path, staged_directory, output_directory
 ):
@@ -79,6 +87,8 @@ def run_score(
     )
 
 
+# Runs the container's field-by-field proto comparison against a
+# shard on the host.
 def run_check_reader(shard_path, sample_count):
     build_container_image()
     run_in_container(
@@ -90,6 +100,8 @@ def run_check_reader(shard_path, sample_count):
     )
 
 
+# Drives the container from the host: either scores a checkpoint's
+# predictions or checks the vendored protos against Waymo's.
 def main():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)

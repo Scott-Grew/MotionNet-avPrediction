@@ -19,6 +19,8 @@ GradScaler = getattr(
 )
 
 
+# Splits parameters so weight decay applies to matrices only, not
+# to biases, norms or the learned anchor queries.
 def parameter_groups(predictor):
     decayed = []
     undecayed = []
@@ -33,6 +35,8 @@ def parameter_groups(predictor):
     ]
 
 
+# Steps per epoch: the sum over worker streams of ceil(targets /
+# batch size), because each worker fills its own batches.
 def optimiser_steps_per_epoch(
     scenario_paths, worker_count, batch_size, designated_targets_only
 ):
@@ -56,6 +60,8 @@ def optimiser_steps_per_epoch(
     return steps
 
 
+# Learning rate as a pure function of the global step: linear
+# warm-up, hold, then an optional cosine fall to zero.
 def scheduled_learning_rate(
     process_steps,
     warmup_steps,
@@ -77,6 +83,8 @@ def scheduled_learning_rate(
     )
 
 
+# Runs the predictor on a batch and returns its losses plus
+# its raw trajectories and confidence logits.
 def training_losses(predictor, batch):
     (
         trajectories,
@@ -101,6 +109,8 @@ def training_losses(predictor, batch):
     )
 
 
+# Bundles the model, optimizer and scaler state, training
+# progress and a parameter fingerprint into a checkpoint dict.
 def checkpoint_state(
     predictor,
     optimizer,
@@ -123,10 +133,13 @@ def checkpoint_state(
     }
 
 
+# Epoch indices still to run, given how many are already done.
 def epochs_left_to_train(completed_epochs, requested_epochs):
     return range(completed_epochs, requested_epochs)
 
 
+# Writes to a temporary file, then swaps it in, so a crash never
+# truncates the checkpoint; the prior one is kept as a fallback.
 def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path = checkpoint_path.with_suffix(
         checkpoint_path.suffix + ".partial"
@@ -137,6 +150,8 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path.replace(checkpoint_path)
 
 
+# Runs one epoch of batches with mixed precision and gradient
+# clipping, logging progress and checkpointing on a timer.
 def train_epoch(
     predictor,
     optimizer,
@@ -308,6 +323,8 @@ def train_epoch(
     return averages, accumulator.results(), seconds
 
 
+# CLI entry point: builds the model, resumes from a checkpoint
+# if requested, and trains the remaining epochs under budget.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)

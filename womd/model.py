@@ -8,6 +8,8 @@ from womd import contract
 HIDDEN_DIM = 192
 
 
+# Per-feature scale so position (metres), velocity (m/s) and
+# dimensions (metres) are normalised before they enter the network.
 def agent_feature_divisors():
     divisors = torch.ones(contract.AGENT_FEATURE_DIM)
     divisors[contract.AGENT_POSITION] = (
@@ -22,6 +24,8 @@ def agent_feature_divisors():
     return divisors
 
 
+# Per-feature scale for map rows: position and stop point in
+# metres, speed limit in miles per hour.
 def map_feature_divisors():
     divisors = torch.ones(contract.MAP_FEATURE_DIM)
     divisors[contract.MAP_POSITION] = (
@@ -36,7 +40,10 @@ def map_feature_divisors():
     return divisors
 
 
+# Encodes one agent's history steps into a single hidden-dim
+# token.
 class AgentHistoryEncoder(nn.Module):
+    # Builds the normaliser buffer and the two-layer MLP.
     def __init__(self):
         super().__init__()
         input_width = contract.HISTORY_STEPS * (
@@ -51,6 +58,8 @@ class AgentHistoryEncoder(nn.Module):
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
         )
 
+    # Zeros invalid steps and appends the mask itself as a feature
+    # before flattening across the history window.
     def forward(self, agent_history, agent_history_mask):
         validity = agent_history_mask.unsqueeze(-1).to(
             agent_history.dtype
@@ -64,7 +73,11 @@ class AgentHistoryEncoder(nn.Module):
         return self.network(flattened)
 
 
+# Encodes one map dot (one metre of a polyline) into a
+# hidden-dim token; boundary crossing codes go in one-hot.
 class MapDotEncoder(nn.Module):
+    # Builds the normaliser buffer, the one-hot lookup table for
+    # crossing codes, and the two-layer MLP.
     def __init__(self):
         super().__init__()
         self.register_buffer(
@@ -83,6 +96,8 @@ class MapDotEncoder(nn.Module):
             nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
         )
 
+    # Splits off the two boundary-crossing code columns, one-hot
+    # encodes them, and concatenates with the scaled rest.
     def forward(self, map_rows):
         scaled = map_rows / self.feature_divisors
         crossing_codes = map_rows[
@@ -102,10 +117,14 @@ class MapDotEncoder(nn.Module):
         )
 
 
+# Max-pools per-dot embeddings into per-polyline tokens; a
+# polyline slot with no dots at all comes back marked absent.
 def pool_dots_to_polyline_tokens(
     dot_embeddings, dot_polyline_slot, batch_size, max_polylines
 ):
     hidden_width = dot_embeddings.shape[-1]
+    # Slots start at -inf so amax pooling never selects an empty
+    # slot; a slot untouched by any dot stays at -inf.
     tokens = torch.full(
         (batch_size * max_polylines, hidden_width),
         float("-inf"),
@@ -137,7 +156,11 @@ DECODER_ROUNDS = 6
 FEEDFORWARD_DIM = 4 * HIDDEN_DIM
 
 
+# Scaled dot-product multi-head attention with separate query,
+# key, value and output projections.
 class MultiHeadAttention(nn.Module):
+    # Builds the query, key, value and output linear projections,
+    # each at the full hidden width.
     def __init__(self):
         super().__init__()
         assert HIDDEN_DIM % ATTENTION_HEAD_COUNT == 0
@@ -146,6 +169,8 @@ class MultiHeadAttention(nn.Module):
         self.value_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
         self.output_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
 
+    # Reshapes a (batch, tokens, hidden) projection into
+    # (batch, heads, tokens, per-head) for attention.
     def split_heads(self, projected):
         batch_size, token_count, _ = projected.shape
         per_head = HIDDEN_DIM // ATTENTION_HEAD_COUNT
@@ -153,6 +178,8 @@ class MultiHeadAttention(nn.Module):
             batch_size, token_count, ATTENTION_HEAD_COUNT, per_head
         ).transpose(1, 2)
 
+    # Projects queries and key/value tokens, attends across heads
+    # and merges back to hidden width; key_present masks absent keys.
     def forward(self, query_tokens, key_value_tokens, key_present):
         queries = self.split_heads(
             self.query_projection(query_tokens)
@@ -171,7 +198,11 @@ class MultiHeadAttention(nn.Module):
         return self.output_projection(merged)
 
 
+# Pre-norm self-attention and feedforward block, each added
+# back to its input as a residual.
 class SceneAttentionLayer(nn.Module):
+    # Builds the self-attention sublayer, feedforward sublayer,
+    # and a LayerNorm before each.
     def __init__(self):
         super().__init__()
         self.attention_norm = nn.LayerNorm(HIDDEN_DIM)
@@ -183,6 +214,8 @@ class SceneAttentionLayer(nn.Module):
             nn.Linear(FEEDFORWARD_DIM, HIDDEN_DIM),
         )
 
+    # Runs pre-norm self-attention over the tokens, then a
+    # pre-norm feedforward block, each added back as a residual.
     def forward(self, tokens, token_present):
         normed = self.attention_norm(tokens)
         tokens = tokens + self.attention(
@@ -193,7 +226,11 @@ class SceneAttentionLayer(nn.Module):
         )
 
 
+# Encodes one agent's view per sample: its own history, its
+# neighbours, and cropped map chunks, self-attended in its frame.
 class SceneEncoder(nn.Module):
+    # Builds the agent, neighbour and map-dot encoders, the
+    # shared signal projection, and the self-attention stack.
     def __init__(self):
         super().__init__()
         self.agent_encoder = AgentHistoryEncoder()
@@ -207,6 +244,8 @@ class SceneEncoder(nn.Module):
             for _ in range(SCENE_ATTENTION_ROUNDS)
         )
 
+    # Builds the agent's own token, its neighbours' tokens, and
+    # the cropped map-chunk tokens, then self-attends over them.
     def forward(self, batch):
         agent_token = (
             self.agent_encoder(
@@ -261,7 +300,11 @@ MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
 
 
+# Builds the 54 unit-length anchor endpoints as a grid of 9
+# directions by 6 distance fractions.
 def unit_anchor_offsets():
+    # Direction repeats slowest, distance fastest, so the flat
+    # index matches ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT.
     direction_indices = torch.arange(
         ANCHOR_DIRECTION_COUNT
     ).repeat_interleave(ANCHOR_DISTANCE_COUNT)
@@ -275,12 +318,16 @@ def unit_anchor_offsets():
     )
 
 
+# Repeats the same 54 unit anchors once per object type, giving
+# every type an identical starting anchor set.
 def unit_anchor_offsets_per_type():
     return unit_anchor_offsets().repeat(
         contract.NUM_OBJECT_TYPES, 1, 1
     )
 
 
+# Reads the one-hot object-type feature at the current history
+# step and returns each agent's predicted type index.
 def predicted_type_index(agent_history):
     type_one_hot = agent_history[
         :, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE
@@ -288,6 +335,8 @@ def predicted_type_index(agent_history):
     return type_one_hot[:, : contract.NUM_OBJECT_TYPES].argmax(dim=-1)
 
 
+# Upper bound on how far an agent could travel over the future
+# horizon at constant maximum acceleration from its current speed.
 def agent_reachable_distance(agent_history):
     current_speed = agent_history[
         :, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY
@@ -300,7 +349,11 @@ def agent_reachable_distance(agent_history):
     )
 
 
+# Decodes the 54 anchor-conditioned trajectory modes and their
+# confidences from the memory built by SceneEncoder.
 class ModeDecoder(nn.Module):
+    # Builds the anchor queries, per-type unit-anchor buffer, and
+    # DECODER_ROUNDS of self/cross-attention plus the output heads.
     def __init__(self, unit_anchors):
         super().__init__()
         assert unit_anchors.shape == (
@@ -362,6 +415,8 @@ class ModeDecoder(nn.Module):
             persistent=False,
         )
 
+    # Alternates self-attention, cross-attention and feedforward
+    # over the queries, decoding anchor offsets and confidence.
     def forward(self, tokens, token_present, predicted_type_index):
         batch_size = tokens.shape[0]
         selected_unit_anchors = self.unit_anchors[
@@ -420,6 +475,8 @@ class ModeDecoder(nn.Module):
         )
 
 
+# Walks modes by descending confidence and drops any whose
+# endpoint is within PRUNE_DISTANCE_METRES of a kept one.
 def prune_modes(trajectories, confidence_logits):
     kept_indices = []
     dropped_indices = []
@@ -441,6 +498,8 @@ def prune_modes(trajectories, confidence_logits):
         kept_indices.append(mode_index)
         if len(kept_indices) == contract.NUM_PREDICTED_MODES:
             break
+    # If suppression kept too few modes, pad back up to
+    # NUM_PREDICTED_MODES with the highest-confidence dropped ones.
     kept_indices.extend(
         dropped_indices[
             : contract.NUM_PREDICTED_MODES - len(kept_indices)
@@ -450,6 +509,8 @@ def prune_modes(trajectories, confidence_logits):
     return trajectories[kept], confidence_logits[kept]
 
 
+# Batched prune_modes: also backfills empty slots with the most
+# confident dropped modes and returns how many were truly kept.
 def prune_modes_batched_with_kept_count(
     trajectories, confidence_logits
 ):
@@ -485,6 +546,7 @@ def prune_modes_batched_with_kept_count(
     dropped_count = torch.zeros_like(kept_count)
 
     for walk_position in range(mode_count):
+        # each sample's next candidate in its own confidence order
         candidate_index = confidence_order[:, walk_position]
         candidate_endpoint = endpoints.gather(
             1, candidate_index[:, None, None].expand(-1, -1, 2)
@@ -498,6 +560,8 @@ def prune_modes_batched_with_kept_count(
         still_walking = kept_count < contract.NUM_PREDICTED_MODES
 
         keeps = still_walking & ~too_close
+        # Writes each newly kept mode into the next free slot for
+        # its sample, tracked by that sample's kept_count.
         keep_slot = keeps[:, None] & (
             slot_positions[None, :] == kept_count[:, None]
         )
@@ -522,6 +586,8 @@ def prune_modes_batched_with_kept_count(
         if bool((kept_count == contract.NUM_PREDICTED_MODES).all()):
             break
 
+    # For samples short of NUM_PREDICTED_MODES, fill the remaining
+    # output slots from the dropped list in confidence order.
     backfill_positions = (
         slot_positions[None, :] - kept_count[:, None]
     ).clamp(min=0)
@@ -540,6 +606,8 @@ def prune_modes_batched_with_kept_count(
     )
 
 
+# Same as prune_modes_batched_with_kept_count, without the
+# kept-mode count.
 def prune_modes_batched(trajectories, confidence_logits):
     kept_trajectories, kept_confidence_logits, _ = (
         prune_modes_batched_with_kept_count(
@@ -549,6 +617,8 @@ def prune_modes_batched(trajectories, confidence_logits):
     return kept_trajectories, kept_confidence_logits
 
 
+# Moves each original mode's softmax probability mass onto
+# whichever kept mode has the nearest endpoint.
 def aggregated_confidences(
     trajectories, confidence_logits, kept_trajectories
 ):
@@ -565,16 +635,22 @@ def aggregated_confidences(
     return aggregated.scatter_add(1, nearest_kept, probabilities)
 
 
+# Top-level model: the scene encoder's memory feeds the mode
+# decoder.
 class MotionPredictor(nn.Module):
+    # Trivial: builds the scene encoder and mode decoder.
     def __init__(self, unit_anchors):
         super().__init__()
         self.scene_encoder = SceneEncoder()
         self.mode_decoder = ModeDecoder(unit_anchors)
 
+    # Exposes the decoder's fitted per-type unit anchors.
     @property
     def unit_anchors(self):
         return self.mode_decoder.unit_anchors
 
+    # Runs the full scene encoder and mode decoder pipeline for one
+    # batch, selecting anchors by each agent's predicted type.
     def predict(self, batch):
         tokens, token_present = self.scene_encoder(batch)
         return self.mode_decoder(
@@ -583,11 +659,15 @@ class MotionPredictor(nn.Module):
             predicted_type_index(batch["agent_history"]),
         )
 
+    # Runs predict() and returns just the trajectories and
+    # confidence logits, dropping its other two outputs.
     def forward(self, batch):
         trajectories, _, confidence_logits, _ = self.predict(batch)
         return trajectories, confidence_logits
 
 
+# Hashes parameter names and shapes into one fingerprint used to
+# detect a checkpoint saved under a different architecture.
 def parameter_fingerprint(model_state):
     parameter_description = ",".join(
         f"{name}:{tuple(tensor.shape)}"
@@ -596,6 +676,8 @@ def parameter_fingerprint(model_state):
     return hashlib.sha256(parameter_description.encode()).hexdigest()
 
 
+# Loads a checkpoint and, unless overridden, verifies its code
+# version and parameter fingerprint match the working tree.
 def load_checkpoint_state(
     checkpoint_path, map_location="cpu", allow_version_mismatch=False
 ):
@@ -626,6 +708,8 @@ def load_checkpoint_state(
     return checkpoint
 
 
+# Loads the fitted per-type unit anchors from a .npz file and
+# checks their provenance and shape before returning them.
 def load_anchor_file(anchors_path):
     import numpy as np
 

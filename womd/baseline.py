@@ -9,12 +9,15 @@ FUTURE_HORIZON_SECONDS = 8.0
 TIMESTEP_SECONDS = FUTURE_HORIZON_SECONDS / contract.FUTURE_STEPS
 
 
+# Seconds elapsed at each of the future steps, at 10 Hz.
 def future_elapsed_seconds(device, dtype):
     return TIMESTEP_SECONDS * torch.arange(
         1, contract.FUTURE_STEPS + 1, device=device, dtype=dtype
     )
 
 
+# Reads each agent's current position, heading (from sin/cos) and
+# velocity from the current history step.
 def current_state(batch):
     now_row = batch["agent_history"][:, contract.CURRENT_STEP_INDEX]
     heading = torch.atan2(
@@ -28,6 +31,8 @@ def current_state(batch):
     )
 
 
+# Wraps one trajectory per sample as a single-mode prediction
+# with a dummy confidence logit, matching the model's output shape.
 def as_single_mode(trajectories):
     confidence_logits = torch.zeros(
         trajectories.shape[0],
@@ -38,6 +43,8 @@ def as_single_mode(trajectories):
     return trajectories.unsqueeze(1), confidence_logits
 
 
+# Baseline: extrapolates the current position at the current
+# velocity, unchanged over the horizon.
 def constant_velocity(batch):
     position, _, velocity = current_state(batch)
     elapsed_seconds = future_elapsed_seconds(
@@ -49,11 +56,15 @@ def constant_velocity(batch):
     )
 
 
+# Estimates a constant yaw rate from the heading change between
+# the current step and the earliest valid history step.
 def observed_yaw_rate(batch):
     agent_history = batch["agent_history"]
     step_indices = torch.arange(
         contract.HISTORY_STEPS, device=agent_history.device
     )
+    # Invalid steps are pushed past the last real index so that
+    # min() finds the earliest step that actually has data.
     valid_step_indices = torch.where(
         batch["agent_history_mask"],
         step_indices,
@@ -68,6 +79,8 @@ def observed_yaw_rate(batch):
     ).squeeze(1)
 
     now_row = agent_history[:, contract.CURRENT_STEP_INDEX]
+    # Sine/cosine angle-difference formula avoids the wraparound
+    # that a plain atan2 subtraction would have.
     change_sine = (
         now_row[:, contract.AGENT_HEADING_SINE]
         * earliest_row[:, contract.AGENT_HEADING_COSINE]
@@ -88,6 +101,8 @@ def observed_yaw_rate(batch):
     ) / observed_seconds.clamp(min=TIMESTEP_SECONDS)
 
 
+# Baseline: extrapolates position along a constant-turn-rate,
+# constant-speed arc from the observed yaw rate and forward speed.
 def constant_turn_rate_and_velocity(batch):
     position, heading, velocity = current_state(batch)
     heading_direction = torch.stack(
@@ -101,6 +116,8 @@ def constant_turn_rate_and_velocity(batch):
     turn_angle = (
         observed_yaw_rate(batch)[:, None] * elapsed_seconds[None, :]
     )
+    # sinc(turn_angle / 2*pi) converts arc length to chord length;
+    # chord_direction bisects the turn angle from the heading.
     chord_to_arc_ratio = torch.sinc(turn_angle / (2.0 * math.pi))
     chord_length = (
         forward_speed[:, None]
@@ -119,6 +136,8 @@ def constant_turn_rate_and_velocity(batch):
     return as_single_mode(position[:, None, :] + displacement)
 
 
+# Baseline: straight lines to each type's first
+# NUM_PREDICTED_MODES anchor endpoints, with uniform confidence.
 def straight_lines_to_most_used_anchors(batch, unit_anchors):
     predicted_type_index = model.predicted_type_index(
         batch["agent_history"]

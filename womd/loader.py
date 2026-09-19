@@ -2,10 +2,14 @@ import numpy as np
 
 from womd import contract, frame_ops
 
+# Visibility crop shape in the target's agent frame: base radius,
+# and how much the forward half stretches per m/s of speed.
 BASE_RADIUS_METRES = 80.0
 STRETCH_GAIN = 0.5
 
 
+# Ellipse crop test in agent-frame coordinates: ahead of the
+# agent it stretches by forward_stretch; behind it is a circle.
 def inside_crop(agent_frame_points, base_radius, forward_stretch):
     x = agent_frame_points[:, 0]
     y = agent_frame_points[:, 1]
@@ -16,6 +20,8 @@ def inside_crop(agent_frame_points, base_radius, forward_stretch):
     return np.where(x > 0.0, forward, rear)
 
 
+# Indices of tracks valid at the current step and of a predicted
+# object type, optionally restricted to designated targets.
 def eligible_track_indices(
     track_rows,
     track_valid,
@@ -35,6 +41,8 @@ def eligible_track_indices(
     return np.flatnonzero(selected)
 
 
+# A track's agent frame at the current step: its position and
+# heading.
 def sample_frame(track_rows, track_index):
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     origin = now_row[contract.AGENT_POSITION]
@@ -45,6 +53,8 @@ def sample_frame(track_rows, track_index):
     return origin, heading
 
 
+# Re-expresses a track's per-step position, velocity and heading
+# columns in another agent's frame.
 def track_rows_to_agent_frame(rows, origin, heading):
     reframed = rows.copy()
     reframed[..., contract.AGENT_POSITION] = (
@@ -71,6 +81,8 @@ def track_rows_to_agent_frame(rows, origin, heading):
     return reframed
 
 
+# For each agent, the nearest lane dot facing its heading; if
+# none face it, falls back to the nearest dot of any direction.
 def nearest_lane_dot_facing_the_agent_way(
     lane_dot_rows, agent_distances, agent_heading_cosine_sine
 ):
@@ -87,6 +99,8 @@ def nearest_lane_dot_facing_the_agent_way(
     )
 
 
+# Selects the map rows and polyline indices belonging to
+# lane-kind dots only.
 def lane_dots_of_scenario(scenario_array):
     map_rows = scenario_array["map_rows"]
     dot_polyline_index = scenario_array["map_dot_polyline_index"]
@@ -103,6 +117,8 @@ def lane_dots_of_scenario(scenario_array):
     )
 
 
+# Assigns each agent at the current step the signal history of
+# its nearest facing lane dot's polyline; others get all zeros.
 def assigned_lane_signal_histories(
     lane_dot_rows,
     polyline_row_of_lane_dot,
@@ -125,6 +141,8 @@ def assigned_lane_signal_histories(
     assignable_rows = agent_now_rows[assignable]
     assignable_positions = assignable_rows[:, contract.AGENT_POSITION]
     lane_dot_positions = lane_dot_rows[:, contract.MAP_POSITION]
+    # Broadcasts every assignable agent against every lane dot to
+    # get one (agent, lane dot) distance matrix.
     offsets_x = (
         lane_dot_positions[None, :, 0] - assignable_positions[:, :1]
     )
@@ -149,6 +167,8 @@ def assigned_lane_signal_histories(
     return signal_histories
 
 
+# Crops map dots to a speed-stretched ellipse, reframes them,
+# then chunks survivors per polyline in groups of MAP_CHUNK_DOTS.
 def crop_and_reframe_map(
     map_rows,
     dot_polyline_index,
@@ -184,6 +204,8 @@ def crop_and_reframe_map(
             heading,
         )
     )
+    # dot_polyline_index is sorted, so np.unique's first-occurrence
+    # index gives each dot's offset within its own polyline's block.
     (
         surviving_polylines,
         first_dot_position,
@@ -202,6 +224,8 @@ def crop_and_reframe_map(
     chunks_per_polyline = (
         dots_per_polyline + contract.MAP_CHUNK_DOTS - 1
     ) // contract.MAP_CHUNK_DOTS
+    # Each polyline's chunk indices start where the previous
+    # polyline's chunks left off: an exclusive cumulative sum.
     first_chunk_of_polyline = (
         np.cumsum(chunks_per_polyline) - chunks_per_polyline
     )
@@ -219,6 +243,8 @@ def crop_and_reframe_map(
     )
 
 
+# Adds map_dot_polyline_index (which polyline each map row
+# belongs to) and track_signal_histories to a loaded scenario.
 def with_derived_arrays(scenario_array):
     feature_lengths = scenario_array["feature_lengths"]
     scenario_array["map_dot_polyline_index"] = np.repeat(
@@ -243,6 +269,8 @@ def with_derived_arrays(scenario_array):
     return scenario_array
 
 
+# Loads one staged .npz scenario, checks its provenance stamp,
+# and returns it with derived arrays added.
 def read_scenario(scenario_path):
     with np.load(scenario_path) as scenario_file:
         scenario_array = {
@@ -263,6 +291,8 @@ def read_scenario(scenario_path):
     return with_derived_arrays(scenario_array)
 
 
+# Builds one sample for a single agent: its track, every other
+# track as a neighbour, and the cropped map, in its own frame.
 def build_sample(scenario_array, track_index):
     track_rows = scenario_array["track_rows"]
     track_valid = scenario_array["track_valid"]
@@ -329,6 +359,8 @@ def build_sample(scenario_array, track_index):
     }
 
 
+# Pads neighbours and map chunks to the batch maximum, and
+# flattens map dots to slot = sample_index * max_chunks + chunk_index.
 def build_batch(samples):
     batch_size = len(samples)
     max_neighbours = max(

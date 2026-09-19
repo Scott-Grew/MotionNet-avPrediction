@@ -11,6 +11,8 @@ from womd import baseline, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
 
 
+# Returns up to needed .npz scenario paths from the directory, in
+# whatever order the filesystem yields them.
 def first_scenario_paths(staged_directory, needed):
     paths = []
     with os.scandir(staged_directory) as entries:
@@ -22,6 +24,8 @@ def first_scenario_paths(staged_directory, needed):
     return paths
 
 
+# Runs a few training batches and stops at non-finite losses or
+# gradients, or at every mode collapsing to one endpoint.
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)
@@ -91,6 +95,8 @@ def main():
             raise SystemExit(
                 f"non-finite gradient norm at batch {batch_index}"
             )
+        # compares every mode's final step to the first mode's; a
+        # match across all of them means the modes never diverged
         endpoints = trajectories.detach()[:, :, -1]
         if torch.allclose(endpoints[:, :1], endpoints, atol=1e-4):
             raise SystemExit(

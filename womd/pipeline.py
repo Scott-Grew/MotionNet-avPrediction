@@ -9,12 +9,17 @@ from torch.utils.data import (
 from womd import loader
 
 
+# Streams per-agent training samples, splitting scenario files
+# across DataLoader workers.
 class ScenarioSampleStream(IterableDataset):
+    # Stores the scenario paths, seed and target-filtering flag.
     def __init__(self, scenario_paths, seed, designated_targets_only):
         self.scenario_paths = scenario_paths
         self.seed = seed
         self.designated_targets_only = designated_targets_only
 
+    # For this worker's scenario slice, shuffles scenarios and
+    # each one's eligible tracks with a per-worker seeded generator.
     def __iter__(self):
         worker_info = get_worker_info()
         worker_index = worker_info.id if worker_info else 0
@@ -43,6 +48,8 @@ class ScenarioSampleStream(IterableDataset):
                 )
 
 
+# Builds a batch from build_batch and converts its numpy
+# arrays to torch tensors.
 def collate_samples(samples):
     batch = loader.build_batch(samples)
     return {
@@ -50,6 +57,8 @@ def collate_samples(samples):
     }
 
 
+# Yields (scenario_array, track_index, sample) batches over
+# every staged scenario, in file or requested order.
 def track_sample_batches(
     staged_directory,
     batch_size,
@@ -87,6 +96,8 @@ def track_sample_batches(
         yield batch
 
 
+# Wraps ScenarioSampleStream in a DataLoader with the given
+# worker count, batch size, and prefetching.
 def batches(
     scenario_paths,
     worker_count,
