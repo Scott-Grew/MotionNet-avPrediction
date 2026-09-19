@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from womd import contract, loader, loss, metrics, model, pipeline
 from womd.model import QUERY_COUNT, MotionPredictor
@@ -137,6 +138,21 @@ def save_checkpoint(checkpoint_path, previous_checkpoint_path, state):
     partial_path.replace(checkpoint_path)
 
 
+def report_scalars(summary_writer, heading, scalars, global_step):
+    for name, value in scalars.items():
+        summary_writer.add_scalar(name, value, global_step)
+    print(
+        " | ".join(
+            [heading]
+            + [
+                f"{name} {value:.4g}"
+                for name, value in scalars.items()
+            ]
+        ),
+        flush=True,
+    )
+
+
 def train_epoch(
     predictor,
     optimizer,
@@ -154,6 +170,7 @@ def train_epoch(
     learning_rate,
     decay_start_step,
     decay_end_step,
+    summary_writer,
 ):
     accumulator = metrics.MetricAccumulator()
     window_accumulator = metrics.MetricAccumulator()
@@ -261,23 +278,46 @@ def train_epoch(
                 if device.type == "cuda"
                 else 0.0
             )
-            print(
-                f"  batch {batch_count} | loss {loss_sums['total'] / batch_count:.4f} "
-                f"(window {window_loss_sums['total'] / LOG_EVERY_BATCHES:.4f}) "
-                f"reg {loss_sums['regression'] / batch_count:.4f} "
-                f"cls {loss_sums['classification'] / batch_count:.4f} | "
-                f"ade_80step {monitor['min_ade']:.3f} (window {window_monitor['min_ade']:.3f}) "
-                f"fde_80step {monitor['min_fde']:.3f} (window {window_monitor['min_fde']:.3f}) | "
-                f"kept modes {window_monitor['mean_kept_modes']:.2f} "
-                f"backfilled {100 * window_monitor['backfill_rate']:.0f}% "
-                f"never-win {never_win_count}/{QUERY_COUNT} | "
-                f"non-finite {non_finite_total_count} skipped steps {gradient_scaler_skip_count} "
-                f"clipped {clipped_step_count} | lr {step_learning_rate:.3e} | "
-                f"{sample_count / elapsed:.1f} samples/s | "
-                f"wait {100 * seconds['data_wait'] / elapsed:.0f}% "
-                f"step {100 * seconds['step'] / elapsed:.0f}% "
-                f"monitor {100 * seconds['monitor'] / elapsed:.0f}% | peak {peak_gigabytes:.1f} GB",
-                flush=True,
+            report_scalars(
+                summary_writer,
+                f"  batch {batch_count}",
+                {
+                    "loss/total": loss_sums["total"] / batch_count,
+                    "loss/regression": loss_sums["regression"]
+                    / batch_count,
+                    "loss/classification": loss_sums["classification"]
+                    / batch_count,
+                    "loss_window/total": window_loss_sums["total"]
+                    / LOG_EVERY_BATCHES,
+                    "monitor/ade_80step": monitor["min_ade"],
+                    "monitor/fde_80step": monitor["min_fde"],
+                    "monitor_window/ade_80step": window_monitor[
+                        "min_ade"
+                    ],
+                    "monitor_window/fde_80step": window_monitor[
+                        "min_fde"
+                    ],
+                    "monitor_window/kept_modes": window_monitor[
+                        "mean_kept_modes"
+                    ],
+                    "monitor_window/backfill_rate": window_monitor[
+                        "backfill_rate"
+                    ],
+                    "monitor_window/never_win_anchors": never_win_count,
+                    "health/non_finite_losses": non_finite_total_count,
+                    "health/skipped_steps": gradient_scaler_skip_count,
+                    "health/clipped_steps": clipped_step_count,
+                    "optimisation/learning_rate": step_learning_rate,
+                    "throughput/samples_per_second": sample_count
+                    / elapsed,
+                    "time_share/data_wait": seconds["data_wait"]
+                    / elapsed,
+                    "time_share/step": seconds["step"] / elapsed,
+                    "time_share/monitor": seconds["monitor"]
+                    / elapsed,
+                    "memory/peak_gigabytes": peak_gigabytes,
+                },
+                process_steps_before_epoch + batch_count,
             )
             window_accumulator = metrics.MetricAccumulator()
             window_loss_sums = dict.fromkeys(loss_sums, 0.0)
@@ -411,6 +451,9 @@ def main():
 
     training_start = time.perf_counter()
     process_steps_before_epoch = completed_epochs * steps_per_epoch
+    summary_writer = SummaryWriter(
+        arguments.checkpoint_path.parent / "tensorboard"
+    )
     decay_start_step = None
     decay_end_step = None
     if arguments.decay_from_epoch is not None:
@@ -460,19 +503,30 @@ def main():
             arguments.learning_rate,
             decay_start_step,
             decay_end_step,
+            summary_writer,
         )
         process_steps_before_epoch += steps_per_epoch
         last_epoch_seconds = time.perf_counter() - epoch_start
-        print(
-            f"epoch {epoch_index + 1}/{arguments.epochs} | "
-            f"loss {averages['total']:.4f} (reg {averages['regression']:.4f}"
-            f" + cls {averages['classification']:.4f}) | "
-            f"ade_80step {monitor['min_ade']:.4f} | fde_80step {monitor['min_fde']:.4f} | "
-            f"kept modes {monitor['mean_kept_modes']:.2f} | backfilled {100 * monitor['backfill_rate']:.0f}% | "
-            f"data_wait {seconds['data_wait']:.0f} s · step {seconds['step']:.0f} s"
-            f" · monitor {seconds['monitor']:.0f} s",
-            flush=True,
+        report_scalars(
+            summary_writer,
+            f"epoch {epoch_index + 1}/{arguments.epochs}",
+            {
+                "epoch/loss_total": averages["total"],
+                "epoch/loss_regression": averages["regression"],
+                "epoch/loss_classification": averages[
+                    "classification"
+                ],
+                "epoch/ade_80step": monitor["min_ade"],
+                "epoch/fde_80step": monitor["min_fde"],
+                "epoch/kept_modes": monitor["mean_kept_modes"],
+                "epoch/backfill_rate": monitor["backfill_rate"],
+                "epoch/data_wait_seconds": seconds["data_wait"],
+                "epoch/step_seconds": seconds["step"],
+                "epoch/monitor_seconds": seconds["monitor"],
+            },
+            epoch_index + 1,
         )
+        summary_writer.flush()
         if not math.isfinite(averages["total"]):
             print(
                 f"epoch {epoch_index + 1} mean total loss {averages['total']}, checkpoint left as it was",
