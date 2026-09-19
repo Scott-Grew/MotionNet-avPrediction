@@ -77,15 +77,104 @@ def padded_to_fixed_shape(
     return fixed
 
 
-def median_milliseconds(run_once, batches):
-    for batch in batches[:WARMUP_RUNS]:
-        run_once(batch)
+def milliseconds_per_batch(run_once, batches):
+    for _ in range(WARMUP_RUNS):
+        run_once(batches[0])
     durations = []
     for batch in batches:
         start = time.perf_counter()
         run_once(batch)
         durations.append(1000 * (time.perf_counter() - start))
-    return statistics.median(durations)
+    return durations
+
+
+def export_and_measure_bucket(
+    predictor, batches, onnx_path, thread_count, device
+):
+    neighbour_count = max(
+        batch["neighbour_history"].shape[1] for batch in batches
+    )
+    chunk_count = max(
+        batch["map_chunk_signal_history"].shape[1]
+        for batch in batches
+    )
+    dot_count = max(len(batch["map_rows"]) for batch in batches)
+    fixed_batches = [
+        padded_to_fixed_shape(
+            batch, neighbour_count, chunk_count, dot_count
+        )
+        for batch in batches
+    ]
+    with torch.no_grad():
+        padding_gap = max(
+            float(
+                (predictor(batch)[0] - predictor(fixed_batch)[0])
+                .abs()
+                .max()
+            )
+            for batch, fixed_batch in zip(batches, fixed_batches)
+        )
+    torch.onnx.export(
+        PositionalInputs(predictor),
+        tuple(fixed_batches[0][name] for name in INPUT_NAMES),
+        str(onnx_path),
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        dynamic_axes={"map_chunk_signal_history": {1: "map_chunks"}},
+        opset_version=18,
+    )
+    session_options = onnxruntime.SessionOptions()
+    session_options.intra_op_num_threads = thread_count
+    session_options.log_severity_level = 3
+    session = onnxruntime.InferenceSession(
+        str(onnx_path),
+        session_options,
+        providers=[
+            (
+                "CUDAExecutionProvider"
+                if device.type == "cuda"
+                else "CPUExecutionProvider"
+            )
+        ],
+    )
+    device_predictor = PositionalInputs(predictor).to(device)
+
+    def run_onnx(fixed_batch):
+        return session.run(
+            OUTPUT_NAMES,
+            {name: fixed_batch[name].numpy() for name in INPUT_NAMES},
+        )
+
+    def run_torch(fixed_batch):
+        with torch.no_grad():
+            trajectories, confidence_logits = device_predictor(
+                *(
+                    fixed_batch[name].to(device)
+                    for name in INPUT_NAMES
+                )
+            )
+        return trajectories.cpu(), confidence_logits.cpu()
+
+    export_gap = max(
+        float(
+            np.abs(
+                run_torch(fixed_batch)[0].numpy()
+                - run_onnx(fixed_batch)[0]
+            ).max()
+        )
+        for fixed_batch in fixed_batches
+    )
+    print(
+        f"{onnx_path.name}: {len(fixed_batches)} batches padded to"
+        f" {neighbour_count} neighbours, {chunk_count} map chunks,"
+        f" {dot_count} map dots"
+    )
+    return (
+        padding_gap,
+        export_gap,
+        milliseconds_per_batch(run_torch, fixed_batches),
+        milliseconds_per_batch(run_onnx, fixed_batches),
+    )
 
 
 def main():
@@ -96,7 +185,13 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--scenarios", type=int, required=True)
     parser.add_argument("--agents-per-batch", type=int, required=True)
+    parser.add_argument("--buckets", type=int, required=True)
+    parser.add_argument("--threads", type=int, required=True)
+    parser.add_argument(
+        "--device", choices=["cpu", "cuda"], required=True
+    )
     arguments = parser.parse_args()
+    torch.set_num_threads(arguments.threads)
 
     predictor = model.MotionPredictor(
         model.load_anchor_file(arguments.anchors)
@@ -112,96 +207,61 @@ def main():
     scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))[
         : arguments.scenarios
     ]
-    batches = [
-        batch
-        for batch in pipeline.batches(
-            scenario_paths,
-            0,
-            arguments.agents_per_batch,
-            None,
-            0,
-            True,
-        )
-        if len(batch["agent_history"]) == arguments.agents_per_batch
-    ]
-    assert batches, "no full batch in the chosen scenarios"
-    neighbour_count = max(
-        batch["neighbour_history"].shape[1] for batch in batches
-    )
-    chunk_count = max(
-        batch["map_chunk_signal_history"].shape[1]
-        for batch in batches
-    )
-    dot_count = max(len(batch["map_rows"]) for batch in batches)
-    fixed_batches = [
-        padded_to_fixed_shape(
-            batch, neighbour_count, chunk_count, dot_count
-        )
-        for batch in batches
-    ]
-
-    with torch.no_grad():
-        padding_gap = max(
-            float(
-                (predictor(batch)[0] - predictor(fixed_batch)[0])
-                .abs()
-                .max()
+    batches = sorted(
+        (
+            batch
+            for batch in pipeline.batches(
+                scenario_paths,
+                0,
+                arguments.agents_per_batch,
+                None,
+                0,
+                True,
             )
-            for batch, fixed_batch in zip(batches, fixed_batches)
-        )
-
-    torch.onnx.export(
-        PositionalInputs(predictor),
-        tuple(fixed_batches[0][name] for name in INPUT_NAMES),
-        str(arguments.onnx_path),
-        input_names=INPUT_NAMES,
-        output_names=OUTPUT_NAMES,
-        dynamic_axes={"map_chunk_signal_history": {1: "map_chunks"}},
-        opset_version=18,
+            if len(batch["agent_history"])
+            == arguments.agents_per_batch
+        ),
+        key=lambda batch: batch["neighbour_history"].shape[1]
+        + batch["map_chunk_signal_history"].shape[1],
     )
-    session_options = onnxruntime.SessionOptions()
-    session_options.intra_op_num_threads = torch.get_num_threads()
-    session_options.log_severity_level = 3
-    session = onnxruntime.InferenceSession(
-        str(arguments.onnx_path),
-        session_options,
-        providers=["CPUExecutionProvider"],
-    )
+    assert (
+        len(batches) >= arguments.buckets
+    ), f"{len(batches)} full batches cannot fill {arguments.buckets} buckets"
 
-    def run_onnx(fixed_batch):
-        return session.run(
-            OUTPUT_NAMES,
-            {name: fixed_batch[name].numpy() for name in INPUT_NAMES},
+    padding_gaps, export_gaps = [], []
+    torch_milliseconds, onnx_milliseconds = [], []
+    for bucket_index, bucket_positions in enumerate(
+        np.array_split(np.arange(len(batches)), arguments.buckets)
+    ):
+        padding_gap, export_gap, torch_durations, onnx_durations = (
+            export_and_measure_bucket(
+                predictor,
+                [batches[position] for position in bucket_positions],
+                arguments.onnx_path.with_name(
+                    f"{arguments.onnx_path.stem}_{bucket_index}"
+                    f"{arguments.onnx_path.suffix}"
+                ),
+                arguments.threads,
+                torch.device(arguments.device),
+            )
         )
+        padding_gaps.append(padding_gap)
+        export_gaps.append(export_gap)
+        torch_milliseconds.extend(torch_durations)
+        onnx_milliseconds.extend(onnx_durations)
 
-    def run_torch(fixed_batch):
-        with torch.no_grad():
-            return predictor(fixed_batch)
-
-    export_gap = max(
-        float(
-            np.abs(
-                run_torch(fixed_batch)[0].numpy()
-                - run_onnx(fixed_batch)[0]
-            ).max()
-        )
-        for fixed_batch in fixed_batches
+    print(
+        f"padding moves a trajectory by at most"
+        f" {max(padding_gaps):.2e} m"
     )
     print(
-        f"{len(fixed_batches)} batches of"
-        f" {arguments.agents_per_batch} agents, padded to"
-        f" {neighbour_count} neighbours, {chunk_count} map chunks,"
-        f" {dot_count} map dots"
+        f"onnx differs from torch by at most {max(export_gaps):.2e} m"
     )
     print(
-        f"padding moves a trajectory by at most {padding_gap:.2e} m"
-    )
-    print(f"onnx differs from torch by at most {export_gap:.2e} m")
-    print(
-        f"torch {median_milliseconds(run_torch, fixed_batches):.1f} ms"
-        f" per batch, onnxruntime"
-        f" {median_milliseconds(run_onnx, fixed_batches):.1f} ms per"
-        f" batch, {torch.get_num_threads()} thread"
+        f"median per batch of {arguments.agents_per_batch} agents on"
+        f" {arguments.device}, {arguments.threads} threads:"
+        f" torch {statistics.median(torch_milliseconds):.1f} ms,"
+        f" onnxruntime {statistics.median(onnx_milliseconds):.1f} ms"
     )
 
 
