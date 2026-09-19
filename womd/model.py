@@ -1,4 +1,5 @@
 import hashlib
+import math
 
 import torch
 from torch import nn
@@ -137,60 +138,35 @@ DECODER_ROUNDS = 6
 FEEDFORWARD_DIM = 4 * HIDDEN_DIM
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        assert HIDDEN_DIM % ATTENTION_HEAD_COUNT == 0
-        self.query_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        self.key_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        self.value_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-        self.output_projection = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
-
-    def split_heads(self, projected):
-        batch_size, token_count, _ = projected.shape
-        per_head = HIDDEN_DIM // ATTENTION_HEAD_COUNT
-        return projected.view(
-            batch_size, token_count, ATTENTION_HEAD_COUNT, per_head
-        ).transpose(1, 2)
-
-    def forward(self, query_tokens, key_value_tokens, key_present):
-        queries = self.split_heads(
-            self.query_projection(query_tokens)
-        )
-        keys = self.split_heads(self.key_projection(key_value_tokens))
-        values = self.split_heads(
-            self.value_projection(key_value_tokens)
-        )
-        attended = nn.functional.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            attn_mask=key_present[:, None, None, :],
-        )
-        merged = attended.transpose(1, 2).flatten(start_dim=-2)
-        return self.output_projection(merged)
+TRANSFORMER_LAYER_SETTINGS = {
+    "d_model": HIDDEN_DIM,
+    "nhead": ATTENTION_HEAD_COUNT,
+    "dim_feedforward": FEEDFORWARD_DIM,
+    "dropout": 0.0,
+    "activation": "relu",
+    "batch_first": True,
+    "norm_first": True,
+}
 
 
-class SceneAttentionLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.attention_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.attention = MultiHeadAttention()
-        self.feedforward_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.feedforward = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
-            nn.ReLU(),
-            nn.Linear(FEEDFORWARD_DIM, HIDDEN_DIM),
-        )
+def initialise_as_separate_linear_projections(attention):
+    bound = 1.0 / math.sqrt(HIDDEN_DIM)
+    nn.init.uniform_(attention.in_proj_weight, -bound, bound)
+    nn.init.uniform_(attention.in_proj_bias, -bound, bound)
+    nn.init.uniform_(attention.out_proj.bias, -bound, bound)
 
-    def forward(self, tokens, token_present):
-        normed = self.attention_norm(tokens)
-        tokens = tokens + self.attention(
-            normed, normed, token_present
-        )
-        return tokens + self.feedforward(
-            self.feedforward_norm(tokens)
-        )
+
+def scene_attention_layer():
+    layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+    initialise_as_separate_linear_projections(layer.self_attn)
+    return layer
+
+
+def decoder_round_layer():
+    layer = nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+    initialise_as_separate_linear_projections(layer.self_attn)
+    initialise_as_separate_linear_projections(layer.multihead_attn)
+    return layer
 
 
 class SceneEncoder(nn.Module):
@@ -203,7 +179,7 @@ class SceneEncoder(nn.Module):
             contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False
         )
         self.layers = nn.ModuleList(
-            SceneAttentionLayer()
+            scene_attention_layer()
             for _ in range(SCENE_ATTENTION_ROUNDS)
         )
 
@@ -247,8 +223,9 @@ class SceneEncoder(nn.Module):
             [agent_present, neighbour_present, map_present], dim=1
         )
 
+        token_absent = ~token_present
         for layer in self.layers:
-            tokens = layer(tokens, token_present)
+            tokens = layer(tokens, src_key_padding_mask=token_absent)
         return tokens, token_present
 
 
@@ -319,28 +296,8 @@ class ModeDecoder(nn.Module):
         )
         self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.mode_norms = nn.ModuleList(
-            nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS)
-        )
-        self.mode_attention = nn.ModuleList(
-            MultiHeadAttention() for _ in range(DECODER_ROUNDS)
-        )
-        self.scene_query_norms = nn.ModuleList(
-            nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS)
-        )
-        self.scene_attention = nn.ModuleList(
-            MultiHeadAttention() for _ in range(DECODER_ROUNDS)
-        )
-        self.feedforward_norms = nn.ModuleList(
-            nn.LayerNorm(HIDDEN_DIM) for _ in range(DECODER_ROUNDS)
-        )
-        self.feedforwards = nn.ModuleList(
-            nn.Sequential(
-                nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
-                nn.ReLU(),
-                nn.Linear(FEEDFORWARD_DIM, HIDDEN_DIM),
-            )
-            for _ in range(DECODER_ROUNDS)
+        self.rounds = nn.ModuleList(
+            decoder_round_layer() for _ in range(DECODER_ROUNDS)
         )
         self.head_norm = nn.LayerNorm(HIDDEN_DIM)
         self.trajectory_head = nn.Sequential(
@@ -372,24 +329,12 @@ class ModeDecoder(nn.Module):
             / contract.DISTANCE_NORMALISER_METRES
         )
         normed_tokens = self.scene_norm(tokens)
-        every_mode_present = torch.ones(
-            batch_size,
-            QUERY_COUNT,
-            dtype=torch.bool,
-            device=tokens.device,
-        )
-        for round_index in range(DECODER_ROUNDS):
-            normed_queries = self.mode_norms[round_index](queries)
-            queries = queries + self.mode_attention[round_index](
-                normed_queries, normed_queries, every_mode_present
-            )
-            queries = queries + self.scene_attention[round_index](
-                self.scene_query_norms[round_index](queries),
+        token_absent = ~token_present
+        for decoder_round in self.rounds:
+            queries = decoder_round(
+                queries,
                 normed_tokens,
-                token_present,
-            )
-            queries = queries + self.feedforwards[round_index](
-                self.feedforward_norms[round_index](queries)
+                memory_key_padding_mask=token_absent,
             )
         queries = self.head_norm(queries)
         head_output = (
