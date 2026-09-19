@@ -5,3 +5,5 @@ protobuf==4.25.9
 scikit-learn==1.8.0
 grpcio-tools==1.62.3
 pytest==9.0.3
+onnx==1.17.0
+onnxruntime==1.23.2
