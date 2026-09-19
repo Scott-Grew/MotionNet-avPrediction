@@ -423,7 +423,4 @@ def build_batch(samples):
             dtype=np.int64,
         ),
         "map_chunk_signal_history": map_chunk_signal_history,
-        "max_polylines_in_batch": np.array(
-            max_chunks_in_batch, dtype=np.int64
-        ),
     }

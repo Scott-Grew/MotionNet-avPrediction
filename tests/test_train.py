@@ -51,7 +51,6 @@ def synthetic_batch():
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "max_polylines_in_batch": torch.tensor(4),
         "future_positions": torch.randn(2, contract.FUTURE_STEPS, 2),
         "future_mask": torch.ones(
             2, contract.FUTURE_STEPS, dtype=torch.bool

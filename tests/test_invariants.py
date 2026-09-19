@@ -109,7 +109,6 @@ def synthetic_scene_batch(
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "max_polylines_in_batch": torch.tensor(polyline_count),
         "future_positions": torch.randn(
             sample_count, contract.FUTURE_STEPS, 2
         ),

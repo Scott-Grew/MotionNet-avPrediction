@@ -202,7 +202,7 @@ class SceneEncoder(nn.Module):
             self.map_encoder(batch["map_rows"]),
             batch["map_dot_polyline_slot"],
             agent_token.shape[0],
-            int(batch["max_polylines_in_batch"]),
+            batch["map_chunk_signal_history"].shape[1],
         )
         map_tokens = map_tokens + self.signal_projection(
             batch["map_chunk_signal_history"].flatten(start_dim=-2)
