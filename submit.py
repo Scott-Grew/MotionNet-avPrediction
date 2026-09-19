@@ -11,10 +11,8 @@ from womd import (
     frame_ops,
     loader,
     model,
-    pipeline,
 )
 
-BATCH_SIZE = 16
 SUBMISSION_STEP_SELECTOR = torch.tensor(
     contract.SUBMISSION_FUTURE_INDICES
 )
@@ -35,7 +33,7 @@ def agent_frame_to_world_frame(
     )
 
 
-def designated_target_samples(staged_directory):
+def designated_target_scenes(staged_directory):
     for scenario_path in sorted(Path(staged_directory).glob("*.npz")):
         scenario_array = loader.read_scenario(scenario_path)
         designated_count = int(
@@ -51,25 +49,18 @@ def designated_target_samples(staged_directory):
             f"{scenario_path} designates {designated_count} targets but"
             f" {designated_count - len(track_indices)} of them cannot be predicted"
         )
-        for track_index in track_indices:
-            yield scenario_array, loader.build_sample(
-                scenario_array, int(track_index)
-            )
+        yield scenario_array, loader.build_scene_sample(
+            scenario_array, track_indices.tolist()
+        )
 
 
-def grouped(pairs, group_size):
-    group = []
-    for pair in pairs:
-        group.append(pair)
-        if len(group) == group_size:
-            yield group
-            group = []
-    if group:
-        yield group
-
-
-def submission_trajectories_and_confidences(predictor, samples):
-    batch = pipeline.collate_samples(samples)
+def submission_trajectories_and_confidences(predictor, scene_sample):
+    batch = {
+        name: torch.from_numpy(array)
+        for name, array in loader.build_scene_batch(
+            [scene_sample]
+        ).items()
+    }
     with torch.no_grad():
         if predictor is None:
             trajectories, confidence_logits = (
@@ -106,28 +97,27 @@ def write_submission_arrays(predictor, staged_directory, output_path):
         [],
         [],
     )
-    for group in grouped(
-        designated_target_samples(staged_directory), BATCH_SIZE
+    for scenario_array, scene_sample in designated_target_scenes(
+        staged_directory
     ):
-        samples = [sample for _, sample in group]
-        group_trajectories, group_confidences = (
+        scene_trajectories, scene_confidences = (
             submission_trajectories_and_confidences(
-                predictor, samples
+                predictor, scene_sample
             )
         )
-        for (
-            (scenario_array, sample),
-            trajectories,
-            sample_confidences,
-        ) in zip(group, group_trajectories, group_confidences):
-            scenario_ids.append(str(sample["scenario_id"]))
-            track_ids.append(int(sample["track_id"]))
+        for target, trajectories, target_confidences in zip(
+            scene_sample["targets"],
+            scene_trajectories,
+            scene_confidences,
+        ):
+            scenario_ids.append(str(scene_sample["scenario_id"]))
+            track_ids.append(int(target["track_id"]))
             world_trajectories.append(
                 agent_frame_to_world_frame(
-                    trajectories, sample, scenario_array
+                    trajectories, target, scenario_array
                 )
             )
-            confidences.append(sample_confidences)
+            confidences.append(target_confidences)
 
     stacked_trajectories = np.stack(world_trajectories)
     assert stacked_trajectories.shape[1:] == (

@@ -26,16 +26,15 @@ def metre_endpoints(scenario_paths):
             scenario_array["is_designated_target"],
             True,
         )
-        for track_index in eligible:
-            sample = loader.build_sample(
-                scenario_array, int(track_index)
-            )
-            valid_future_steps = np.flatnonzero(sample["future_mask"])
+        for target in loader.build_scene_sample(
+            scenario_array, eligible.tolist()
+        )["targets"]:
+            valid_future_steps = np.flatnonzero(target["future_mask"])
             if valid_future_steps.size == 0:
                 continue
-            agent_histories.append(sample["agent_history"])
+            agent_histories.append(target["agent_history"])
             logged_endpoints.append(
-                sample["future_positions"][valid_future_steps[-1]]
+                target["future_positions"][valid_future_steps[-1]]
             )
 
     agent_history = torch.from_numpy(np.stack(agent_histories))

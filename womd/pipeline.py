@@ -9,11 +9,18 @@ from torch.utils.data import (
 from womd import loader
 
 
-class ScenarioSampleStream(IterableDataset):
-    def __init__(self, scenario_paths, seed, designated_targets_only):
+class SceneBatchStream(IterableDataset):
+    def __init__(
+        self,
+        scenario_paths,
+        seed,
+        designated_targets_only,
+        targets_per_batch,
+    ):
         self.scenario_paths = scenario_paths
         self.seed = seed
         self.designated_targets_only = designated_targets_only
+        self.targets_per_batch = targets_per_batch
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -23,31 +30,39 @@ class ScenarioSampleStream(IterableDataset):
         random_generator = np.random.default_rng(
             self.seed + worker_index
         )
+        scene_samples = []
+        free_target_slots = self.targets_per_batch
         for scenario_index in random_generator.permutation(
             len(worker_paths)
         ):
             scenario_arrays = loader.read_scenario(
                 worker_paths[scenario_index]
             )
-            sample_track_indices = loader.eligible_track_indices(
-                scenario_arrays["track_rows"],
-                scenario_arrays["track_valid"],
-                scenario_arrays["is_designated_target"],
-                self.designated_targets_only,
-            )
-            for track_index in random_generator.permutation(
-                sample_track_indices
-            ):
-                yield loader.build_sample(
-                    scenario_arrays, int(track_index)
+            waiting_track_indices = random_generator.permutation(
+                loader.eligible_track_indices(
+                    scenario_arrays["track_rows"],
+                    scenario_arrays["track_valid"],
+                    scenario_arrays["is_designated_target"],
+                    self.designated_targets_only,
                 )
-
-
-def collate_samples(samples):
-    batch = loader.build_batch(samples)
-    return {
-        name: torch.from_numpy(array) for name, array in batch.items()
-    }
+            ).tolist()
+            while waiting_track_indices:
+                scene_samples.append(
+                    loader.build_scene_sample(
+                        scenario_arrays,
+                        waiting_track_indices[:free_target_slots],
+                    )
+                )
+                taken = len(scene_samples[-1]["targets"])
+                waiting_track_indices = waiting_track_indices[taken:]
+                free_target_slots -= taken
+                if free_target_slots:
+                    continue
+                yield loader.build_scene_batch(scene_samples)
+                scene_samples = []
+                free_target_slots = self.targets_per_batch
+        if scene_samples:
+            yield loader.build_scene_batch(scene_samples)
 
 
 def batches(
@@ -59,12 +74,11 @@ def batches(
     designated_targets_only,
 ):
     return DataLoader(
-        ScenarioSampleStream(
-            scenario_paths, seed, designated_targets_only
+        SceneBatchStream(
+            scenario_paths, seed, designated_targets_only, batch_size
         ),
-        batch_size=batch_size,
+        batch_size=None,
         num_workers=worker_count,
-        collate_fn=collate_samples,
         prefetch_factor=(
             prefetch_batches if worker_count > 0 else None
         ),

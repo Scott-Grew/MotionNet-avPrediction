@@ -77,13 +77,13 @@ def synthetic_scene_batch(
         "agent_history_mask": torch.ones(
             sample_count, contract.HISTORY_STEPS, dtype=torch.bool
         ),
-        "neighbour_history": torch.randn(
+        "scene_agent_history": torch.randn(
             sample_count,
             neighbour_count,
             contract.HISTORY_STEPS,
             contract.AGENT_FEATURE_DIM,
         ),
-        "neighbour_history_mask": torch.ones(
+        "scene_agent_history_mask": torch.ones(
             sample_count,
             neighbour_count,
             contract.HISTORY_STEPS,
@@ -94,7 +94,7 @@ def synthetic_scene_batch(
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "neighbour_signal_history": torch.rand(
+        "scene_agent_signal_history": torch.rand(
             sample_count,
             neighbour_count,
             contract.HISTORY_STEPS,
@@ -108,6 +108,15 @@ def synthetic_scene_batch(
             polyline_count,
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
+        ),
+        "target_scene_index": torch.arange(sample_count),
+        "token_visible": torch.ones(
+            sample_count,
+            neighbour_count + polyline_count,
+            dtype=torch.bool,
+        ),
+        "token_pose": torch.randn(
+            sample_count, neighbour_count + polyline_count, 4
         ),
         "future_positions": torch.randn(
             sample_count, contract.FUTURE_STEPS, 2
@@ -545,7 +554,9 @@ def test_submission_world_frame_returns_the_logged_future_to_its_logged_place():
             True,
         )[0]
     )
-    sample = loader.build_sample(scenario_array, track_index)
+    sample = loader.build_scene_sample(scenario_array, [track_index])[
+        "targets"
+    ][0]
     agent_frame_future = sample["future_positions"]
 
     world_future = submit.agent_frame_to_world_frame(
@@ -849,25 +860,25 @@ def test_scorer_tensors_group_per_scenario_with_every_agent_in_the_ground_truth(
         ] == pytest.approx(agent_row * 1.0)
 
 
-def test_permuting_neighbours_and_map_dots_leaves_trajectories_unchanged():
+def test_permuting_scene_agents_and_map_dots_leaves_trajectories_unchanged():
     torch.manual_seed(11)
     predictor = model.MotionPredictor(
         model.unit_anchor_offsets_per_type()
     ).eval()
     batch = synthetic_scene_batch(2, 6, 5, 16)
-    batch["neighbour_history_mask"][:, 5] = False
-    neighbour_order = torch.randperm(6)
+    batch["scene_agent_history_mask"][:, 5] = False
+    scene_agent_order = torch.randperm(6)
+    token_order = torch.cat([scene_agent_order, torch.arange(6, 11)])
     map_order = torch.randperm(batch["map_rows"].shape[0])
     permuted = dict(batch)
-    permuted["neighbour_history"] = batch["neighbour_history"][
-        :, neighbour_order
-    ]
-    permuted["neighbour_history_mask"] = batch[
-        "neighbour_history_mask"
-    ][:, neighbour_order]
-    permuted["neighbour_signal_history"] = batch[
-        "neighbour_signal_history"
-    ][:, neighbour_order]
+    for name in (
+        "scene_agent_history",
+        "scene_agent_history_mask",
+        "scene_agent_signal_history",
+    ):
+        permuted[name] = batch[name][:, scene_agent_order]
+    for name in ("token_visible", "token_pose"):
+        permuted[name] = batch[name][:, token_order]
     permuted["map_rows"] = batch["map_rows"][map_order]
     permuted["map_dot_polyline_slot"] = batch[
         "map_dot_polyline_slot"
@@ -942,27 +953,29 @@ def test_each_agent_carries_the_signal_history_of_the_lane_it_is_assigned_to():
     signalled_lane_history[
         8:, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")
     ] = 1.0
-    three_agent_sample = loader.build_sample(
-        two_lane_signal_scenario(3, signalled_lane_history), 0
+    three_agent_scene = loader.build_scene_sample(
+        two_lane_signal_scenario(3, signalled_lane_history), [0]
     )
-    two_agent_sample = loader.build_sample(
-        two_lane_signal_scenario(2, signalled_lane_history), 0
+    two_agent_scene = loader.build_scene_sample(
+        two_lane_signal_scenario(2, signalled_lane_history), [0]
     )
     assert np.array_equal(
-        three_agent_sample["agent_signal_history"],
+        three_agent_scene["targets"][0]["agent_signal_history"],
         signalled_lane_history,
     )
     assert np.all(
-        three_agent_sample["neighbour_signal_history"] == 0.0
+        three_agent_scene["scene_agent_signal_history"][1:] == 0.0
     )
-    batch = loader.build_batch([three_agent_sample, two_agent_sample])
-    assert batch["neighbour_signal_history"].shape == (
+    batch = loader.build_scene_batch(
+        [three_agent_scene, two_agent_scene]
+    )
+    assert batch["scene_agent_signal_history"].shape == (
         2,
-        2,
+        3,
         contract.HISTORY_STEPS,
         contract.NUM_TRAFFIC_SIGNAL_STATES,
     )
-    assert np.all(batch["neighbour_signal_history"][1, 1] == 0.0)
+    assert np.all(batch["scene_agent_signal_history"][1, 2] == 0.0)
     torch_batch = {
         name: torch.from_numpy(array) for name, array in batch.items()
     }
@@ -976,6 +989,51 @@ def test_each_agent_carries_the_signal_history_of_the_lane_it_is_assigned_to():
         tokens, _ = encoder(torch_batch)
         silenced_tokens, _ = encoder(silenced_batch)
     assert not torch.allclose(tokens[0, 0], silenced_tokens[0, 0])
+
+
+def test_a_target_is_predicted_the_same_alone_as_beside_other_targets_and_scenes():
+    signalled_lane_history = np.zeros(
+        (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
+        dtype=np.float32,
+    )
+    three_track_scenario = two_lane_signal_scenario(
+        3, signalled_lane_history
+    )
+    two_track_scenario = two_lane_signal_scenario(
+        2, signalled_lane_history
+    )
+
+    def torch_batch(scene_samples):
+        return {
+            name: torch.from_numpy(array)
+            for name, array in loader.build_scene_batch(
+                scene_samples
+            ).items()
+        }
+
+    torch.manual_seed(53)
+    predictor = model.MotionPredictor(
+        model.unit_anchor_offsets_per_type()
+    ).eval()
+    with torch.no_grad():
+        alone, _ = predictor(
+            torch_batch(
+                [loader.build_scene_sample(three_track_scenario, [1])]
+            )
+        )
+        together, _ = predictor(
+            torch_batch(
+                [
+                    loader.build_scene_sample(
+                        two_track_scenario, [0]
+                    ),
+                    loader.build_scene_sample(
+                        three_track_scenario, [0, 1, 2]
+                    ),
+                ]
+            )
+        )
+    assert torch.allclose(alone[0], together[2], atol=1e-4)
 
 
 def test_a_mode_endpoint_is_its_anchor_when_the_head_is_zero_and_the_loss_assigns_by_that_anchor():

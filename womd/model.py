@@ -173,18 +173,60 @@ class SceneEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.agent_encoder = AgentHistoryEncoder()
-        self.neighbour_encoder = AgentHistoryEncoder()
+        self.scene_agent_encoder = AgentHistoryEncoder()
         self.map_encoder = MapDotEncoder()
         self.signal_projection = nn.Linear(
             contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False
+        )
+        self.pose_projection = nn.Linear(4, HIDDEN_DIM)
+        self.register_buffer(
+            "pose_divisors",
+            torch.tensor(
+                [
+                    contract.DISTANCE_NORMALISER_METRES,
+                    contract.DISTANCE_NORMALISER_METRES,
+                    1.0,
+                    1.0,
+                ]
+            ),
         )
         self.layers = nn.ModuleList(
             scene_attention_layer()
             for _ in range(SCENE_ATTENTION_ROUNDS)
         )
 
+    def scene_tokens(self, batch):
+        agent_tokens = self.scene_agent_encoder(
+            batch["scene_agent_history"],
+            batch["scene_agent_history_mask"],
+        ) + self.signal_projection(
+            batch["scene_agent_signal_history"].flatten(start_dim=-2)
+        )
+        map_tokens, map_present = pool_dots_to_polyline_tokens(
+            self.map_encoder(batch["map_rows"]),
+            batch["map_dot_polyline_slot"],
+            agent_tokens.shape[0],
+            batch["map_chunk_signal_history"].shape[1],
+        )
+        map_tokens = map_tokens + self.signal_projection(
+            batch["map_chunk_signal_history"].flatten(start_dim=-2)
+        )
+        tokens = torch.cat([agent_tokens, map_tokens], dim=1)
+        token_present = torch.cat(
+            [
+                batch["scene_agent_history_mask"].any(dim=-1),
+                map_present,
+            ],
+            dim=1,
+        )
+        token_absent = ~token_present
+        for layer in self.layers:
+            tokens = layer(tokens, src_key_padding_mask=token_absent)
+        return tokens, token_present
+
     def forward(self, batch):
-        agent_token = (
+        tokens, token_present = self.scene_tokens(batch)
+        own_token = (
             self.agent_encoder(
                 batch["agent_history"], batch["agent_history_mask"]
             )
@@ -192,41 +234,26 @@ class SceneEncoder(nn.Module):
                 batch["agent_signal_history"].flatten(start_dim=-2)
             )
         ).unsqueeze(1)
-        neighbour_tokens = self.neighbour_encoder(
-            batch["neighbour_history"],
-            batch["neighbour_history_mask"],
-        ) + self.signal_projection(
-            batch["neighbour_signal_history"].flatten(start_dim=-2)
+        scene_of_target = batch["target_scene_index"]
+        target_view = tokens[scene_of_target] + self.pose_projection(
+            batch["token_pose"] / self.pose_divisors
         )
-        map_tokens, map_present = pool_dots_to_polyline_tokens(
-            self.map_encoder(batch["map_rows"]),
-            batch["map_dot_polyline_slot"],
-            agent_token.shape[0],
-            batch["map_chunk_signal_history"].shape[1],
-        )
-        map_tokens = map_tokens + self.signal_projection(
-            batch["map_chunk_signal_history"].flatten(start_dim=-2)
-        )
-
-        tokens = torch.cat(
-            [agent_token, neighbour_tokens, map_tokens], dim=1
-        )
-        agent_present = torch.ones(
-            agent_token.shape[:2],
+        own_present = torch.ones(
+            own_token.shape[:2],
             dtype=torch.bool,
-            device=tokens.device,
+            device=own_token.device,
         )
-        neighbour_present = batch["neighbour_history_mask"].any(
-            dim=-1
+        return (
+            torch.cat([own_token, target_view], dim=1),
+            torch.cat(
+                [
+                    own_present,
+                    token_present[scene_of_target]
+                    & batch["token_visible"],
+                ],
+                dim=1,
+            ),
         )
-        token_present = torch.cat(
-            [agent_present, neighbour_present, map_present], dim=1
-        )
-
-        token_absent = ~token_present
-        for layer in self.layers:
-            tokens = layer(tokens, src_key_padding_mask=token_absent)
-        return tokens, token_present
 
 
 QUERY_COUNT = 54

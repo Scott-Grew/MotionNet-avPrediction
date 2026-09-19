@@ -149,76 +149,6 @@ def assigned_lane_signal_histories(
     return signal_histories
 
 
-def crop_and_reframe_map(
-    map_rows,
-    dot_polyline_index,
-    polyline_signal_histories,
-    origin,
-    heading,
-    speed,
-):
-    agent_frame_positions = frame_ops.positions_to_agent_frame(
-        map_rows[:, contract.MAP_POSITION], origin, heading
-    )
-    crop_mask = inside_crop(
-        agent_frame_positions,
-        BASE_RADIUS_METRES,
-        1.0 + STRETCH_GAIN * speed,
-    )
-    reframed = map_rows[crop_mask]
-    reframed[:, contract.MAP_POSITION] = agent_frame_positions[
-        crop_mask
-    ]
-    reframed[:, contract.MAP_DIRECTION] = (
-        frame_ops.directions_to_agent_frame(
-            reframed[:, contract.MAP_DIRECTION], heading
-        )
-    )
-    has_signal = polyline_signal_histories.any(axis=(1, 2))[
-        dot_polyline_index[crop_mask]
-    ]
-    reframed[has_signal, contract.MAP_STOP_POINT] = (
-        frame_ops.positions_to_agent_frame(
-            reframed[has_signal, contract.MAP_STOP_POINT],
-            origin,
-            heading,
-        )
-    )
-    (
-        surviving_polylines,
-        first_dot_position,
-        compact_polyline_index,
-        dots_per_polyline,
-    ) = np.unique(
-        dot_polyline_index[crop_mask],
-        return_index=True,
-        return_inverse=True,
-        return_counts=True,
-    )
-    position_within_polyline = (
-        np.arange(len(compact_polyline_index))
-        - first_dot_position[compact_polyline_index]
-    )
-    chunks_per_polyline = (
-        dots_per_polyline + contract.MAP_CHUNK_DOTS - 1
-    ) // contract.MAP_CHUNK_DOTS
-    first_chunk_of_polyline = (
-        np.cumsum(chunks_per_polyline) - chunks_per_polyline
-    )
-    dot_chunk_index = (
-        first_chunk_of_polyline[compact_polyline_index]
-        + position_within_polyline // contract.MAP_CHUNK_DOTS
-    )
-    chunk_polyline = np.repeat(
-        surviving_polylines, chunks_per_polyline
-    )
-    return (
-        reframed,
-        dot_chunk_index,
-        polyline_signal_histories[chunk_polyline],
-    )
-
-
 def with_derived_arrays(scenario_array):
     feature_lengths = scenario_array["feature_lengths"]
     scenario_array["map_dot_polyline_index"] = np.repeat(
@@ -263,164 +193,268 @@ def read_scenario(scenario_path):
     return with_derived_arrays(scenario_array)
 
 
-def build_sample(scenario_array, track_index):
+def chunk_index_of_dots(dot_polyline_index):
+    (
+        polylines,
+        first_dot_position,
+        compact_polyline_index,
+        dots_per_polyline,
+    ) = np.unique(
+        dot_polyline_index,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    position_within_polyline = (
+        np.arange(len(compact_polyline_index))
+        - first_dot_position[compact_polyline_index]
+    )
+    chunks_per_polyline = (
+        dots_per_polyline + contract.MAP_CHUNK_DOTS - 1
+    ) // contract.MAP_CHUNK_DOTS
+    first_chunk_of_polyline = (
+        np.cumsum(chunks_per_polyline) - chunks_per_polyline
+    )
+    dot_chunk_index = (
+        first_chunk_of_polyline[compact_polyline_index]
+        + position_within_polyline // contract.MAP_CHUNK_DOTS
+    )
+    return dot_chunk_index, np.repeat(polylines, chunks_per_polyline)
+
+
+def poses_in_agent_frame(
+    positions, direction_cosine_sine, origin, heading
+):
+    return np.concatenate(
+        [
+            frame_ops.positions_to_agent_frame(
+                positions, origin, heading
+            ),
+            frame_ops.directions_to_agent_frame(
+                direction_cosine_sine, heading
+            ),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def build_scene_sample(scenario_array, track_indices):
     track_rows = scenario_array["track_rows"]
     track_valid = scenario_array["track_valid"]
-    origin, heading = sample_frame(track_rows, track_index)
-
-    agent_track = track_rows_to_agent_frame(
-        track_rows[track_index], origin, heading
-    )
-    neighbour_indices = np.flatnonzero(
-        np.arange(len(track_rows)) != track_index
-    )
-    neighbour_history = track_rows_to_agent_frame(
-        track_rows[neighbour_indices, : contract.HISTORY_STEPS],
-        origin,
-        heading,
-    )
-
-    now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
-    speed = float(np.linalg.norm(now_row[contract.AGENT_VELOCITY]))
     track_signal_histories = scenario_array["track_signal_histories"]
-    agent_map, map_chunk_index, map_chunk_signal_history = (
-        crop_and_reframe_map(
-            scenario_array["map_rows"],
-            scenario_array["map_dot_polyline_index"],
-            scenario_array["polyline_signal_histories"],
-            origin,
-            heading,
-            speed,
-        )
+    map_rows = scenario_array["map_rows"]
+    history_valid = track_valid[:, : contract.HISTORY_STEPS]
+    agent_present = history_valid.any(axis=1)
+    last_valid_step = (
+        contract.HISTORY_STEPS
+        - 1
+        - history_valid[:, ::-1].argmax(axis=1)
+    )
+    agent_reference_rows = track_rows[
+        np.arange(len(track_rows)), last_valid_step
+    ]
+    agent_reference_directions = np.stack(
+        [
+            agent_reference_rows[:, contract.AGENT_HEADING_COSINE],
+            agent_reference_rows[:, contract.AGENT_HEADING_SINE],
+        ],
+        axis=1,
     )
 
+    dot_chunk_index, chunk_polyline = chunk_index_of_dots(
+        scenario_array["map_dot_polyline_index"]
+    )
+    chunk_count = len(chunk_polyline)
+    _, first_dot_of_chunk, dots_per_chunk = np.unique(
+        dot_chunk_index, return_index=True, return_counts=True
+    )
+    chunk_reference_rows = map_rows[
+        first_dot_of_chunk + dots_per_chunk // 2
+    ]
+
+    targets = []
+    for track_index in track_indices:
+        origin, heading = sample_frame(track_rows, track_index)
+        agent_track = track_rows_to_agent_frame(
+            track_rows[track_index], origin, heading
+        )
+        now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
+        speed = float(
+            np.linalg.norm(now_row[contract.AGENT_VELOCITY])
+        )
+        dot_inside_crop = inside_crop(
+            frame_ops.positions_to_agent_frame(
+                map_rows[:, contract.MAP_POSITION], origin, heading
+            ),
+            BASE_RADIUS_METRES,
+            1.0 + STRETCH_GAIN * speed,
+        )
+        chunk_visible = (
+            np.bincount(
+                dot_chunk_index,
+                weights=dot_inside_crop,
+                minlength=chunk_count,
+            )
+            > 0
+        )
+        agent_visible = agent_present.copy()
+        agent_visible[track_index] = False
+        targets.append(
+            {
+                "agent_history": agent_track[
+                    : contract.HISTORY_STEPS
+                ],
+                "agent_history_mask": history_valid[track_index],
+                "agent_signal_history": track_signal_histories[
+                    track_index
+                ],
+                "future_positions": agent_track[
+                    contract.CURRENT_STEP_INDEX + 1 :,
+                    contract.AGENT_POSITION,
+                ],
+                "future_mask": track_valid[
+                    track_index, contract.CURRENT_STEP_INDEX + 1 :
+                ],
+                "agent_token_visible": agent_visible,
+                "chunk_token_visible": chunk_visible,
+                "agent_token_pose": poses_in_agent_frame(
+                    agent_reference_rows[:, contract.AGENT_POSITION],
+                    agent_reference_directions,
+                    origin,
+                    heading,
+                ),
+                "chunk_token_pose": poses_in_agent_frame(
+                    chunk_reference_rows[:, contract.MAP_POSITION],
+                    chunk_reference_rows[:, contract.MAP_DIRECTION],
+                    origin,
+                    heading,
+                ),
+                "frame_origin": origin,
+                "frame_heading": heading,
+                "track_id": scenario_array["track_ids"][track_index],
+                "is_designated_target": scenario_array[
+                    "is_designated_target"
+                ][track_index],
+                "is_object_of_interest": scenario_array[
+                    "is_object_of_interest"
+                ][track_index],
+            }
+        )
     return {
-        "agent_history": agent_track[: contract.HISTORY_STEPS],
-        "agent_history_mask": track_valid[
-            track_index, : contract.HISTORY_STEPS
-        ],
-        "agent_signal_history": track_signal_histories[track_index],
-        "future_positions": agent_track[
-            contract.CURRENT_STEP_INDEX + 1 :, contract.AGENT_POSITION
-        ],
-        "future_mask": track_valid[
-            track_index, contract.CURRENT_STEP_INDEX + 1 :
-        ],
-        "neighbour_history": neighbour_history,
-        "neighbour_history_mask": track_valid[
-            neighbour_indices, : contract.HISTORY_STEPS
-        ],
-        "neighbour_signal_history": track_signal_histories[
-            neighbour_indices
-        ],
-        "map_rows": agent_map,
-        "map_chunk_index": map_chunk_index.astype(np.int64),
-        "map_chunk_signal_history": map_chunk_signal_history,
-        "frame_origin": origin,
-        "frame_heading": heading,
         "scenario_id": scenario_array["scenario_id"],
-        "track_id": scenario_array["track_ids"][track_index],
-        "is_designated_target": scenario_array[
-            "is_designated_target"
-        ][track_index],
-        "is_object_of_interest": scenario_array[
-            "is_object_of_interest"
-        ][track_index],
+        "scene_agent_history": track_rows[
+            :, : contract.HISTORY_STEPS
+        ],
+        "scene_agent_history_mask": history_valid,
+        "scene_agent_signal_history": track_signal_histories,
+        "map_rows": map_rows,
+        "map_chunk_index": dot_chunk_index.astype(np.int64),
+        "map_chunk_signal_history": scenario_array[
+            "polyline_signal_histories"
+        ][chunk_polyline],
+        "targets": targets,
     }
 
 
-def build_batch(samples):
-    batch_size = len(samples)
-    max_neighbours = max(
-        sample["neighbour_history"].shape[0] for sample in samples
+def padded_stack(arrays, length, dtype):
+    stacked = np.zeros(
+        (len(arrays), length) + arrays[0].shape[1:], dtype=dtype
     )
-    max_chunks_in_batch = max(
-        (
-            int(sample["map_chunk_index"].max()) + 1
-            if len(sample["map_chunk_index"])
-            else 0
-        )
-        for sample in samples
-    )
+    for row, array in zip(stacked, arrays):
+        row[: len(array)] = array
+    return stacked
 
-    neighbour_history = np.zeros(
-        (
-            batch_size,
-            max_neighbours,
-            contract.HISTORY_STEPS,
-            contract.AGENT_FEATURE_DIM,
-        ),
-        dtype=np.float32,
-    )
-    neighbour_history_mask = np.zeros(
-        (batch_size, max_neighbours, contract.HISTORY_STEPS),
-        dtype=bool,
-    )
-    neighbour_signal_history = np.zeros(
-        (
-            batch_size,
-            max_neighbours,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
-        ),
-        dtype=np.float32,
-    )
-    map_chunk_signal_history = np.zeros(
-        (
-            batch_size,
-            max_chunks_in_batch,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
-        ),
-        dtype=np.float32,
-    )
 
-    for sample_index, sample in enumerate(samples):
-        neighbour_count = sample["neighbour_history"].shape[0]
-        neighbour_history[sample_index, :neighbour_count] = sample[
-            "neighbour_history"
-        ]
-        neighbour_history_mask[sample_index, :neighbour_count] = (
-            sample["neighbour_history_mask"]
+def build_scene_batch(scene_samples):
+    max_agents = max(
+        len(scene["scene_agent_history"]) for scene in scene_samples
+    )
+    max_chunks = max(
+        len(scene["map_chunk_signal_history"])
+        for scene in scene_samples
+    )
+    targets = [
+        (scene_index, target)
+        for scene_index, scene in enumerate(scene_samples)
+        for target in scene["targets"]
+    ]
+
+    def stacked_target(name):
+        return np.stack([target[name] for _, target in targets])
+
+    def padded_target_tokens(agent_name, chunk_name, dtype):
+        return np.concatenate(
+            [
+                padded_stack(
+                    [target[agent_name] for _, target in targets],
+                    max_agents,
+                    dtype,
+                ),
+                padded_stack(
+                    [target[chunk_name] for _, target in targets],
+                    max_chunks,
+                    dtype,
+                ),
+            ],
+            axis=1,
         )
-        neighbour_signal_history[sample_index, :neighbour_count] = (
-            sample["neighbour_signal_history"]
-        )
-        chunk_count = sample["map_chunk_signal_history"].shape[0]
-        map_chunk_signal_history[sample_index, :chunk_count] = sample[
-            "map_chunk_signal_history"
-        ]
 
     return {
-        "agent_history": np.stack(
-            [sample["agent_history"] for sample in samples]
+        "scene_agent_history": padded_stack(
+            [scene["scene_agent_history"] for scene in scene_samples],
+            max_agents,
+            np.float32,
         ),
-        "agent_history_mask": np.stack(
-            [sample["agent_history_mask"] for sample in samples]
+        "scene_agent_history_mask": padded_stack(
+            [
+                scene["scene_agent_history_mask"]
+                for scene in scene_samples
+            ],
+            max_agents,
+            bool,
         ),
-        "agent_signal_history": np.stack(
-            [sample["agent_signal_history"] for sample in samples]
+        "scene_agent_signal_history": padded_stack(
+            [
+                scene["scene_agent_signal_history"]
+                for scene in scene_samples
+            ],
+            max_agents,
+            np.float32,
         ),
-        "future_positions": np.stack(
-            [sample["future_positions"] for sample in samples]
-        ),
-        "future_mask": np.stack(
-            [sample["future_mask"] for sample in samples]
-        ),
-        "neighbour_history": neighbour_history,
-        "neighbour_history_mask": neighbour_history_mask,
-        "neighbour_signal_history": neighbour_signal_history,
         "map_rows": np.concatenate(
-            [sample["map_rows"] for sample in samples],
+            [scene["map_rows"] for scene in scene_samples],
             dtype=np.float32,
         ),
         "map_dot_polyline_slot": np.concatenate(
             [
-                sample["map_chunk_index"]
-                + sample_index * max_chunks_in_batch
-                for sample_index, sample in enumerate(samples)
+                scene["map_chunk_index"] + scene_index * max_chunks
+                for scene_index, scene in enumerate(scene_samples)
             ],
             dtype=np.int64,
         ),
-        "map_chunk_signal_history": map_chunk_signal_history,
+        "map_chunk_signal_history": padded_stack(
+            [
+                scene["map_chunk_signal_history"]
+                for scene in scene_samples
+            ],
+            max_chunks,
+            np.float32,
+        ),
+        "target_scene_index": np.array(
+            [scene_index for scene_index, _ in targets],
+            dtype=np.int64,
+        ),
+        "agent_history": stacked_target("agent_history"),
+        "agent_history_mask": stacked_target("agent_history_mask"),
+        "agent_signal_history": stacked_target(
+            "agent_signal_history"
+        ),
+        "future_positions": stacked_target("future_positions"),
+        "future_mask": stacked_target("future_mask"),
+        "token_visible": padded_target_tokens(
+            "agent_token_visible", "chunk_token_visible", bool
+        ),
+        "token_pose": padded_target_tokens(
+            "agent_token_pose", "chunk_token_pose", np.float32
+        ),
     }

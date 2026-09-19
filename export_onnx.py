@@ -8,19 +8,30 @@ import numpy as np
 import onnxruntime
 import torch
 
-from womd import model, pipeline
+from womd import loader, model
 
-INPUT_NAMES = [
+SCENE_AGENT_NAMES = [
+    "scene_agent_history",
+    "scene_agent_history_mask",
+    "scene_agent_signal_history",
+]
+TARGET_NAMES = [
+    "target_scene_index",
     "agent_history",
     "agent_history_mask",
     "agent_signal_history",
-    "neighbour_history",
-    "neighbour_history_mask",
-    "neighbour_signal_history",
-    "map_rows",
-    "map_dot_polyline_slot",
-    "map_chunk_signal_history",
+    "token_visible",
+    "token_pose",
 ]
+INPUT_NAMES = (
+    SCENE_AGENT_NAMES
+    + [
+        "map_rows",
+        "map_dot_polyline_slot",
+        "map_chunk_signal_history",
+    ]
+    + TARGET_NAMES
+)
 OUTPUT_NAMES = ["trajectories", "confidence_logits"]
 WARMUP_RUNS = 2
 
@@ -42,48 +53,64 @@ def padded_along(tensor, dimension, length):
     )
 
 
+def last_row_repeated_to(tensor, length):
+    return torch.cat(
+        [
+            tensor,
+            tensor[-1:].expand(
+                length - len(tensor), *tensor.shape[1:]
+            ),
+        ]
+    )
+
+
 def padded_to_fixed_shape(
-    batch, neighbour_count, chunk_count, dot_count
+    batch, agent_count, chunk_count, dot_count, target_count
 ):
+    batch_agent_count = batch["scene_agent_history"].shape[1]
     batch_chunk_count = batch["map_chunk_signal_history"].shape[1]
     slot = batch["map_dot_polyline_slot"]
-    fixed_slot = (
-        slot // batch_chunk_count
-    ) * chunk_count + slot % batch_chunk_count
-    repeated_last_dot = dot_count - len(slot)
     fixed = {
-        name: batch[name]
-        for name in INPUT_NAMES
-        if name.startswith("agent_")
+        name: padded_along(batch[name], 1, agent_count)
+        for name in SCENE_AGENT_NAMES
     }
-    for name in (
-        "neighbour_history",
-        "neighbour_history_mask",
-        "neighbour_signal_history",
-    ):
-        fixed[name] = padded_along(batch[name], 1, neighbour_count)
     fixed["map_chunk_signal_history"] = padded_along(
         batch["map_chunk_signal_history"], 1, chunk_count
     )
-    fixed["map_rows"] = torch.cat(
-        [
-            batch["map_rows"],
-            batch["map_rows"][-1:].expand(repeated_last_dot, -1),
-        ]
+    fixed["map_rows"] = last_row_repeated_to(
+        batch["map_rows"], dot_count
     )
-    fixed["map_dot_polyline_slot"] = torch.cat(
-        [fixed_slot, fixed_slot[-1:].expand(repeated_last_dot)]
+    fixed["map_dot_polyline_slot"] = last_row_repeated_to(
+        (slot // batch_chunk_count) * chunk_count
+        + slot % batch_chunk_count,
+        dot_count,
     )
+    for name in ("token_visible", "token_pose"):
+        fixed[name] = torch.cat(
+            [
+                padded_along(
+                    batch[name][:, :batch_agent_count], 1, agent_count
+                ),
+                padded_along(
+                    batch[name][:, batch_agent_count:], 1, chunk_count
+                ),
+            ],
+            dim=1,
+        )
+    for name in TARGET_NAMES:
+        fixed[name] = last_row_repeated_to(
+            fixed.get(name, batch[name]), target_count
+        )
     return fixed
 
 
-def milliseconds_per_batch(run_once, batches):
+def milliseconds_per_scene(run_once, fixed_batches):
     for _ in range(WARMUP_RUNS):
-        run_once(batches[0])
+        run_once(fixed_batches[0])
     durations = []
-    for batch in batches:
+    for fixed_batch in fixed_batches:
         start = time.perf_counter()
-        run_once(batch)
+        run_once(fixed_batch)
         durations.append(1000 * (time.perf_counter() - start))
     return durations
 
@@ -91,24 +118,32 @@ def milliseconds_per_batch(run_once, batches):
 def export_and_measure_bucket(
     predictor, batches, onnx_path, thread_count, device
 ):
-    neighbour_count = max(
-        batch["neighbour_history"].shape[1] for batch in batches
+    agent_count = max(
+        batch["scene_agent_history"].shape[1] for batch in batches
     )
     chunk_count = max(
         batch["map_chunk_signal_history"].shape[1]
         for batch in batches
     )
     dot_count = max(len(batch["map_rows"]) for batch in batches)
+    target_count = max(
+        len(batch["agent_history"]) for batch in batches
+    )
     fixed_batches = [
         padded_to_fixed_shape(
-            batch, neighbour_count, chunk_count, dot_count
+            batch, agent_count, chunk_count, dot_count, target_count
         )
         for batch in batches
     ]
     with torch.no_grad():
         padding_gap = max(
             float(
-                (predictor(batch)[0] - predictor(fixed_batch)[0])
+                (
+                    predictor(batch)[0]
+                    - predictor(fixed_batch)[0][
+                        : len(batch["agent_history"])
+                    ]
+                )
                 .abs()
                 .max()
             )
@@ -165,16 +200,39 @@ def export_and_measure_bucket(
         for fixed_batch in fixed_batches
     )
     print(
-        f"{onnx_path.name}: {len(fixed_batches)} batches padded to"
-        f" {neighbour_count} neighbours, {chunk_count} map chunks,"
-        f" {dot_count} map dots"
+        f"{onnx_path.name}: {len(fixed_batches)} scenes padded to"
+        f" {target_count} predicted agents, {agent_count} scene"
+        f" agents, {chunk_count} map chunks, {dot_count} map dots"
     )
     return (
         padding_gap,
         export_gap,
-        milliseconds_per_batch(run_torch, fixed_batches),
-        milliseconds_per_batch(run_onnx, fixed_batches),
+        milliseconds_per_scene(run_torch, fixed_batches),
+        milliseconds_per_scene(run_onnx, fixed_batches),
     )
+
+
+def designated_target_scene_batches(scenario_paths):
+    for scenario_path in scenario_paths:
+        scenario_array = loader.read_scenario(scenario_path)
+        track_indices = loader.eligible_track_indices(
+            scenario_array["track_rows"],
+            scenario_array["track_valid"],
+            scenario_array["is_designated_target"],
+            True,
+        )
+        if not len(track_indices):
+            continue
+        yield {
+            name: torch.from_numpy(array)
+            for name, array in loader.build_scene_batch(
+                [
+                    loader.build_scene_sample(
+                        scenario_array, track_indices.tolist()
+                    )
+                ]
+            ).items()
+        }
 
 
 def main():
@@ -184,7 +242,6 @@ def main():
     parser.add_argument("--anchors", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--scenarios", type=int, required=True)
-    parser.add_argument("--agents-per-batch", type=int, required=True)
     parser.add_argument("--buckets", type=int, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument(
@@ -204,29 +261,17 @@ def main():
         )
     predictor.eval()
 
-    scenario_paths = sorted(arguments.staged_directory.glob("*.npz"))[
-        : arguments.scenarios
-    ]
     batches = sorted(
-        (
-            batch
-            for batch in pipeline.batches(
-                scenario_paths,
-                0,
-                arguments.agents_per_batch,
-                None,
-                0,
-                True,
-            )
-            if len(batch["agent_history"])
-            == arguments.agents_per_batch
+        designated_target_scene_batches(
+            sorted(arguments.staged_directory.glob("*.npz"))[
+                : arguments.scenarios
+            ]
         ),
-        key=lambda batch: batch["neighbour_history"].shape[1]
-        + batch["map_chunk_signal_history"].shape[1],
+        key=lambda batch: batch["token_visible"].shape[1],
     )
     assert (
         len(batches) >= arguments.buckets
-    ), f"{len(batches)} full batches cannot fill {arguments.buckets} buckets"
+    ), f"{len(batches)} scenes cannot fill {arguments.buckets} buckets"
 
     padding_gaps, export_gaps = [], []
     torch_milliseconds, onnx_milliseconds = [], []
@@ -258,8 +303,8 @@ def main():
         f"onnx differs from torch by at most {max(export_gaps):.2e} m"
     )
     print(
-        f"median per batch of {arguments.agents_per_batch} agents on"
-        f" {arguments.device}, {arguments.threads} threads:"
+        f"median per scene on {arguments.device},"
+        f" {arguments.threads} threads:"
         f" torch {statistics.median(torch_milliseconds):.1f} ms,"
         f" onnxruntime {statistics.median(onnx_milliseconds):.1f} ms"
     )

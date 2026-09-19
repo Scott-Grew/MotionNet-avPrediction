@@ -26,10 +26,10 @@ def synthetic_batch():
         "agent_history_mask": torch.ones(
             2, contract.HISTORY_STEPS, dtype=torch.bool
         ),
-        "neighbour_history": torch.randn(
+        "scene_agent_history": torch.randn(
             2, 3, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM
         ),
-        "neighbour_history_mask": torch.ones(
+        "scene_agent_history_mask": torch.ones(
             2, 3, contract.HISTORY_STEPS, dtype=torch.bool
         ),
         "agent_signal_history": torch.zeros(
@@ -37,7 +37,7 @@ def synthetic_batch():
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "neighbour_signal_history": torch.zeros(
+        "scene_agent_signal_history": torch.zeros(
             2,
             3,
             contract.HISTORY_STEPS,
@@ -51,6 +51,9 @@ def synthetic_batch():
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
+        "target_scene_index": torch.arange(2),
+        "token_visible": torch.ones(2, 3 + 4, dtype=torch.bool),
+        "token_pose": torch.randn(2, 3 + 4, 4),
         "future_positions": torch.randn(2, contract.FUTURE_STEPS, 2),
         "future_mask": torch.ones(
             2, contract.FUTURE_STEPS, dtype=torch.bool
