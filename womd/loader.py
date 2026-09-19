@@ -332,12 +332,6 @@ def build_scene_sample(scenario_array, track_indices):
                 "frame_origin": origin,
                 "frame_heading": heading,
                 "track_id": scenario_array["track_ids"][track_index],
-                "is_designated_target": scenario_array[
-                    "is_designated_target"
-                ][track_index],
-                "is_object_of_interest": scenario_array[
-                    "is_object_of_interest"
-                ][track_index],
             }
         )
     return {

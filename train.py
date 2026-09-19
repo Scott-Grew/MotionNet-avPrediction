@@ -127,7 +127,6 @@ def checkpoint_state(
     gradient_scaler,
     seed,
     completed_epochs,
-    batch_index,
 ):
     model_state = unwrapped(predictor).state_dict()
     return {
@@ -135,7 +134,6 @@ def checkpoint_state(
         "optimizer_state": optimizer.state_dict(),
         "gradient_scaler_state": gradient_scaler.state_dict(),
         "completed_epochs": completed_epochs,
-        "batch_index": batch_index,
         "seed": seed,
         "code_version": contract.STAGING_CODE_VERSION,
         "parameter_fingerprint": model.parameter_fingerprint(
@@ -358,7 +356,6 @@ def train_epoch(
                         gradient_scaler,
                         seed,
                         epoch_index,
-                        batch_count,
                     ),
                 )
             checkpoint_wait_start = time.perf_counter()
@@ -610,7 +607,6 @@ def main():
                     gradient_scaler,
                     arguments.seed,
                     epoch_index + 1,
-                    None,
                 ),
             )
         elapsed_seconds = time.perf_counter() - training_start

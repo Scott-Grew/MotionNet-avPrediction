@@ -111,10 +111,10 @@ def test_resuming_never_skips_a_completed_epoch():
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
     interrupted = train.checkpoint_state(
-        predictor, optimizer, scaler, 0, 2, 137
+        predictor, optimizer, scaler, 0, 2
     )
     finished = train.checkpoint_state(
-        predictor, optimizer, scaler, 0, 3, None
+        predictor, optimizer, scaler, 0, 3
     )
     assert list(
         train.epochs_left_to_train(interrupted["completed_epochs"], 5)
@@ -131,9 +131,7 @@ def test_checkpoint_state_round_trips_and_rejects_a_tampered_version(
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
-    state = train.checkpoint_state(
-        predictor, optimizer, scaler, 0, 1, None
-    )
+    state = train.checkpoint_state(predictor, optimizer, scaler, 0, 1)
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(state, checkpoint_path)
     reloaded_state = model.load_checkpoint_state(checkpoint_path)
