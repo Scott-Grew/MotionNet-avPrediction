@@ -56,3 +56,54 @@ Tests need no data: `./gate.sh` (45 tests). Training runs from
 in a Docker container. Waymo does not permit redistribution of their
 data, so reproducing the table requires a Waymo Open Motion Dataset
 account; `stage.py` converts their files into this repository's format.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph PREP["Data preparation, run once"]
+        RAW["Waymo scenario files"]
+        STAGE["stage.py<br/>one array file per scene"]
+        ANCHORS["fit_anchors.py<br/>54 typical destinations<br/>per road-user type"]
+        RAW --> STAGE --> ANCHORS
+    end
+
+    subgraph INPUT["Inputs for one road user, womd/loader.py"]
+        OWN["Its own past second"]
+        NEAR["Past second of the<br/>road users around it"]
+        MAP["Lane lines and road edges<br/>near it"]
+        LIGHTS["Traffic-light states<br/>over the past second"]
+    end
+
+    subgraph MODEL["Model, womd/model.py"]
+        TOKENS["One token per road user<br/>and per stretch of lane,<br/>light states added to each"]
+        ENCODER["Scene encoder<br/>6 self-attention layers"]
+        QUERIES["54 anchor queries<br/>one per typical destination"]
+        DECODER["Decoder, 6 rounds<br/>queries attend to each other,<br/>then to the scene"]
+        PATHS["Path head<br/>80 future steps per anchor,<br/>position and uncertainty"]
+        CONFIDENCE["Confidence head<br/>one score per anchor"]
+        TOKENS --> ENCODER --> DECODER
+        QUERIES --> DECODER
+        DECODER --> PATHS
+        DECODER --> CONFIDENCE
+    end
+
+    STAGE --> OWN & NEAR & MAP & LIGHTS
+    OWN & NEAR & MAP & LIGHTS --> TOKENS
+    ANCHORS --> QUERIES
+
+    subgraph TRAIN["Training, train.py"]
+        LOSS["womd/loss.py<br/>likelihood of the recorded path<br/>under the closest anchor<br/>+ cross-entropy toward that anchor"]
+    end
+
+    subgraph PREDICT["Prediction and scoring"]
+        PRUNE["submit.py<br/>rank 54 by confidence,<br/>drop near-duplicates, keep 6"]
+        SCORE["scorer.py<br/>Waymo's metric code<br/>in a Docker container"]
+        PRUNE --> SCORE
+    end
+
+    PATHS --> LOSS
+    CONFIDENCE --> LOSS
+    PATHS --> PRUNE
+    CONFIDENCE --> PRUNE
+```
