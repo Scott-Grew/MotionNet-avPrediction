@@ -1,28 +1,33 @@
+"""Training-time monitor of minADE and minFDE.
+
+It steers runs; reported numbers come only from Waymo's scorer.
+"""
 import torch
 
 from womd import contract
-from womd.model import prune_modes_batched_with_kept_count
+from womd.pruning import prune_modes_batched_with_kept_count
 
 
-# Averages per-step Euclidean distance to the ground truth over
-# valid future steps, separately for each mode.
-def mean_distance_per_mode(
-    trajectories, future_positions, future_mask
-):
-    step_distances = (
-        trajectories - future_positions.unsqueeze(1)
-    ).norm(dim=-1)
+def mean_distance_per_mode(trajectories: torch.Tensor,
+                           future_positions: torch.Tensor,
+                           future_mask: torch.Tensor) -> torch.Tensor:
+    """Averages per-step Euclidean distance to the ground truth over valid
+    future steps, separately for each mode.
+    """
+    step_errors = trajectories - future_positions.unsqueeze(1)
+    step_distances = step_errors.norm(dim=-1)
     validity = future_mask.unsqueeze(1).to(step_distances.dtype)
-    return (step_distances * validity).sum(dim=-1) / validity.sum(
-        dim=-1
-    ).clamp_min(1.0)
+    valid_step_count = validity.sum(dim=-1).clamp_min(1.0)
+    return (step_distances * validity).sum(dim=-1) / valid_step_count
 
 
-# Accumulates minADE/minFDE and mode-pruning stats across batches
-# as a training-time monitor; not the reported score.
 class MetricAccumulator:
-    # Zeroes the running sums and counts.
-    def __init__(self):
+    """Accumulates minADE/minFDE and mode-pruning stats across batches as a
+    training-time monitor; not the reported score.
+    """
+
+    def __init__(self) -> None:
+        """Zeroes the running sums and counts."""
         self.ade_sum = 0.0
         self.ade_count = 0
         self.fde_sum = 0.0
@@ -31,75 +36,55 @@ class MetricAccumulator:
         self.backfilled_sample_count = 0
         self.sample_count = 0
 
-    # Prunes to the kept modes, then folds this batch's minADE,
-    # minFDE and mode-pruning counts into the running totals.
-    def update(
-        self,
-        trajectories,
-        confidence_logits,
-        future_positions,
-        future_mask,
-    ):
-        kept_trajectories, _, kept_mode_count = (
-            prune_modes_batched_with_kept_count(
-                trajectories, confidence_logits
-            )
-        )
-        distances = (
-            kept_trajectories - future_positions.unsqueeze(1)
-        ).norm(dim=-1)
-        valid_steps = future_mask.unsqueeze(1)
+    def update(self, trajectories: torch.Tensor,
+               confidence_logits: torch.Tensor, future_positions: torch.Tensor,
+               future_mask: torch.Tensor) -> None:
+        """Prunes to the kept modes, then folds this batch's minADE, minFDE and
+        mode-pruning counts into the running totals.
+        """
+        pruned = prune_modes_batched_with_kept_count(trajectories,
+                                                     confidence_logits)
+        kept_trajectories, _, kept_mode_count = pruned
+
+        step_errors = kept_trajectories - future_positions.unsqueeze(1)
+        distances = step_errors.norm(dim=-1)
         # Zeros invalid steps before summing so they don't bias
         # the per-mode average distance.
-        summed = torch.where(
-            valid_steps, distances, torch.zeros_like(distances)
-        ).sum(dim=-1)
-        average_distances = summed / future_mask.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1)
+        valid_steps = future_mask.unsqueeze(1)
+        valid_distances = torch.where(valid_steps, distances,
+                                      torch.zeros_like(distances))
+        valid_step_count = future_mask.sum(dim=-1, keepdim=True)
+        valid_step_count = valid_step_count.clamp_min(1)
+        average_distances = valid_distances.sum(dim=-1) / valid_step_count
 
         has_any_valid_step = future_mask.any(dim=-1)
-        self.ade_sum += (
-            average_distances.min(dim=-1).values * has_any_valid_step
-        ).sum()
+        best_average_distance = average_distances.min(dim=-1).values
+        self.ade_sum += (best_average_distance * has_any_valid_step).sum()
         self.ade_count += has_any_valid_step.sum()
 
         final_step_valid = future_mask[:, -1]
-        self.fde_sum += (
-            distances[:, :, -1].min(dim=-1).values * final_step_valid
-        ).sum()
+        best_final_distance = distances[:, :, -1].min(dim=-1).values
+        self.fde_sum += (best_final_distance * final_step_valid).sum()
         self.fde_count += final_step_valid.sum()
 
+        was_backfilled = kept_mode_count < contract.NUM_PREDICTED_MODES
         self.kept_mode_sum += kept_mode_count.sum()
-        self.backfilled_sample_count += (
-            kept_mode_count < contract.NUM_PREDICTED_MODES
-        ).sum()
+        self.backfilled_sample_count += was_backfilled.sum()
         self.sample_count += confidence_logits.shape[0]
 
-    # Returns the accumulated metrics as plain floats, or nan for
-    # any that never saw a valid sample.
-    def results(self):
+    @staticmethod
+    def mean_or_nan(running_sum: torch.Tensor | float,
+                    count: torch.Tensor | int) -> float:
+        """A running sum over its count, or nan when nothing was counted."""
+        return float(running_sum / count) if count else float("nan")
+
+    def results(self) -> dict[str, float]:
+        """Returns the accumulated metrics as plain floats."""
+        backfilled = self.backfilled_sample_count
         return {
-            "min_ade": (
-                float(self.ade_sum / self.ade_count)
-                if self.ade_count
-                else float("nan")
-            ),
-            "min_fde": (
-                float(self.fde_sum / self.fde_count)
-                if self.fde_count
-                else float("nan")
-            ),
-            "mean_kept_modes": (
-                float(self.kept_mode_sum / self.sample_count)
-                if self.sample_count
-                else float("nan")
-            ),
-            "backfill_rate": (
-                float(
-                    self.backfilled_sample_count / self.sample_count
-                )
-                if self.sample_count
-                else float("nan")
-            ),
+            "min_ade": self.mean_or_nan(self.ade_sum, self.ade_count),
+            "min_fde": self.mean_or_nan(self.fde_sum, self.fde_count),
+            "mean_kept_modes": self.mean_or_nan(self.kept_mode_sum,
+                                                self.sample_count),
+            "backfill_rate": self.mean_or_nan(backfilled, self.sample_count),
         }

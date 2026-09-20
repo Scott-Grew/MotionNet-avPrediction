@@ -32,12 +32,8 @@ def build_fixture_scenario(scenario_id):
     scenario.scenario_id = scenario_id
     scenario.current_time_index = contract.CURRENT_STEP_INDEX
     scenario.sdc_track_index = 0
-    add_track(
-        scenario, 100, scenario_pb2.Track.TYPE_VEHICLE, 0.0, 0.0
-    )
-    add_track(
-        scenario, 200, scenario_pb2.Track.TYPE_PEDESTRIAN, 5.0, 5.0
-    )
+    add_track(scenario, 100, scenario_pb2.Track.TYPE_VEHICLE, 0.0, 0.0)
+    add_track(scenario, 200, scenario_pb2.Track.TYPE_PEDESTRIAN, 5.0, 5.0)
     add_track(scenario, 300, scenario_pb2.Track.TYPE_OTHER, -5.0, 2.0)
     scenario.tracks_to_predict.add().track_index = 1
     scenario.objects_of_interest.append(300)
@@ -97,9 +93,7 @@ def build_fixture_scenario(scenario_id):
 def write_shard(shard_path, scenarios):
     with open(shard_path, "wb") as stream:
         for scenario in scenarios:
-            tfrecord.write_record(
-                stream, scenario.SerializeToString()
-            )
+            tfrecord.write_record(stream, scenario.SerializeToString())
 
 
 def stage_fixture(tmp_path):
@@ -107,9 +101,7 @@ def stage_fixture(tmp_path):
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
-    written_paths, _ = stage.stage_shards(
-        [shard_path], output_directory
-    )
+    written_paths, _ = stage.stage_shards([shard_path], output_directory)
     return np.load(written_paths[0])
 
 
@@ -124,8 +116,7 @@ def staged_structure(scenario_file):
         key: {
             "shape": list(scenario_file[key].shape),
             "dtype": pinned_dtype(scenario_file[key]),
-        }
-        for key in sorted(scenario_file.files)
+        } for key in sorted(scenario_file.files)
     }
 
 
@@ -133,17 +124,11 @@ def write_staging_pin():
     import tempfile
 
     with tempfile.TemporaryDirectory() as temporary_directory:
-        structure = staged_structure(
-            stage_fixture(Path(temporary_directory))
-        )
-    STAGING_PIN_PATH.write_text(
-        json.dumps(structure, indent=2) + "\n"
-    )
+        structure = staged_structure(stage_fixture(Path(temporary_directory)))
+    STAGING_PIN_PATH.write_text(json.dumps(structure, indent=2) + "\n")
 
 
-def test_staging_names_by_scenario_id_across_production_shards(
-    tmp_path,
-):
+def test_staging_names_files_by_scenario_id(tmp_path,):
     first_shard = tmp_path / "training.tfrecord-00000-of-01000"
     second_shard = tmp_path / "training.tfrecord-00001-of-01000"
     write_shard(
@@ -158,8 +143,7 @@ def test_staging_names_by_scenario_id_across_production_shards(
     output_directory.mkdir()
 
     written_paths, spacing_deviations = stage.stage_shards(
-        [first_shard, second_shard], output_directory
-    )
+        [first_shard, second_shard], output_directory)
 
     assert sorted(path.name for path in written_paths) == [
         "aaa111.npz",
@@ -170,7 +154,7 @@ def test_staging_names_by_scenario_id_across_production_shards(
     assert len(spacing_deviations) == len(written_paths)
 
 
-def test_collision_guard_dies_on_duplicate_scenario_ids(tmp_path):
+def test_duplicate_scenario_ids_are_refused(tmp_path):
     first_shard = tmp_path / "training.tfrecord-00000-of-01000"
     second_shard = tmp_path / "training.tfrecord-00001-of-01000"
     write_shard(first_shard, [build_fixture_scenario("same0001")])
@@ -179,9 +163,7 @@ def test_collision_guard_dies_on_duplicate_scenario_ids(tmp_path):
     output_directory.mkdir()
 
     with pytest.raises(AssertionError):
-        stage.stage_shards(
-            [first_shard, second_shard], output_directory
-        )
+        stage.stage_shards([first_shard, second_shard], output_directory)
 
 
 def test_staged_structure_matches_pin(tmp_path):

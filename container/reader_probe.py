@@ -1,14 +1,21 @@
+"""Decodes one shard with either our reader and protos or Waymo's and prints it
+as JSON, so runner.py can compare the two.
+"""
 import argparse
 import json
-import sys
 from pathlib import Path
+import sys
+from typing import Any
 
+# Map feature kinds whose points form a closed polygon rather
+# than an open polyline.
 MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
 
 
-# Extracts one track state's fields into a plain list so it can
-# be compared across two different proto implementations.
-def track_state_row(state):
+def track_state_row(state: Any) -> list[float]:
+    """Extracts one track state's fields into a plain list so it can be compared
+    across two different proto implementations.
+    """
     return [
         bool(state.valid),
         float(state.center_x),
@@ -21,9 +28,10 @@ def track_state_row(state):
     ]
 
 
-# Reads one map feature's kind and points from whichever oneof
-# field is set: a single point, a polygon, or a polyline.
-def map_feature_points(feature):
+def map_feature_points(feature: Any) -> tuple[str, list[list[float]]] | None:
+    """Reads one map feature's kind and points from whichever oneof field is
+    set: a single point, a polygon, or a polyline.
+    """
     kind = feature.WhichOneof("feature_data")
     if kind is None:
         return None
@@ -33,24 +41,18 @@ def map_feature_points(feature):
         raw_points = list(getattr(feature, kind).polygon)
     else:
         raw_points = list(getattr(feature, kind).polyline)
-    return kind, [
-        [float(point.x), float(point.y)] for point in raw_points
-    ]
+    return kind, [[float(point.x), float(point.y)] for point in raw_points]
 
 
-# Flattens one decoded scenario proto into plain nested dicts and
-# lists, so it can be JSON-encoded and diffed field by field.
-def extract_scenario_fields(scenario):
-    tracks = [
-        {
-            "id": int(track.id),
-            "object_type": int(track.object_type),
-            "states": [
-                track_state_row(state) for state in track.states
-            ],
-        }
-        for track in scenario.tracks
-    ]
+def extract_scenario_fields(scenario: Any) -> dict[str, Any]:
+    """Flattens one decoded scenario proto into plain nested dicts and lists, so
+    it can be JSON-encoded and diffed field by field.
+    """
+    tracks = [{
+        "id": int(track.id),
+        "object_type": int(track.object_type),
+        "states": [track_state_row(state) for state in track.states],
+    } for track in scenario.tracks]
 
     map_features = []
     for feature in scenario.map_features:
@@ -58,9 +60,11 @@ def extract_scenario_fields(scenario):
         if extracted is None:
             continue
         kind, points = extracted
-        map_features.append(
-            {"id": int(feature.id), "kind": kind, "points": points}
-        )
+        map_features.append({
+            "id": int(feature.id),
+            "kind": kind,
+            "points": points
+        })
 
     return {
         "scenario_id": scenario.scenario_id,
@@ -74,30 +78,30 @@ def extract_scenario_fields(scenario):
     }
 
 
-# Decodes the first sample_count records of a shard with this
-# repo's tfrecord reader and scenario_pb2, for comparison.
-def extract_ours(shard_path, sample_count):
+def extract_ours(shard_path: Path | str,
+                 sample_count: int) -> list[dict[str, Any]]:
+    """Decodes the first sample_count records of a shard with this repo's
+    tfrecord reader and scenario_pb2, for comparison.
+    """
     from womd import tfrecord
     from womd_protos import scenario_pb2
 
     extracted_scenarios = []
     with open(shard_path, "rb") as stream:
-        for payload in tfrecord.read_records(
-            stream, verify_checksums=True
-        ):
+        for payload in tfrecord.read_records(stream, verify_checksums=True):
             if len(extracted_scenarios) >= sample_count:
                 break
             scenario = scenario_pb2.Scenario()
             scenario.ParseFromString(payload)
-            extracted_scenarios.append(
-                extract_scenario_fields(scenario)
-            )
+            extracted_scenarios.append(extract_scenario_fields(scenario))
     return extracted_scenarios
 
 
-# Decodes the first sample_count records of a shard with Waymo's
-# own installed scenario_pb2, for comparison against ours.
-def extract_theirs(shard_path, sample_count):
+def extract_theirs(shard_path: Path | str,
+                   sample_count: int) -> list[dict[str, Any]]:
+    """Decodes the first sample_count records of a shard with Waymo's own
+    installed scenario_pb2, for comparison against ours.
+    """
     import tensorflow as tf
     from waymo_open_dataset.protos import scenario_pb2
 
@@ -111,25 +115,22 @@ def extract_theirs(shard_path, sample_count):
     return extracted_scenarios
 
 
-# Decodes a shard with this repo's protos or Waymo's (--role) and
-# prints the scenarios as JSON for the caller to compare.
-def main():
+def main() -> None:
+    """Decodes a shard with this repo's protos or Waymo's (--role) and prints
+    the scenarios as JSON for the caller to compare.
+    """
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--role", choices=("ours", "theirs"), required=True
-    )
+    parser.add_argument("--role", choices=("ours", "theirs"), required=True)
     parser.add_argument("--shard-path", type=Path, required=True)
     parser.add_argument("--sample-count", type=int, required=True)
     arguments = parser.parse_args()
 
     if arguments.role == "ours":
-        extracted_scenarios = extract_ours(
-            arguments.shard_path, arguments.sample_count
-        )
+        extracted_scenarios = extract_ours(arguments.shard_path,
+                                           arguments.sample_count)
     else:
-        extracted_scenarios = extract_theirs(
-            arguments.shard_path, arguments.sample_count
-        )
+        extracted_scenarios = extract_theirs(arguments.shard_path,
+                                             arguments.sample_count)
 
     json.dump(extracted_scenarios, sys.stdout)
 

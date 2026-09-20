@@ -5,19 +5,21 @@ will move next, from recorded autonomous-driving data.
 
 A Waymo car records the scene around it: where each road user has been
 for the past second, the lane lines, the state of the traffic lights.
-From that one second, this program predicts the next eight — six
+From that one second, this program predicts the next eight: six
 possible paths per road user, each with a confidence. A car approaching
 a junction may turn or continue straight, and a single prediction would
 average the two.
 
-{{DATA DERVED IMAGE TO COME}}
+{{DATA DERVED IMAGE TO COME}} 
+// Happy to hear rendering recommendaitons.
 
 ## How well it works
 
 minADE is the standard score: the average distance, in metres, between
 the recorded path and whichever of the six predictions came closest.
 Lower is better. Waymo's own scoring code produced these numbers on the
-44,097 held-out scenes of the validation split:
+44,097 held-out scenes of the validation split, and Waymo's evaluation
+server returned the same numbers for the same predictions:
 
 | minADE (m)  | 3 s  | 5 s  | 8 s  |
 |-------------|------|------|------|
@@ -30,32 +32,33 @@ holds its current speed and heading. At 8 s it scores 10.98 m for cars,
 1.55 m for pedestrians and 4.17 m for cyclists.
 
 These numbers are not comparable to the public leaderboard. This model
-trains on a quarter of the training split: 122,352 scenes, 16 epochs,
+trained on a quarter of the training split: 122,352 scenes, 16 epochs,
 two 12-hour sessions on a free Kaggle GPU.
+
+Waymo does not permit redistribution of their data, so reproducing the
+table requires a Waymo Open Motion Dataset account; `stage.py` converts
+their files into this repository's format.
 
 ## How it works
 
 1. Waymo's files are unpacked by this repository's reader and reduced
-   to numeric arrays, one file per scene. The reader is checked
-   byte-for-byte against Waymo's.
-2. Before training, the endpoints of every training path are clustered
+   to numeric arrays, one file per scene. (`stage.py`,
+   `womd/tfrecord.py`, `womd/store.py`)
+2. Before training, the endpoints of the training paths are clustered
    into 54 typical destinations per road-user type: straight and far,
-   gentle left, hard right. These are the anchors.
+   gentle left, hard right. These are the anchors. (`fit_anchors.py`)
 3. A transformer encodes the scene and, for each anchor, adjusts that
    anchor's path to fit it. A second head scores how likely each anchor
    is. The loss is the paper's (MultiPath, Chai et al. 2019): each
    training example trains the path of the anchor closest to the
    recorded path, and trains the confidence toward that same anchor.
+   (`womd/model.py`, `womd/loss.py`, `train.py`)
 4. At prediction time the 54 are ranked by confidence, near-duplicates
-   are dropped, and the six highest are kept.
+   are dropped, and the six highest are kept. (`womd/pruning.py`,
+   `submit.py`)
 
-## Run it
-
-Tests need no data: `./gate.sh` (45 tests). Training runs from
-`train.py`, scoring from `scorer.py`, which drives Waymo's metric code
-in a Docker container. Waymo does not permit redistribution of their
-data, so reproducing the table requires a Waymo Open Motion Dataset
-account; `stage.py` converts their files into this repository's format.
+The exact inputs the model reads are drawn, column by column, at the
+bottom of `womd/loader.py`.
 
 ## Architecture
 

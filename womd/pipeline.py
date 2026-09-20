@@ -1,3 +1,9 @@
+"""Streams loader samples into training batches through a shuffled multi-worker
+DataLoader.
+"""
+from pathlib import Path
+from typing import Any, Iterator
+
 import numpy as np
 import torch
 from torch.utils.data import (
@@ -9,31 +15,29 @@ from torch.utils.data import (
 from womd import loader
 
 
-# Streams per-agent training samples, splitting scenario files
-# across DataLoader workers.
 class ScenarioSampleStream(IterableDataset):
-    # Stores the scenario paths, seed and target-filtering flag.
-    def __init__(self, scenario_paths, seed, designated_targets_only):
+    """Streams per-agent training samples, splitting scenario files across
+    DataLoader workers.
+    """
+
+    def __init__(self, scenario_paths: list[Path], seed: int,
+                 designated_targets_only: bool) -> None:
+        """Stores the scenario paths, seed and target-filtering flag."""
         self.scenario_paths = scenario_paths
         self.seed = seed
         self.designated_targets_only = designated_targets_only
 
-    # For this worker's scenario slice, shuffles scenarios and
-    # each one's eligible tracks with a per-worker seeded generator.
-    def __iter__(self):
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """For this worker's scenario slice, shuffles scenarios and each one's
+        eligible tracks with a per-worker seeded generator.
+        """
         worker_info = get_worker_info()
         worker_index = worker_info.id if worker_info else 0
         worker_count = worker_info.num_workers if worker_info else 1
         worker_paths = self.scenario_paths[worker_index::worker_count]
-        random_generator = np.random.default_rng(
-            self.seed + worker_index
-        )
-        for scenario_index in random_generator.permutation(
-            len(worker_paths)
-        ):
-            scenario_arrays = loader.read_scenario(
-                worker_paths[scenario_index]
-            )
+        random_generator = np.random.default_rng(self.seed + worker_index)
+        for scenario_index in random_generator.permutation(len(worker_paths)):
+            scenario_arrays = loader.read_scenario(worker_paths[scenario_index])
             sample_track_indices = loader.eligible_track_indices(
                 scenario_arrays["track_rows"],
                 scenario_arrays["track_valid"],
@@ -41,80 +45,29 @@ class ScenarioSampleStream(IterableDataset):
                 self.designated_targets_only,
             )
             for track_index in random_generator.permutation(
-                sample_track_indices
-            ):
-                yield loader.build_sample(
-                    scenario_arrays, int(track_index)
-                )
+                    sample_track_indices):
+                yield loader.build_sample(scenario_arrays, int(track_index))
 
 
-# Builds a batch from build_batch and converts its numpy
-# arrays to torch tensors.
-def collate_samples(samples):
+def collate_samples(samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    """Builds a batch from build_batch and converts its numpy arrays to torch
+    tensors.
+    """
     batch = loader.build_batch(samples)
-    return {
-        name: torch.from_numpy(array) for name, array in batch.items()
-    }
+    return {name: torch.from_numpy(array) for name, array in batch.items()}
 
 
-# Yields (scenario_array, track_index, sample) batches over
-# every staged scenario, in file or requested order.
-def track_sample_batches(
-    staged_directory,
-    batch_size,
-    designated_targets_only,
-    scenario_order=None,
-):
-    scenario_paths = sorted(staged_directory.glob("*.npz"))
-    if scenario_order is not None:
-        scenario_paths = [
-            scenario_paths[scenario_index]
-            for scenario_index in scenario_order
-        ]
-    batch = []
-    for scenario_path in scenario_paths:
-        scenario_array = loader.read_scenario(scenario_path)
-        for track_index in loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
-            designated_targets_only,
-        ):
-            track_index = int(track_index)
-            batch.append(
-                (
-                    scenario_array,
-                    track_index,
-                    loader.build_sample(scenario_array, track_index),
-                )
-            )
-            if len(batch) < batch_size:
-                continue
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-# Wraps ScenarioSampleStream in a DataLoader with the given
-# worker count, batch size, and prefetching.
-def batches(
-    scenario_paths,
-    worker_count,
-    batch_size,
-    prefetch_batches,
-    seed,
-    designated_targets_only,
-):
+def batches(scenario_paths: list[Path], worker_count: int, batch_size: int,
+            prefetch_batches: int, seed: int,
+            designated_targets_only: bool) -> DataLoader:
+    """Wraps ScenarioSampleStream in a DataLoader with the given worker count,
+    batch size, and prefetching.
+    """
     return DataLoader(
-        ScenarioSampleStream(
-            scenario_paths, seed, designated_targets_only
-        ),
+        ScenarioSampleStream(scenario_paths, seed, designated_targets_only),
         batch_size=batch_size,
         num_workers=worker_count,
         collate_fn=collate_samples,
-        prefetch_factor=(
-            prefetch_batches if worker_count > 0 else None
-        ),
+        prefetch_factor=(prefetch_batches if worker_count > 0 else None),
         pin_memory=torch.cuda.is_available(),
     )
