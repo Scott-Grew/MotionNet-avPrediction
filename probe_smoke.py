@@ -1,6 +1,8 @@
 """A few training batches as a smoke test: stops on non-finite losses or on the
 modes all collapsing to one endpoint.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 import math

@@ -1,6 +1,8 @@
 """Decodes one shard with either our reader and protos or Waymo's and prints it
 as JSON, so runner.py can compare the two.
 """
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path

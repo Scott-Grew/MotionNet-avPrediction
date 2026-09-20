@@ -1,6 +1,8 @@
 """Loads checkpoints and anchor files, refusing any artifact the current code
 version did not produce.
 """
+from __future__ import annotations
+
 import hashlib
 from pathlib import Path
 from typing import Any

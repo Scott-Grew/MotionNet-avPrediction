@@ -3,6 +3,8 @@
 Host-side driver: writes predictions, then runs Waymo's own metrics inside a
 linux/amd64 Docker container.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 import subprocess

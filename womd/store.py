@@ -1,6 +1,8 @@
 """Turns one Waymo Scenario proto into staged arrays: agent tracks, map dots one
 metre apart, traffic-light histories.
 """
+from __future__ import annotations
+
 from collections import namedtuple
 from pathlib import Path
 

@@ -1,6 +1,8 @@
 """Runs inside the container: feeds predictions and ground truth to Waymo's
 metrics op, and checks our protos against theirs.
 """
+from __future__ import annotations
+
 import argparse
 import importlib.metadata
 import json

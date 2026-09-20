@@ -1,0 +1,5 @@
+torch==2.2.2
+numpy==1.26.4
+protobuf==4.25.9
+grpcio-tools==1.62.3
+pytest==9.0.3

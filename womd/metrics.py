@@ -2,6 +2,8 @@
 
 It steers runs; reported numbers come only from Waymo's scorer.
 """
+from __future__ import annotations
+
 import torch
 
 from womd import contract

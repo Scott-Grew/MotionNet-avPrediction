@@ -3,6 +3,8 @@
 Trains the model on staged scenarios; resumable, with a time budget so a session
 stops cleanly.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 from collections import namedtuple

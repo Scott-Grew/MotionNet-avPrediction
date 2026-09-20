@@ -1,6 +1,8 @@
 """The two loss terms: Gaussian likelihood of the assigned anchor's path, and
 cross-entropy over which anchor that was.
 """
+from __future__ import annotations
+
 import math
 
 import torch

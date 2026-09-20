@@ -1,6 +1,8 @@
 """Checks run before a Kaggle session: the mounted code matches this working
 copy, and no credential file is present.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import sys
 from pathlib import Path

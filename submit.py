@@ -3,6 +3,8 @@
 Runs a trained model over staged scenarios and writes 6 world-frame futures per
 designated target.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 from pathlib import Path

@@ -3,6 +3,8 @@
 Clusters where training agents ended up after 8 s into 54 anchor endpoints per
 object type.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 import math

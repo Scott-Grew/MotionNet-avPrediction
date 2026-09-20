@@ -10,11 +10,11 @@ assert ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT == QUERY_COUNT
 
 
 def unit_anchor_offsets():
-    # Direction repeats slowest, distance fastest, so the flat
-    # index matches ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT.
     """Builds the 54 unit-length anchor endpoints as a grid of 9 directions by 6
     distance fractions.
     """
+    # Direction repeats slowest, distance fastest, so the flat
+    # index matches ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT.
     direction_indices = torch.arange(ANCHOR_DIRECTION_COUNT).repeat_interleave(
         ANCHOR_DISTANCE_COUNT)
     distance_indices = torch.arange(ANCHOR_DISTANCE_COUNT).repeat(

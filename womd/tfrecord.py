@@ -1,6 +1,8 @@
 """Reads and writes TFRecord framing, with its CRC-32C checks, and parses each
 record into a Scenario proto.
 """
+from __future__ import annotations
+
 from pathlib import Path
 import struct
 from typing import Any, BinaryIO, Iterator

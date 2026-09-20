@@ -1,6 +1,8 @@
 """Turns a staged scenario into model inputs, one sample per predicted agent, in
 that agent's frame. Layout drawn at the end.
 """
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any
 

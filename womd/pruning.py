@@ -1,6 +1,8 @@
 """Cuts the model's 54 futures to the 6 Waymo scores and moves the dropped
 futures' probability onto the kept ones.
 """
+from __future__ import annotations
+
 import torch
 
 from womd import contract

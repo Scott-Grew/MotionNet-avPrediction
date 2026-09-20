@@ -3,10 +3,13 @@
 Each function takes a frame's origin and heading as measured in the frame the
 points are in now. The three frames are drawn at the end of this file.
 """
+from __future__ import annotations
+
 import numpy as np
 
 
-def rotation_matrix(heading: float, dtype: type = np.float64) -> np.ndarray:
+def rotation_matrix(heading: float,
+                    dtype: np.dtype | type = np.float64) -> np.ndarray:
     """2D rotation matrix for the given heading angle, in radians."""
     cosine, sine = np.cos(heading), np.sin(heading)
     return np.array([[cosine, -sine], [sine, cosine]], dtype=dtype)

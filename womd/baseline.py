@@ -1,6 +1,8 @@
 """Physics baselines in the model's output shape, so they pass through the same
 submission and scoring path as the model.
 """
+from __future__ import annotations
+
 import math
 
 import torch

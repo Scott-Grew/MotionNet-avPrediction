@@ -3,6 +3,8 @@
 Reads raw Waymo shards and writes one .npz per scenario, in the scene frame, for
 the later steps to read.
 """
+from __future__ import annotations
+
 import womd.runtime_env
 import argparse
 from pathlib import Path

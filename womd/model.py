@@ -1,6 +1,8 @@
 """The network: the agent, its neighbours and the map become tokens, self-
 attend, then 54 anchored futures are decoded.
 """
+from __future__ import annotations
+
 from collections import namedtuple
 
 import torch
