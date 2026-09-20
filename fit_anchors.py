@@ -10,9 +10,7 @@ from sklearn.cluster import KMeans
 
 from womd import contract, loader, model
 
-MAXIMUM_ITERATIONS = 2000
 RANDOM_STATE_SEED = 0
-RESTART_COUNT = 10
 
 
 # Collects each target's last valid future position (agent frame,
@@ -60,18 +58,13 @@ def endpoints_per_centre(assignment, centre_count):
 # endpoint's assigned centre, and whether the fit converged.
 def fit_unit_anchors(endpoints, centre_count=model.QUERY_COUNT):
     fitted = KMeans(
-        n_clusters=centre_count,
-        init="k-means++",
-        n_init=RESTART_COUNT,
-        max_iter=MAXIMUM_ITERATIONS,
-        tol=0.0,
-        random_state=RANDOM_STATE_SEED,
+        n_clusters=centre_count, random_state=RANDOM_STATE_SEED
     ).fit(endpoints.numpy())
     return (
         torch.from_numpy(fitted.cluster_centers_).to(endpoints.dtype),
         torch.from_numpy(fitted.labels_).to(torch.long),
         fitted.n_iter_,
-        fitted.n_iter_ < MAXIMUM_ITERATIONS,
+        fitted.n_iter_ < fitted.max_iter,
     )
 
 
@@ -95,7 +88,7 @@ def print_one_type(
     print(
         f"{type_name} | samples {type_sample_count} | {len(fitted_anchors)} anchors |"
         f" k-means ran {iteration_count} iterations, stopped by "
-        f"{'an unchanged assignment' if stopped_by_convergence else f'the {MAXIMUM_ITERATIONS} iteration cap'}"
+        f"{'convergence' if stopped_by_convergence else 'the iteration cap'}"
     )
     print(
         f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}{'angle deg':>11}{'share':>9}"
