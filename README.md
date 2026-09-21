@@ -12,25 +12,26 @@ average the two.
 
 ## Results
 
-minADE is the standard score: the average distance, in metres, between
-the recorded path and whichever of the six predictions came closest.
-Lower is better. Waymo's own scoring code produced these numbers on the
-44,097 held-out scenes of the validation split, and Waymo's evaluation
-server returned the same numbers for the same predictions:
+minADE: the mean distance, in metres, between the recorded path and the
+closest of the six predictions. Lower is better.
 
-| minADE (m)  | 3 s  | 5 s  | 8 s  |
-|-------------|------|------|------|
-| cars        | 0.36 | 0.77 | 1.49 |
-| pedestrians | 0.19 | 0.37 | 0.65 |
-| cyclists    | 0.38 | 0.73 | 1.30 |
+| minADE (m)                | 3 s  | 5 s  | 8 s   |
+|---------------------------|------|------|-------|
+| cars, validation          | 0.36 | 0.77 | 1.49  |
+| cars, test                | 0.36 | 0.77 | 1.49  |
+| cars, control             | 2.33 | 5.47 | 10.98 |
+| pedestrians, validation   | 0.19 | 0.37 | 0.65  |
+| pedestrians, test         | 0.19 | 0.37 | 0.65  |
+| pedestrians, control      | 0.47 | 0.89 | 1.55  |
+| cyclists, validation      | 0.38 | 0.73 | 1.30  |
+| cyclists, test            | 0.37 | 0.73 | 1.31  |
+| cyclists, control         | 1.14 | 2.26 | 4.17  |
 
-The control, scored through the same code, assumes every road user
-holds its current speed and heading. At 8 s it scores 10.98 m for cars,
-1.55 m for pedestrians and 4.17 m for cyclists.
-
-These numbers are not comparable to the public leaderboard. This model
-trained on a quarter of the training split: 122,352 scenes, 16 epochs,
-two 12-hour sessions on a free Kaggle GPU.
+Validation: 44,097 scenes, scored by Waymo's metric code and confirmed
+by Waymo's evaluation server. Test: 44,920 scenes, graded by the server
+only. Control: constant speed and heading. Training: a quarter of the
+training split, 122,352 scenes, 16 epochs, two 12-hour sessions on a
+free Kaggle GPU. Not comparable to the public leaderboard.
 
 ## Method
 
