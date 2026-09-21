@@ -1,72 +1,65 @@
 # MotionNet
 
-A Python program that predicts where cars, bikes and people are about to
-go in self-driving car data.
+A Python program that predicts where cars, cyclists and pedestrians
+will move next, from recorded autonomous-driving data.
 
-A Waymo car records everything around it: where each road user has been
-for the last second, the lane lines, the traffic lights. Given that one
-second, this program predicts the next eight — six possible paths per
-road user, each with a confidence, because a car rolling up to a
-junction might turn or might not, and a single guess would just split
-the difference.
+A Waymo car records the scene around it: where each road user has been
+for the past second, the lane lines, the state of the traffic lights.
+From that one second, this program predicts the next eight: six
+possible paths per road user, each with a confidence. A car approaching
+a junction may turn or continue straight, and a single prediction would
+average the two.
 
-{{DATA DERVED IMAGE TO COME}}
-
-*The red car is being predicted. White dashes are where it actually
-went. The cyan lines are the six predictions — brighter means more
-confident. The model never saw this scene in training.*
+{{DATA DERVED IMAGE TO COME}} 
+// Happy to hear rendering recommendaitons.
 
 ## How well it works
 
-minADE is the standard score: how far the closest of the six predictions
-is from the truth, on average, in metres. Lower is better. Waymo's own
-scoring code produced these numbers on the {{SCENE_COUNT}} held-out
-scenes of the validation split:
+minADE is the standard score: the average distance, in metres, between
+the recorded path and whichever of the six predictions came closest.
+Lower is better. Waymo's own scoring code produced these numbers on the
+44,097 held-out scenes of the validation split, and Waymo's evaluation
+server returned the same numbers for the same predictions:
 
-| minADE (m)  | 3 s | 5 s | 8 s |
-|-------------|-----|-----|-----|
-| cars        | {{VEH_3S}} | {{VEH_5S}} | {{VEH_8S}} |
-| pedestrians | {{PED_3S}} | {{PED_5S}} | {{PED_8S}} |
-| cyclists    | {{CYC_3S}} | {{CYC_5S}} | {{CYC_8S}} |
+| minADE (m)  | 3 s  | 5 s  | 8 s  |
+|-------------|------|------|------|
+| cars        | 0.36 | 0.79 | 1.55 |
+| pedestrians | 0.19 | 0.37 | 0.64 |
+| cyclists    | 0.38 | 0.73 | 1.32 |
 
-The control, scored through the same code: assume everyone keeps their
-current speed and direction. It scores {{CV_8S}} at 8 s. The gap between
-that and the table is what the model learned.
+The control, scored through the same code, assumes every road user
+holds its current speed and heading. At 8 s it scores 10.98 m for cars,
+1.55 m for pedestrians and 4.17 m for cyclists.
 
-These numbers can't be compared to the public leaderboard. Those models
-are around twenty times bigger, train on all the data, and score around
-1 m at 8 s. This one trains on a quarter of the training split — 122,352
-scenes, 16 epochs, two 12-hour sessions on a free Kaggle GPU.
+These numbers are not comparable to the public leaderboard. This model
+trained on a quarter of the training split: 122,352 scenes, 16 epochs,
+two 12-hour sessions on a free Kaggle GPU.
+
+Waymo does not permit redistribution of their data, so reproducing the
+table requires a Waymo Open Motion Dataset account; `stage.py` converts
+their files into this repository's format.
 
 ## How it works
 
-1. Waymo's files are unpacked by this repo's own reader and boiled down
-   to plain number arrays: one file per scene. The reader is checked
-   byte-for-byte against Waymo's, so the data going in is provably the
-   data they publish.
-2. Before training, the endpoints of every training path are clustered
-   into 54 typical destinations per road-user type — straight and far,
-   gentle left, hard right, and so on. These are the anchors.
-3. A transformer reads the scene and, for each anchor, bends a path
-   toward what the scene says. A second head scores how likely each
-   anchor is. The loss is the paper's (MultiPath, Chai et al. 2019):
-   each training example teaches the path of the anchor its true path
-   matches, and teaches the confidence to point at that anchor.
+1. Waymo's files are unpacked by this repository's reader and reduced
+   to numeric arrays, one file per scene. (`stage.py`,
+   `womd/tfrecord.py`, `womd/store.py`)
+2. Before training, the endpoints of the training paths are clustered
+   into 54 typical destinations per road-user type: straight and far,
+   gentle left, hard right. These are the anchors. (`fit_anchors.py`)
+3. A transformer encodes the scene and, for each anchor, adjusts that
+   anchor's path to fit it. A second head scores how likely each anchor
+   is. The loss is the paper's (MultiPath, Chai et al. 2019): each
+   training example trains the path of the anchor closest to the
+   recorded path, and trains the confidence toward that same anchor.
+   (`womd/model.py`, `womd/loss.py`, `train.py`)
 4. At prediction time the 54 are ranked by confidence, near-duplicates
-   are dropped, and the best six survive.
+   are dropped, and the six highest are kept. (`womd/pruning.py`,
+   `submit.py`)
 
-Every constant in training was set from a measurement on this model,
-not a convention: the gradient clip from the measured size of updates,
-the learning rate from a sweep, the anchor rule from counting which
-choice groups real paths better. When the confidence head silently
-learned to ignore the scene mid-project, an eight-example probe on a
-laptop reproduced the failure in minutes and proved the fix before any
-GPU time was spent.
+The exact inputs the model reads are drawn, column by column, at the
+bottom of `womd/loader.py`.
 
-## Run it
+## Architecture
 
-Tests need no data: `./gate.sh` (45 tests, a few seconds). Training runs
-from `train.py`, scoring from `scorer.py`, which drives Waymo's metric
-code in a Docker container. Waymo doesn't allow their data to be
-shared, so reproducing the table needs a Waymo Open Motion Dataset
-account; `stage.py` turns their files into this repo's format.
+![Architecture flowchart](architecture.png)
