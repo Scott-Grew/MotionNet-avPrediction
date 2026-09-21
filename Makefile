@@ -24,9 +24,9 @@ STOP_AFTER_SECONDS ?= 42000
 PROTO_CHECK_SCENARIOS ?= 100
 
 EXPORT_DEVICE ?= cpu
-EXPORT_SCENARIOS ?=
-EXPORT_BUCKETS ?=
-EXPORT_THREADS ?=
+EXPORT_SCENARIOS ?= 287
+EXPORT_BUCKETS ?= 4
+EXPORT_THREADS ?= 4
 
 .DEFAULT_GOAL := help
 .PHONY: help install protos test stage anchors train predict baseline \
@@ -94,9 +94,6 @@ check-protos: ## compare our protos with Waymo's, in Docker
 		$(PROTO_CHECK_SCENARIOS)
 
 export: ## export to ONNX, check it against torch, time both
-	@test -n "$(EXPORT_SCENARIOS)" -a -n "$(EXPORT_BUCKETS)" \
-		-a -n "$(EXPORT_THREADS)" || { echo "set EXPORT_SCENARIOS," \
-		"EXPORT_BUCKETS and EXPORT_THREADS"; exit 1; }
 	$(PYTHON) export_onnx.py $(STAGED) $(ONNX) --anchors $(ANCHORS) \
 		--checkpoint $(CHECKPOINT) --scenarios $(EXPORT_SCENARIOS) \
 		--buckets $(EXPORT_BUCKETS) --threads $(EXPORT_THREADS) \
