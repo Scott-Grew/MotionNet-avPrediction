@@ -234,8 +234,9 @@ def read_scenario(scenario_path: Path | str) -> dict[str, np.ndarray]:
     return with_derived_arrays(scenario_array)
 
 
-def poses_in_frame(positions: np.ndarray, direction_cosine_sine: np.ndarray,
-                   origin: np.ndarray, heading: float) -> np.ndarray:
+def poses_in_agent_frame(positions: np.ndarray,
+                         direction_cosine_sine: np.ndarray, origin: np.ndarray,
+                         heading: float) -> np.ndarray:
     """One pose row per token, (x, y, cosine, sine), in the given agent's frame.
     """
     return np.concatenate(
@@ -339,12 +340,12 @@ def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
         "future_mask": track_valid[track_index, future],
         "agent_token_visible": agent_visible,
         "chunk_token_visible": dots_inside_per_chunk > 0,
-        "agent_token_pose": poses_in_frame(tokens.agent_positions,
-                                           tokens.agent_directions, origin,
-                                           heading),
-        "chunk_token_pose": poses_in_frame(tokens.chunk_positions,
-                                           tokens.chunk_directions, origin,
-                                           heading),
+        "agent_token_pose": poses_in_agent_frame(tokens.agent_positions,
+                                                 tokens.agent_directions,
+                                                 origin, heading),
+        "chunk_token_pose": poses_in_agent_frame(tokens.chunk_positions,
+                                                 tokens.chunk_directions,
+                                                 origin, heading),
         "frame_origin": origin,
         "frame_heading": heading,
         "track_id": scenario_array["track_ids"][track_index],
