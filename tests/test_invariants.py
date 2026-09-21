@@ -1,3 +1,6 @@
+"""One test per correctness property of the frames, staging, loader, model,
+loss, pruning, metrics and submission.
+"""
 import math
 from pathlib import Path
 
@@ -27,6 +30,7 @@ STAGED_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "staged"
 
 
 def lane_polyline_rows(first_dot_x, dot_count):
+    """Map rows for a straight lane along x with one dot per metre."""
     rows = np.zeros((dot_count, contract.MAP_FEATURE_DIM), dtype=np.float32)
     rows[:, contract.MAP_POSITION] = np.stack(
         [
@@ -45,6 +49,9 @@ def lane_polyline_rows(first_dot_x, dot_count):
 
 def synthetic_scene_batch(sample_count, scene_agent_count, polyline_count,
                           dots_per_polyline):
+    """A random scene batch of the given size, one object type per sample in
+    turn.
+    """
     agent_history = torch.randn(
         sample_count,
         contract.HISTORY_STEPS,
@@ -116,6 +123,7 @@ def synthetic_scene_batch(sample_count, scene_agent_count, polyline_count,
 
 
 def test_agent_frame_transform_inverts():
+    """Into an agent's frame and back out returns the same world positions."""
     random_generator = np.random.default_rng(3)
     world_positions = random_generator.uniform(-120.0, 120.0, size=(64, 2))
     origin = np.array([13.5, -42.25])
@@ -148,6 +156,7 @@ def test_agent_frame_x_axis_points_ahead():
 
 
 def test_heading_wrap_stays_in_range():
+    """Wrapped angles land in the half-open range from -pi to pi."""
     angles = np.array([-7.0, -np.pi, 0.0, np.pi, 7.0, 100.0])
     wrapped = frame_ops.wrap_to_pi(angles)
     assert (wrapped >= -np.pi).all() and (wrapped < np.pi).all()
@@ -240,6 +249,9 @@ def test_chunk_pooling_isolates_groups():
 
 
 def test_null_baselines_reproduce_their_motion():
+    """The constant-turn baseline retraces an arc exactly, the constant-velocity
+    one leaves it, and an invalid agent gets zeros.
+    """
     step_offsets = np.arange(-contract.CURRENT_STEP_INDEX,
                              contract.FUTURE_STEPS + 1)
     elapsed = step_offsets * baseline.TIMESTEP_SECONDS
@@ -761,6 +773,9 @@ def test_input_order_does_not_change_predictions():
 
 
 def two_lane_signal_scenario(track_count, signalled_lane_history):
+    """A staged scenario with a signalled lane under the first track and an
+    unsignalled lane 40 m away.
+    """
     signalled_lane = lane_polyline_rows(0.0, 11)
     unsignalled_lane = lane_polyline_rows(0.0, 11)
     unsignalled_lane[:, contract.MAP_POSITION.start + 1] = 40.0
@@ -805,6 +820,9 @@ def two_lane_signal_scenario(track_count, signalled_lane_history):
 
 
 def test_agents_carry_their_lane_signal_history():
+    """An agent on a signalled lane receives that lane's signal history, and the
+    encoder's output depends on it.
+    """
     signalled_lane_history = np.zeros(
         (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
         dtype=np.float32,
@@ -857,10 +875,10 @@ def test_target_prediction_ignores_batch_company():
     two_track_scenario = two_lane_signal_scenario(2, signalled_lane_history)
 
     def torch_batch(scene_samples):
+        """Scene samples joined into one batch of torch tensors."""
         scene_batch = loader.build_scene_batch(scene_samples)
         return {
-            name: torch.from_numpy(array)
-            for name, array in scene_batch.items()
+            name: torch.from_numpy(array) for name, array in scene_batch.items()
         }
 
     torch.manual_seed(53)
@@ -917,6 +935,9 @@ def test_regression_term_is_gaussian_nll():
     displacement = torch.tensor([0.3, -0.4])
 
     def regression_at(log_standard_deviation, error):
+        """The regression loss when every mode misses by error at the given log
+        standard deviation.
+        """
         trajectories = (future_positions.unsqueeze(1).expand(
             -1, model.QUERY_COUNT, -1, -1) + error)
         _, regression, _ = loss.prediction_loss(
@@ -969,6 +990,7 @@ def test_classification_term_is_cross_entropy():
 
 
 def test_masked_steps_move_no_loss():
+    """Values at masked future steps cannot change any loss component."""
     torch.manual_seed(103)
     sample_count = 4
     future_mask = torch.ones(sample_count,
@@ -985,6 +1007,7 @@ def test_masked_steps_move_no_loss():
         sample_count, -1, -1) * 40.0)
 
     def components(logged_positions, predicted_positions):
+        """The three loss components as one tensor."""
         return torch.stack(
             loss.prediction_loss(
                 predicted_positions,
@@ -1033,6 +1056,7 @@ def test_every_model_output_moves_the_loss():
     }
 
     def total(quantities):
+        """The total loss for the given model outputs."""
         (
             trajectories,
             log_standard_deviation,
@@ -1085,6 +1109,9 @@ def test_anchors_are_frozen_buffers():
 
 
 def test_training_step_runs_on_staged_scenarios(tmp_path,):
+    """One optimiser step on two real staged scenarios gives finite losses and
+    gradients. Skipped when no staged data is present.
+    """
     scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:2]
     if not scenario_paths:
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")

@@ -302,8 +302,8 @@ class EpochProgress:
             "loss/total": loss_sums["total"] / batch_count,
             "loss/regression": loss_sums["regression"] / batch_count,
             "loss/classification": loss_sums["classification"] / batch_count,
-            "loss_window/total":
-                self.window_loss_sums["total"] / LOG_EVERY_BATCHES,
+            "loss_window/total": self.window_loss_sums["total"] /
+                                 LOG_EVERY_BATCHES,
             "monitor/ade_80step": monitor["min_ade"],
             "monitor/fde_80step": monitor["min_fde"],
             "monitor_window/ade_80step": window_monitor["min_ade"],
@@ -490,8 +490,8 @@ def start_processes() -> tuple[Processes, torch.device]:
         device = torch.device("cuda", local_rank)
         torch.cuda.set_device(device)
     if count > 1:
-        distributed.init_process_group(
-            "nccl" if device.type == "cuda" else "gloo")
+        distributed.init_process_group("nccl" if device.type ==
+                                       "cuda" else "gloo")
     return Processes(count, rank, local_rank, rank == 0), device
 
 

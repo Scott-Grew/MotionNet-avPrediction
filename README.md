@@ -10,10 +10,7 @@ possible paths per road user, each with a confidence. A car approaching
 a junction may turn or continue straight, and a single prediction would
 average the two.
 
-{{DATA DERVED IMAGE TO COME}} 
-// Happy to hear rendering recommendaitons.
-
-## How well it works
+## Results
 
 minADE is the standard score: the average distance, in metres, between
 the recorded path and whichever of the six predictions came closest.
@@ -23,9 +20,9 @@ server returned the same numbers for the same predictions:
 
 | minADE (m)  | 3 s  | 5 s  | 8 s  |
 |-------------|------|------|------|
-| cars        | 0.36 | 0.79 | 1.55 |
-| pedestrians | 0.19 | 0.37 | 0.64 |
-| cyclists    | 0.38 | 0.73 | 1.32 |
+| cars        | 0.36 | 0.77 | 1.49 |
+| pedestrians | 0.19 | 0.37 | 0.65 |
+| cyclists    | 0.38 | 0.73 | 1.30 |
 
 The control, scored through the same code, assumes every road user
 holds its current speed and heading. At 8 s it scores 10.98 m for cars,
@@ -35,15 +32,11 @@ These numbers are not comparable to the public leaderboard. This model
 trained on a quarter of the training split: 122,352 scenes, 16 epochs,
 two 12-hour sessions on a free Kaggle GPU.
 
-Waymo does not permit redistribution of their data, so reproducing the
-table requires a Waymo Open Motion Dataset account; `stage.py` converts
-their files into this repository's format.
+## Method
 
-## How it works
-
-1. Waymo's files are unpacked by this repository's reader and reduced
+1. Waymo's files are read with TensorFlow's record reader and reduced
    to numeric arrays, one file per scene. (`stage.py`,
-   `womd/tfrecord.py`, `womd/store.py`)
+   `womd/store.py`)
 2. Before training, the endpoints of the training paths are clustered
    into 54 typical destinations per road-user type: straight and far,
    gentle left, hard right. These are the anchors. (`fit_anchors.py`)
@@ -63,3 +56,19 @@ bottom of `womd/loader.py`.
 ## Architecture
 
 ![Architecture flowchart](architecture.png)
+
+## Usage
+
+Waymo does not permit redistribution of their data, so reproducing the
+table requires a Waymo Open Motion Dataset account; `stage.py` converts
+their files into this repository's format.
+
+```
+make install   # install the pinned dependencies
+make test      # run the test suite, under 30 seconds
+make stage     # turn raw WOMD shards into one .npz per scene
+make anchors   # fit the 54 anchors per road-user type
+make train     # train, resuming from the checkpoint if one exists
+make predict   # write the model's predictions for the staged scenes
+make score     # score the checkpoint with Waymo's metrics, in Docker
+```

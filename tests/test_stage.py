@@ -1,3 +1,6 @@
+"""Tests for staging: file naming, duplicate scenario ids, and the pinned layout
+of a staged file.
+"""
 import json
 from pathlib import Path
 
@@ -13,6 +16,7 @@ STAGING_PIN_PATH = Path(__file__).parent / "staging_pinned.json"
 
 
 def add_track(scenario, track_id, object_type, base_x, base_y):
+    """Adds a fully valid track that moves 0.1 m per step along x."""
     track = scenario.tracks.add()
     track.id = track_id
     track.object_type = object_type
@@ -29,6 +33,9 @@ def add_track(scenario, track_id, object_type, base_x, base_y):
 
 
 def build_fixture_scenario(scenario_id):
+    """A small scenario with three tracks, two neighbouring lanes, a road edge,
+    a stop sign and one traffic signal.
+    """
     scenario = scenario_pb2.Scenario()
     scenario.scenario_id = scenario_id
     scenario.current_time_index = contract.CURRENT_STEP_INDEX
@@ -92,12 +99,14 @@ def build_fixture_scenario(scenario_id):
 
 
 def write_shard(shard_path, scenarios):
+    """Writes scenarios to a TFRecord shard the way Waymo ships them."""
     with tensorflow.io.TFRecordWriter(str(shard_path)) as writer:
         for scenario in scenarios:
             writer.write(scenario.SerializeToString())
 
 
 def stage_fixture(tmp_path):
+    """Stages the fixture scenario and returns its staged file."""
     shard_path = tmp_path / "training.tfrecord-00000-of-01000"
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"
@@ -107,12 +116,15 @@ def stage_fixture(tmp_path):
 
 
 def pinned_dtype(array):
+    """The dtype as the pin file records it; every string width counts as str.
+    """
     if array.dtype.kind == "U":
         return "str"
     return str(array.dtype)
 
 
 def staged_structure(scenario_file):
+    """The shape and dtype of every array in a staged file."""
     return {
         key: {
             "shape": list(scenario_file[key].shape),
@@ -122,6 +134,9 @@ def staged_structure(scenario_file):
 
 
 def write_staging_pin():
+    """Rewrites the pin file from the current staging code. Run by hand after a
+    deliberate layout change.
+    """
     import tempfile
 
     with tempfile.TemporaryDirectory() as temporary_directory:
@@ -130,6 +145,8 @@ def write_staging_pin():
 
 
 def test_staging_names_files_by_scenario_id(tmp_path,):
+    """Each scenario becomes one file named by its scenario id, across shards.
+    """
     first_shard = tmp_path / "training.tfrecord-00000-of-01000"
     second_shard = tmp_path / "training.tfrecord-00001-of-01000"
     write_shard(
@@ -156,6 +173,9 @@ def test_staging_names_files_by_scenario_id(tmp_path,):
 
 
 def test_duplicate_scenario_ids_are_refused(tmp_path):
+    """Two scenarios with the same id would overwrite each other, so staging
+    must stop.
+    """
     first_shard = tmp_path / "training.tfrecord-00000-of-01000"
     second_shard = tmp_path / "training.tfrecord-00001-of-01000"
     write_shard(first_shard, [build_fixture_scenario("same0001")])
@@ -168,6 +188,9 @@ def test_duplicate_scenario_ids_are_refused(tmp_path):
 
 
 def test_staged_structure_matches_pin(tmp_path):
+    """The staged layout must equal the pinned one, because the Kaggle datasets
+    were staged with it.
+    """
     structure = staged_structure(stage_fixture(tmp_path))
     pinned_structure = json.loads(STAGING_PIN_PATH.read_text())
     assert structure == pinned_structure

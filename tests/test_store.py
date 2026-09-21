@@ -1,13 +1,15 @@
+"""Tests for the map rows and the scene-frame resampling in womd/store.py."""
 import numpy as np
 
 from womd import contract, store
-from womd_protos import map_pb2, scenario_pb2
+from womd_protos import map_pb2
 
 WORLD_ORIGIN = np.zeros(2)
 WORLD_HEADING = 0.0
 
 
 def polyline_feature(kind, points, feature_id=1):
+    """A map feature of the given polyline kind through the given points."""
     feature = map_pb2.MapFeature()
     feature.id = feature_id
     for x, y in points:
@@ -16,6 +18,7 @@ def polyline_feature(kind, points, feature_id=1):
 
 
 def polygon_feature(kind, corners, feature_id=1):
+    """A map feature of the given polygon kind with the given corners."""
     feature = map_pb2.MapFeature()
     feature.id = feature_id
     for x, y in corners:
@@ -24,6 +27,9 @@ def polygon_feature(kind, corners, feature_id=1):
 
 
 def test_map_rows_layout_for_all_seven_kinds():
+    """Every map kind fills its own one-hot column and only the detail columns
+    that belong to it.
+    """
     square = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)]
     lane = polyline_feature("lane", [(0.0, 0.0), (10.0, 0.0)], feature_id=7)
     lane.lane.type = 2
@@ -99,6 +105,9 @@ def test_map_rows_layout_for_all_seven_kinds():
 
 
 def test_fill_bridges_measured_worst_case_shapes():
+    """A 159.8 m two-point road edge and a 62 m corners-only crosswalk are both
+    filled so no gap exceeds the dot spacing.
+    """
     endpoint_pair_edge = polyline_feature("road_edge", [(0.0, 0.0),
                                                         (159.8, 0.0)])
     edge_points, edge_directions, _, _ = store.map_feature_to_scene_frame(
@@ -121,6 +130,9 @@ def test_fill_bridges_measured_worst_case_shapes():
 
 
 def test_crop_keeps_polyline_crossing_the_boundary():
+    """A polyline that crosses the staging radius keeps its inside part and
+    drops the rest.
+    """
     crossing_edge = polyline_feature("road_edge", [(-300.0, 1.0), (300.0, 1.0)])
     scene_points, scene_directions, _, _ = store.map_feature_to_scene_frame(
         crossing_edge, WORLD_ORIGIN, WORLD_HEADING)
@@ -156,5 +168,6 @@ def test_crossing_codes_survive_resampling():
 
 
 def test_feature_row_layout_is_pinned():
+    """The row widths the staged data was written with."""
     assert contract.MAP_FEATURE_DIM == 32
     assert contract.AGENT_FEATURE_DIM == 13

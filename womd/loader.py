@@ -367,8 +367,8 @@ def build_scene_sample(scenario_array: dict[str, np.ndarray],
         "scene_agent_signal_history": scenario_array["track_signal_histories"],
         "map_rows": scenario_array["map_rows"],
         "map_chunk_index": tokens.dot_chunk_index.astype(np.int64),
-        "map_chunk_signal_history":
-            polyline_signal_histories[tokens.chunk_polyline],
+        "map_chunk_signal_history": polyline_signal_histories[
+            tokens.chunk_polyline],
         "targets": [
             build_target(scenario_array, track_index, tokens)
             for track_index in track_indices
@@ -388,8 +388,8 @@ def pad_and_stack(arrays: list[np.ndarray], padded_length: int,
     return padded
 
 
-def build_scene_batch(scene_samples: list[dict[str, Any]]
-                     ) -> dict[str, np.ndarray]:
+def build_scene_batch(
+        scene_samples: list[dict[str, Any]]) -> dict[str, np.ndarray]:
     """Joins scene samples into one batch.
 
     Scene agents and map chunks are zero-padded to the largest scene, map dots
@@ -433,22 +433,19 @@ def build_scene_batch(scene_samples: list[dict[str, Any]]
     ]
 
     batch = {
-        "scene_agent_history":
-            scene_entry("scene_agent_history", max_agents, np.float32),
-        "scene_agent_history_mask":
-            scene_entry("scene_agent_history_mask", max_agents, bool),
-        "scene_agent_signal_history":
-            scene_entry("scene_agent_signal_history", max_agents, np.float32),
-        "map_rows":
-            np.concatenate([scene["map_rows"] for scene in scene_samples],
-                           dtype=np.float32),
-        "map_dot_chunk_slot":
-            np.concatenate(dot_chunk_slots, dtype=np.int64),
-        "map_chunk_signal_history":
-            scene_entry("map_chunk_signal_history", max_chunks, np.float32),
-        "target_scene_index":
-            np.array([scene_index for scene_index, _ in targets],
-                     dtype=np.int64),
+        "scene_agent_history": scene_entry("scene_agent_history", max_agents,
+                                           np.float32),
+        "scene_agent_history_mask": scene_entry("scene_agent_history_mask",
+                                                max_agents, bool),
+        "scene_agent_signal_history": scene_entry("scene_agent_signal_history",
+                                                  max_agents, np.float32),
+        "map_rows": np.concatenate(
+            [scene["map_rows"] for scene in scene_samples], dtype=np.float32),
+        "map_dot_chunk_slot": np.concatenate(dot_chunk_slots, dtype=np.int64),
+        "map_chunk_signal_history": scene_entry("map_chunk_signal_history",
+                                                max_chunks, np.float32),
+        "target_scene_index": np.array(
+            [scene_index for scene_index, _ in targets], dtype=np.int64),
     }
     for key in ("agent_history", "agent_history_mask", "agent_signal_history",
                 "future_positions", "future_mask"):

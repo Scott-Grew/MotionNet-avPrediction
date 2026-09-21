@@ -1,3 +1,6 @@
+"""Plain reference versions of the anchors and the pruning rule, kept only for
+the tests to compare against.
+"""
 import torch
 
 from womd import contract

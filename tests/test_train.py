@@ -1,3 +1,6 @@
+"""Tests for the training loop: the learning-rate schedule, resuming, and the
+Kaggle kernel's command line.
+"""
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ from womd.model import MotionPredictor
 
 
 def build_synthetic_map_rows(dot_count):
+    """Random map rows whose two boundary-crossing columns hold valid codes."""
     map_rows = torch.randn(dot_count, contract.MAP_FEATURE_DIM)
     map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
         0, contract.NUM_BOUNDARY_CROSSING_CODES, (dot_count, 2)).float()
@@ -17,6 +21,7 @@ def build_synthetic_map_rows(dot_count):
 
 
 def synthetic_batch():
+    """A random two-target batch with three scene agents and four map chunks."""
     return {
         "agent_history": torch.randn(2, contract.HISTORY_STEPS,
                                      contract.AGENT_FEATURE_DIM),
@@ -57,6 +62,9 @@ def synthetic_batch():
 
 
 def test_warmup_rises_then_holds():
+    """The rate climbs through warm-up, holds at the chosen rate, and reaches
+    zero on the last step.
+    """
     warmup_steps = 20
     rates = [
         train.scheduled_learning_rate(step, warmup_steps) for step in range(200)
@@ -90,6 +98,8 @@ def test_rate_holds_then_falls_to_zero():
 
 
 def test_resuming_never_skips_a_completed_epoch():
+    """A resumed run starts at the first epoch the checkpoint has not finished.
+    """
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
@@ -140,10 +150,15 @@ def test_one_training_step_runs_end_to_end():
 
 
 def kernel_train_arguments():
+    """The literal train.py arguments in the Kaggle kernel script, and how many
+    arguments the call has in total.
+    """
     import ast as ast_module
 
     kernel_path = (Path(__file__).parent.parent / "data" / "kaggle_upload" /
                    "kernel" / "run.py")
+    if not kernel_path.exists():
+        pytest.skip(f"no Kaggle kernel script at {kernel_path}")
     kernel_tree = ast_module.parse(kernel_path.read_text())
     for node in ast_module.walk(kernel_tree):
         if not isinstance(node, ast_module.Call):
