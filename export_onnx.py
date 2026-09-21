@@ -9,6 +9,7 @@ import onnxruntime
 import torch
 
 from womd import loader, model
+from womd.checkpoint import load_anchor_file, load_checkpoint_state
 
 SCENE_AGENT_NAMES = [
     "scene_agent_history",
@@ -27,7 +28,7 @@ INPUT_NAMES = (
     SCENE_AGENT_NAMES
     + [
         "map_rows",
-        "map_dot_polyline_slot",
+        "map_dot_chunk_slot",
         "map_chunk_signal_history",
     ]
     + TARGET_NAMES
@@ -80,7 +81,7 @@ def padded_to_fixed_shape(
 ):
     batch_agent_count = batch["scene_agent_history"].shape[1]
     batch_chunk_count = batch["map_chunk_signal_history"].shape[1]
-    slot = batch["map_dot_polyline_slot"]
+    slot = batch["map_dot_chunk_slot"]
     fixed = {
         name: padded_along(batch[name], 1, agent_count)
         for name in SCENE_AGENT_NAMES
@@ -93,7 +94,7 @@ def padded_to_fixed_shape(
     )
     # slot = scene index * chunk count + chunk index, so the stride
     # changes when the chunk count is padded
-    fixed["map_dot_polyline_slot"] = last_row_repeated_to(
+    fixed["map_dot_chunk_slot"] = last_row_repeated_to(
         (slot // batch_chunk_count) * chunk_count
         + slot % batch_chunk_count,
         dot_count,
@@ -278,11 +279,11 @@ def main():
     torch.set_num_threads(arguments.threads)
 
     predictor = model.MotionPredictor(
-        model.load_anchor_file(arguments.anchors)
+        load_anchor_file(arguments.anchors)
     )
     if arguments.checkpoint is not None:
         predictor.load_state_dict(
-            model.load_checkpoint_state(arguments.checkpoint)[
+            load_checkpoint_state(arguments.checkpoint)[
                 "model_state"
             ]
         )
