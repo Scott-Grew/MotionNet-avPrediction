@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPOSITORY_ROOT))
@@ -113,6 +113,30 @@ def scenario_world_frame_ground_truth(
     )
 
 
+class SubmissionArrays(NamedTuple):
+    """A submission .npz, one row per predicted target, in the world frame."""
+    scenario_id: np.ndarray  # (targets,)
+    track_id: np.ndarray  # (targets,)
+    world_trajectories: np.ndarray  # (targets, 6, 16, 2) at 2 Hz
+    confidences: np.ndarray  # (targets, 6)
+
+
+class MotionMetricInputs(NamedTuple):
+    """The padded scenario-by-agent tensors Waymo's motion metrics op reads,
+    named as its keyword arguments. S scenarios, P predictions and A agents in
+    the largest scenario, M modes, K submitted steps, 91 logged steps.
+    """
+    prediction_trajectory: np.ndarray  # (S, P, M, 1, K, 2)
+    prediction_score: np.ndarray  # (S, P, M)
+    ground_truth_trajectory: np.ndarray  # (S, A, 91, 7)
+    ground_truth_is_valid: np.ndarray  # (S, A, 91)
+    prediction_ground_truth_indices: np.ndarray  # (S, P, 1)
+    prediction_ground_truth_indices_mask: np.ndarray  # (S, P, 1)
+    object_type: np.ndarray  # (S, A)
+    object_id: np.ndarray  # (S, A)
+    scenario_id: np.ndarray  # (S,)
+
+
 def prediction_rows_by_scenario(
         scenario_ids: np.ndarray) -> dict[str, list[int]]:
     """Groups the flat per-target prediction rows by scenario in first-seen
@@ -126,16 +150,16 @@ def prediction_rows_by_scenario(
 
 
 def build_motion_metric_tensors(
-        predictions: dict[str, np.ndarray],
-        staged_directory: Path | str) -> dict[str, np.ndarray]:
+        predictions: SubmissionArrays,
+        staged_directory: Path | str) -> MotionMetricInputs:
     """Reshapes flat per-target predictions and staged ground truth into the
     padded scenario-by-agent tensors the metrics op expects.
     """
-    track_ids = predictions["track_id"]
-    world_trajectories = predictions["world_trajectories"]
-    confidences = predictions["confidences"]
+    track_ids = predictions.track_id
+    world_trajectories = predictions.world_trajectories
+    confidences = predictions.confidences
     prediction_rows_of_scenario = prediction_rows_by_scenario(
-        predictions["scenario_id"])
+        predictions.scenario_id)
     ordered_scenario_ids = list(prediction_rows_of_scenario)
     scenarios = [
         loader.read_scenario(Path(staged_directory) / f"{scenario_id}.npz")
@@ -153,22 +177,21 @@ def build_motion_metric_tensors(
     per_agent = (scenario_count, max_agents)
     step_count = contract.TOTAL_STEPS
 
-    tensors = {
-        "prediction_trajectory": np.zeros(
+    tensors = MotionMetricInputs(
+        prediction_trajectory=np.zeros(
             per_prediction + (mode_count, 1, submitted_steps, 2), np.float32),
-        "prediction_score": np.zeros(per_prediction + (mode_count,),
-                                     np.float32),
-        "ground_truth_trajectory": np.zeros(per_agent + (step_count, 7),
-                                            np.float32),
-        "ground_truth_is_valid": np.zeros(per_agent + (step_count,), bool),
-        "prediction_ground_truth_indices": np.zeros(per_prediction + (1,),
-                                                    np.int64),
-        "prediction_ground_truth_indices_mask": np.zeros(
-            per_prediction + (1,), bool),
-        "object_type": np.zeros(per_agent, np.int64),
-        "object_id": np.zeros(per_agent, np.int64),
-        "scenario_id": np.array(ordered_scenario_ids),
-    }
+        prediction_score=np.zeros(per_prediction + (mode_count,), np.float32),
+        ground_truth_trajectory=np.zeros(per_agent + (step_count, 7),
+                                         np.float32),
+        ground_truth_is_valid=np.zeros(per_agent + (step_count,), bool),
+        prediction_ground_truth_indices=np.zeros(per_prediction + (1,),
+                                                 np.int64),
+        prediction_ground_truth_indices_mask=np.zeros(per_prediction + (1,),
+                                                      bool),
+        object_type=np.zeros(per_agent, np.int64),
+        object_id=np.zeros(per_agent, np.int64),
+        scenario_id=np.array(ordered_scenario_ids),
+    )
 
     for scenario_index, scenario_id in enumerate(ordered_scenario_ids):
         scenario = scenarios[scenario_index]
@@ -179,10 +202,10 @@ def build_motion_metric_tensors(
         world_frame_states, track_valid, object_types = (
             scenario_world_frame_ground_truth(scenario))
         agents = (scenario_index, slice(0, agent_count))
-        tensors["ground_truth_trajectory"][agents] = world_frame_states
-        tensors["ground_truth_is_valid"][agents] = track_valid
-        tensors["object_type"][agents] = object_types
-        tensors["object_id"][agents] = scenario_track_ids
+        tensors.ground_truth_trajectory[agents] = world_frame_states
+        tensors.ground_truth_is_valid[agents] = track_valid
+        tensors.object_type[agents] = object_types
+        tensors.object_id[agents] = scenario_track_ids
 
         # Each prediction points at its agent by index, not track id.
         for slot_index, prediction_index in enumerate(
@@ -195,28 +218,28 @@ def build_motion_metric_tensors(
                 f" {len(matching_track_indices)} times in scenario"
                 f" {scenario_id}")
             slot = (scenario_index, slot_index)
-            tensors["prediction_trajectory"][slot][:, 0] = (
+            tensors.prediction_trajectory[slot][:, 0] = (
                 world_trajectories[prediction_index])
-            tensors["prediction_score"][slot] = confidences[prediction_index]
-            tensors["prediction_ground_truth_indices"][slot] = (
+            tensors.prediction_score[slot] = confidences[prediction_index]
+            tensors.prediction_ground_truth_indices[slot] = (
                 matching_track_indices[0])
-            tensors["prediction_ground_truth_indices_mask"][slot] = True
+            tensors.prediction_ground_truth_indices_mask[slot] = True
 
     return tensors
 
 
-def load_predictions(predictions_path: Path) -> dict[str, np.ndarray]:
+def load_predictions(predictions_path: Path) -> SubmissionArrays:
     """Loads a submission .npz and refuses one this code did not produce."""
     with np.load(predictions_path) as predictions_file:
-        predictions = {
-            name: predictions_file[name] for name in predictions_file.files
-        }
-    contract.check_artifact_provenance(
-        predictions.get("provenance"),
-        predictions_path,
-        "Regenerate the predictions with submit.py.",
-    )
-    return predictions
+        contract.check_artifact_provenance(
+            (predictions_file["provenance"]
+             if "provenance" in predictions_file else None),
+            predictions_path,
+            "Regenerate the predictions with submit.py.",
+        )
+        return SubmissionArrays(
+            **
+            {name: predictions_file[name] for name in SubmissionArrays._fields})
 
 
 def print_score_table(breakdown_names: list[str],
@@ -258,23 +281,13 @@ def run_score(predictions_path: Path, staged_directory: Path) -> None:
     with graph.as_default():
         motion_metric_ops = py_metrics_ops.motion_metrics(
             config=config.SerializeToString(),
-            prediction_trajectory=tensors["prediction_trajectory"],
-            prediction_score=tensors["prediction_score"],
-            ground_truth_trajectory=tensors["ground_truth_trajectory"],
-            ground_truth_is_valid=tensors["ground_truth_is_valid"],
-            prediction_ground_truth_indices=tensors[
-                "prediction_ground_truth_indices"],
-            prediction_ground_truth_indices_mask=tensors[
-                "prediction_ground_truth_indices_mask"],
-            object_type=tensors["object_type"],
-            object_id=tensors["object_id"],
-            scenario_id=tensors["scenario_id"],
+            **tensors._asdict(),
         )
     with tf.compat.v1.Session(graph=graph) as session:
         metric_columns = session.run(motion_metric_ops)
 
-    target_count = int(tensors["prediction_ground_truth_indices_mask"].sum())
-    scenario_count = tensors["object_type"].shape[0]
+    target_count = int(tensors.prediction_ground_truth_indices_mask.sum())
+    scenario_count = tensors.object_type.shape[0]
     print(f"{target_count} designated targets across"
           f" {scenario_count} scenarios scored from {predictions_path}")
     print_score_table(breakdown_names, metric_columns)

@@ -30,7 +30,7 @@ from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
 STAGED_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "staged"
 
 
-def lane_polyline_rows(first_dot_x, dot_count):
+def lane_polyline_rows(*, first_dot_x, dot_count):
     """Map rows for a straight lane along x with one dot per metre."""
     rows = np.zeros((dot_count, contract.MAP_FEATURE_DIM), dtype=np.float32)
     rows[:, contract.MAP_POSITION] = np.stack(
@@ -48,7 +48,7 @@ def lane_polyline_rows(first_dot_x, dot_count):
     return rows
 
 
-def synthetic_scene_batch(sample_count, scene_agent_count, polyline_count,
+def synthetic_scene_batch(*, sample_count, scene_agent_count, polyline_count,
                           dots_per_polyline):
     """A random scene batch of the given size, one object type per sample in
     turn.
@@ -188,11 +188,13 @@ def test_frame_transforms_compose():
 
     sdc_origin = np.array([-12.0, 31.0])
     sdc_heading = -1.2
-    stored_rows, stored_valid = store.track_to_feature_rows(
-        track, sdc_origin, sdc_heading, False)
+    stored_rows, stored_valid = store.track_to_feature_rows(track,
+                                                            sdc_origin,
+                                                            sdc_heading,
+                                                            is_sdc=False)
     track_rows = stored_rows.astype(np.float32)[np.newaxis]
 
-    origin, heading = loader.sample_frame(track_rows, 0)
+    origin, heading = loader.sample_frame(track_rows, track_index=0)
     two_step = loader.track_rows_to_agent_frame(track_rows[0], origin, heading)
 
     world_positions = np.array(
@@ -570,11 +572,11 @@ def test_backfill_monitor_detects_a_repeated_future():
         future_mask,
     )
 
-    assert separated_accumulator.results()["mean_kept_modes"] == float(
+    assert separated_accumulator.results().mean_kept_modes == float(
         contract.NUM_PREDICTED_MODES)
-    assert separated_accumulator.results()["backfill_rate"] == 0.0
-    assert collapsed_accumulator.results()["mean_kept_modes"] == 1.0
-    assert collapsed_accumulator.results()["backfill_rate"] == 1.0
+    assert separated_accumulator.results().backfill_rate == 0.0
+    assert collapsed_accumulator.results().mean_kept_modes == 1.0
+    assert collapsed_accumulator.results().backfill_rate == 1.0
 
 
 def test_constant_velocity_null_keeps_the_logged_speed():
@@ -695,28 +697,28 @@ def test_scorer_tensors_group_by_scenario(tmp_path,):
             prediction_scenario_ids.append(scenario_id)
             prediction_track_ids.append(track_id)
     target_count = len(prediction_track_ids)
-    predictions = {
-        "scenario_id": np.array(prediction_scenario_ids),
-        "track_id": np.array(prediction_track_ids, dtype=np.int64),
-        "world_trajectories": np.random.default_rng(0).normal(size=(
+    predictions = runner.SubmissionArrays(
+        scenario_id=np.array(prediction_scenario_ids),
+        track_id=np.array(prediction_track_ids, dtype=np.int64),
+        world_trajectories=np.random.default_rng(0).normal(size=(
             target_count,
             contract.NUM_PREDICTED_MODES,
             contract.SUBMISSION_STEPS,
             2,
         )),
-        "confidences": np.full((target_count, contract.NUM_PREDICTED_MODES),
-                               1.0 / 6.0),
-    }
+        confidences=np.full((target_count, contract.NUM_PREDICTED_MODES),
+                            1.0 / 6.0),
+    )
 
     tensors = runner.build_motion_metric_tensors(predictions, tmp_path)
 
-    assert tensors["ground_truth_trajectory"].shape == (
+    assert tensors.ground_truth_trajectory.shape == (
         2,
         3,
         contract.TOTAL_STEPS,
         7,
     )
-    assert tensors["prediction_trajectory"].shape == (
+    assert tensors.prediction_trajectory.shape == (
         2,
         2,
         contract.NUM_PREDICTED_MODES,
@@ -725,27 +727,25 @@ def test_scorer_tensors_group_by_scenario(tmp_path,):
         2,
     )
     assert (int(
-        tensors["prediction_ground_truth_indices_mask"].sum()) == target_count)
+        tensors.prediction_ground_truth_indices_mask.sum()) == target_count)
 
     scenario_row = {
-        scenario_id: row
-        for row, scenario_id in enumerate(tensors["scenario_id"])
+        scenario_id: row for row, scenario_id in enumerate(tensors.scenario_id)
     }
     a_row, b_row = scenario_row["scn_a"], scenario_row["scn_b"]
-    assert tensors["ground_truth_is_valid"][a_row].all()
-    assert tensors["ground_truth_is_valid"][b_row, :2].all()
-    assert not tensors["ground_truth_is_valid"][b_row, 2:].any()
-    assert not tensors["prediction_ground_truth_indices_mask"][b_row, 1:].any()
+    assert tensors.ground_truth_is_valid[a_row].all()
+    assert tensors.ground_truth_is_valid[b_row, :2].all()
+    assert not tensors.ground_truth_is_valid[b_row, 2:].any()
+    assert not tensors.prediction_ground_truth_indices_mask[b_row, 1:].any()
 
     for slot_index, expected_track_id in enumerate(
             scenario_target_track_ids["scn_a"]):
-        agent_row = int(tensors["prediction_ground_truth_indices"][a_row,
-                                                                   slot_index,
-                                                                   0])
-        assert tensors["object_id"][a_row, agent_row] == expected_track_id
-        assert tensors["ground_truth_trajectory"][a_row, agent_row, 0,
-                                                  0] == pytest.approx(
-                                                      agent_row * 1.0)
+        agent_row = int(tensors.prediction_ground_truth_indices[a_row,
+                                                                slot_index, 0])
+        assert tensors.object_id[a_row, agent_row] == expected_track_id
+        assert tensors.ground_truth_trajectory[a_row, agent_row, 0,
+                                               0] == pytest.approx(agent_row *
+                                                                   1.0)
 
 
 def test_input_order_does_not_change_predictions():
@@ -753,7 +753,10 @@ def test_input_order_does_not_change_predictions():
     torch.manual_seed(11)
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()).eval()
-    batch = synthetic_scene_batch(2, 6, 5, 16)
+    batch = synthetic_scene_batch(sample_count=2,
+                                  scene_agent_count=6,
+                                  polyline_count=5,
+                                  dots_per_polyline=16)
     batch.scene.agent_history_mask[:, 5] = False
     scene_agent_order = torch.randperm(6)
     token_order = torch.cat([scene_agent_order, torch.arange(6, 11)])
@@ -780,12 +783,12 @@ def test_input_order_does_not_change_predictions():
     assert torch.allclose(base_logits, permuted_logits, atol=1e-5)
 
 
-def two_lane_signal_scenario(track_count, signalled_lane_history):
+def two_lane_signal_scenario(*, track_count, signalled_lane_history):
     """A staged scenario with a signalled lane under the first track and an
     unsignalled lane 40 m away.
     """
-    signalled_lane = lane_polyline_rows(0.0, 11)
-    unsignalled_lane = lane_polyline_rows(0.0, 11)
+    signalled_lane = lane_polyline_rows(first_dot_x=0.0, dot_count=11)
+    unsignalled_lane = lane_polyline_rows(first_dot_x=0.0, dot_count=11)
     unsignalled_lane[:, contract.MAP_POSITION.start + 1] = 40.0
     feature_lengths = np.array([11, 11], dtype=np.int64)
     polyline_signal_histories = np.zeros(
@@ -843,9 +846,13 @@ def test_agents_carry_their_lane_signal_history():
     signalled_lane_history[
         8:, contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")] = 1.0
     three_agent_scene = loader.build_scene_sample(
-        two_lane_signal_scenario(3, signalled_lane_history), [0])
+        two_lane_signal_scenario(track_count=3,
+                                 signalled_lane_history=signalled_lane_history),
+        [0])
     two_agent_scene = loader.build_scene_sample(
-        two_lane_signal_scenario(2, signalled_lane_history), [0])
+        two_lane_signal_scenario(track_count=2,
+                                 signalled_lane_history=signalled_lane_history),
+        [0])
     assert np.array_equal(
         three_agent_scene.targets[0].agent_signal_history,
         signalled_lane_history,
@@ -880,8 +887,10 @@ def test_target_prediction_ignores_batch_company():
         (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES),
         dtype=np.float32,
     )
-    three_track_scenario = two_lane_signal_scenario(3, signalled_lane_history)
-    two_track_scenario = two_lane_signal_scenario(2, signalled_lane_history)
+    three_track_scenario = two_lane_signal_scenario(
+        track_count=3, signalled_lane_history=signalled_lane_history)
+    two_track_scenario = two_lane_signal_scenario(
+        track_count=2, signalled_lane_history=signalled_lane_history)
 
     def torch_batch(scene_samples):
         return pipeline.torch_batch(loader.build_scene_batch(scene_samples))
@@ -911,7 +920,10 @@ def test_zero_head_output_lands_on_the_anchor():
     with torch.no_grad():
         predictor.mode_decoder.trajectory_head[-1].weight.zero_()
         predictor.mode_decoder.trajectory_head[-1].bias.zero_()
-    batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 2, 2, 10)
+    batch = synthetic_scene_batch(sample_count=contract.NUM_OBJECT_TYPES,
+                                  scene_agent_count=2,
+                                  polyline_count=2,
+                                  dots_per_polyline=10)
     with torch.no_grad():
         trajectories, _, _, selected_unit_anchors = predictor.predict(batch)
     assert torch.allclose(trajectories[:, :, -1], unit_anchors, atol=1e-4)
@@ -1041,7 +1053,10 @@ def test_every_model_output_moves_the_loss():
     torch.manual_seed(83)
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()).eval()
-    batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 3, 2, 10)
+    batch = synthetic_scene_batch(sample_count=contract.NUM_OBJECT_TYPES,
+                                  scene_agent_count=3,
+                                  polyline_count=2,
+                                  dots_per_polyline=10)
     with torch.no_grad():
         emitted = list(predictor.predict(batch))
     names = (
@@ -1087,7 +1102,10 @@ def test_no_step_uncertainty_starts_saturated():
     torch.manual_seed(97)
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()).eval()
-    batch = synthetic_scene_batch(contract.NUM_OBJECT_TYPES, 2, 2, 10)
+    batch = synthetic_scene_batch(sample_count=contract.NUM_OBJECT_TYPES,
+                                  scene_agent_count=2,
+                                  polyline_count=2,
+                                  dots_per_polyline=10)
     with torch.no_grad():
         trajectories, log_standard_deviation, confidence_logits, _ = (
             predictor.predict(batch))
@@ -1155,7 +1173,7 @@ def test_training_step_runs_on_staged_scenarios(tmp_path,):
         batch.targets.future_positions,
         batch.targets.future_mask,
     )
-    assert all(math.isfinite(value) for value in accumulator.results().values())
+    assert all(math.isfinite(value) for value in accumulator.results())
     checkpoint_path = tmp_path / "predictor.pt"
     torch.save(predictor.state_dict(), checkpoint_path)
     reloaded_state = torch.load(checkpoint_path)

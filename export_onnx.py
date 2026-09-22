@@ -65,7 +65,7 @@ class PositionalInputs(torch.nn.Module):
         return self.predictor(batch_from_graph_inputs(tensors))
 
 
-def padded_along(tensor: torch.Tensor, dimension: int,
+def padded_along(tensor: torch.Tensor, *, dimension: int,
                  length: int) -> torch.Tensor:
     """Pads a tensor with zeros along one dimension up to length; the added rows
     are absent tokens, not real agents or map chunks.
@@ -96,7 +96,7 @@ def padded_to_fixed_shape(batch: SceneBatch, *, agent_count: int,
     slot = batch.map.dot_chunk_slot
     scene = SceneArrays(
         **{
-            name: padded_along(array, 1, agent_count)
+            name: padded_along(array, dimension=1, length=agent_count)
             for name, array in batch.scene._asdict().items()
         })
     # A slot is scene index * chunk count + chunk index, so the stride
@@ -106,8 +106,9 @@ def padded_to_fixed_shape(batch: SceneBatch, *, agent_count: int,
         dot_chunk_slot=last_row_repeated_to(
             (slot // batch_chunk_count) * chunk_count +
             slot % batch_chunk_count, dot_count),
-        chunk_signal_history=padded_along(batch.map.chunk_signal_history, 1,
-                                          chunk_count),
+        chunk_signal_history=padded_along(batch.map.chunk_signal_history,
+                                          dimension=1,
+                                          length=chunk_count),
     )
     # The token axis holds the scene agents and then the map chunks, so each
     # half is padded separately before being joined back together.
@@ -116,8 +117,12 @@ def padded_to_fixed_shape(batch: SceneBatch, *, agent_count: int,
         tokens = target_arrays[name]
         target_arrays[name] = torch.cat(
             [
-                padded_along(tokens[:, :batch_agent_count], 1, agent_count),
-                padded_along(tokens[:, batch_agent_count:], 1, chunk_count),
+                padded_along(tokens[:, :batch_agent_count],
+                             dimension=1,
+                             length=agent_count),
+                padded_along(tokens[:, batch_agent_count:],
+                             dimension=1,
+                             length=chunk_count),
             ],
             dim=1,
         )

@@ -5,7 +5,9 @@ It steers runs; reported numbers come only from Waymo's scorer.
 from __future__ import annotations
 
 from collections import namedtuple
+from dataclasses import dataclass, fields
 import math
+from typing import NamedTuple
 
 import torch
 
@@ -23,6 +25,41 @@ TrainingStep = namedtuple(
 
 # A progress line is printed once per this many batches.
 LOG_EVERY_BATCHES = 20
+
+
+class MonitorResults(NamedTuple):
+    """The training monitor over the batches it saw. Distances are in metres
+    over the 80 future steps, and each value is nan when nothing was counted.
+    """
+    min_ade: float
+    min_fde: float
+    mean_kept_modes: float
+    backfill_rate: float  # share of samples that kept fewer than 6 modes
+
+
+class LossValues(NamedTuple):
+    """The total loss and its two likelihood terms."""
+    total: float
+    regression: float
+    classification: float
+
+
+@dataclass
+class PhaseSeconds:
+    """Wall-clock seconds spent waiting for data, stepping and monitoring."""
+    data_wait: float = 0.0
+    step: float = 0.0
+    monitor: float = 0.0
+
+    def elapsed(self) -> float:
+        return sum(getattr(self, phase.name) for phase in fields(self))
+
+
+class EpochSummary(NamedTuple):
+    """One finished epoch, as the epoch report and checkpoint read it."""
+    losses: LossValues  # mean per batch
+    monitor: MonitorResults
+    seconds: PhaseSeconds
 
 
 def mean_distance_per_mode(trajectories: torch.Tensor,
@@ -94,15 +131,15 @@ class MetricAccumulator:
         """A running sum over its count, or nan when nothing was counted."""
         return float(running_sum / count) if count else float("nan")
 
-    def results(self) -> dict[str, float]:
-        backfilled = self.backfilled_sample_count
-        return {
-            "min_ade": self.mean_or_nan(self.ade_sum, self.ade_count),
-            "min_fde": self.mean_or_nan(self.fde_sum, self.fde_count),
-            "mean_kept_modes": self.mean_or_nan(self.kept_mode_sum,
-                                                self.sample_count),
-            "backfill_rate": self.mean_or_nan(backfilled, self.sample_count),
-        }
+    def results(self) -> MonitorResults:
+        return MonitorResults(
+            min_ade=self.mean_or_nan(self.ade_sum, self.ade_count),
+            min_fde=self.mean_or_nan(self.fde_sum, self.fde_count),
+            mean_kept_modes=self.mean_or_nan(self.kept_mode_sum,
+                                             self.sample_count),
+            backfill_rate=self.mean_or_nan(self.backfilled_sample_count,
+                                           self.sample_count),
+        )
 
 
 class EpochProgress:
@@ -114,13 +151,9 @@ class EpochProgress:
         self.device = device
         self.accumulator = MetricAccumulator()
         self.window_accumulator = MetricAccumulator()
-        self.loss_sums = {
-            "total": 0.0,
-            "regression": 0.0,
-            "classification": 0.0,
-        }
-        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
-        self.seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
+        self.loss_sums = LossValues(0.0, 0.0, 0.0)
+        self.window_loss_sums = LossValues(0.0, 0.0, 0.0)
+        self.seconds = PhaseSeconds()
         self.batch_count = 0
         self.sample_count = 0
         self.non_finite_total_count = 0
@@ -135,15 +168,18 @@ class EpochProgress:
         """Folds one step's losses and optimiser health into the totals, and
         returns whether the total loss was finite.
         """
-        loss_values = {
-            "total": float(step.total.detach()),
-            "regression": float(step.regression.detach()),
-            "classification": float(step.classification.detach()),
-        }
-        for name, value in loss_values.items():
-            self.loss_sums[name] += value
-            self.window_loss_sums[name] += value
-        total_is_finite = math.isfinite(loss_values["total"])
+        loss_values = LossValues(
+            total=float(step.total.detach()),
+            regression=float(step.regression.detach()),
+            classification=float(step.classification.detach()),
+        )
+        self.loss_sums = LossValues(
+            *(sum_so_far + value
+              for sum_so_far, value in zip(self.loss_sums, loss_values)))
+        self.window_loss_sums = LossValues(
+            *(sum_so_far + value
+              for sum_so_far, value in zip(self.window_loss_sums, loss_values)))
+        total_is_finite = math.isfinite(loss_values.total)
         self.non_finite_total_count += int(not total_is_finite)
         self.clipped_step_count += int(was_clipped)
         self.gradient_scaler_skip_count += int(was_skipped)
@@ -185,58 +221,61 @@ class EpochProgress:
         peak_gigabytes = 0.0
         if self.device.type == "cuda":
             peak_gigabytes = torch.cuda.max_memory_allocated() / 1e9
-        loss_sums = self.loss_sums
-        batch_count = self.batch_count
+        averages = self.averages()
         seconds = self.seconds
-        elapsed = sum(seconds.values())
+        elapsed = seconds.elapsed()
         return {
-            "loss/total": loss_sums["total"] / batch_count,
-            "loss/regression": loss_sums["regression"] / batch_count,
-            "loss/classification": loss_sums["classification"] / batch_count,
-            "loss_window/total": self.window_loss_sums["total"] /
+            "loss/total": averages.total,
+            "loss/regression": averages.regression,
+            "loss/classification": averages.classification,
+            "loss_window/total": self.window_loss_sums.total /
                                  LOG_EVERY_BATCHES,
-            "monitor/ade_80step": monitor["min_ade"],
-            "monitor/fde_80step": monitor["min_fde"],
-            "monitor_window/ade_80step": window_monitor["min_ade"],
-            "monitor_window/fde_80step": window_monitor["min_fde"],
-            "monitor_window/kept_modes": window_monitor["mean_kept_modes"],
-            "monitor_window/backfill_rate": window_monitor["backfill_rate"],
+            "monitor/ade_80step": monitor.min_ade,
+            "monitor/fde_80step": monitor.min_fde,
+            "monitor_window/ade_80step": window_monitor.min_ade,
+            "monitor_window/fde_80step": window_monitor.min_fde,
+            "monitor_window/kept_modes": window_monitor.mean_kept_modes,
+            "monitor_window/backfill_rate": window_monitor.backfill_rate,
             "monitor_window/never_win_anchors": never_win_count,
             "health/non_finite_losses": self.non_finite_total_count,
             "health/skipped_steps": self.gradient_scaler_skip_count,
             "health/clipped_steps": self.clipped_step_count,
             "optimisation/learning_rate": step_learning_rate,
             "throughput/samples_per_second": self.sample_count / elapsed,
-            "time_share/data_wait": seconds["data_wait"] / elapsed,
-            "time_share/step": seconds["step"] / elapsed,
-            "time_share/monitor": seconds["monitor"] / elapsed,
+            "time_share/data_wait": seconds.data_wait / elapsed,
+            "time_share/step": seconds.step / elapsed,
+            "time_share/monitor": seconds.monitor / elapsed,
             "memory/peak_gigabytes": peak_gigabytes,
         }
 
     def start_new_window(self) -> None:
         self.window_accumulator = MetricAccumulator()
-        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
+        self.window_loss_sums = LossValues(0.0, 0.0, 0.0)
         self.window_winner_counts.zero_()
 
-    def averages(self) -> dict[str, float]:
+    def averages(self) -> LossValues:
         """Mean of each loss term over the batches seen so far."""
-        return {
-            name: value / max(self.batch_count, 1)
-            for name, value in self.loss_sums.items()
-        }
+        return LossValues(
+            *(value / max(self.batch_count, 1) for value in self.loss_sums))
+
+    def summary(self) -> EpochSummary:
+        return EpochSummary(losses=self.averages(),
+                            monitor=self.accumulator.results(),
+                            seconds=self.seconds)
 
 
-def epoch_scalars(averages: dict[str, float], monitor: dict[str, float],
-                  seconds: dict[str, float]) -> dict[str, float]:
+def epoch_scalars(summary: EpochSummary) -> dict[str, float]:
+    """The epoch report's table, keyed by the names its charts use."""
+    losses, monitor, seconds = summary
     return {
-        "epoch/loss_total": averages["total"],
-        "epoch/loss_regression": averages["regression"],
-        "epoch/loss_classification": averages["classification"],
-        "epoch/ade_80step": monitor["min_ade"],
-        "epoch/fde_80step": monitor["min_fde"],
-        "epoch/kept_modes": monitor["mean_kept_modes"],
-        "epoch/backfill_rate": monitor["backfill_rate"],
-        "epoch/data_wait_seconds": seconds["data_wait"],
-        "epoch/step_seconds": seconds["step"],
-        "epoch/monitor_seconds": seconds["monitor"],
+        "epoch/loss_total": losses.total,
+        "epoch/loss_regression": losses.regression,
+        "epoch/loss_classification": losses.classification,
+        "epoch/ade_80step": monitor.min_ade,
+        "epoch/fde_80step": monitor.min_fde,
+        "epoch/kept_modes": monitor.mean_kept_modes,
+        "epoch/backfill_rate": monitor.backfill_rate,
+        "epoch/data_wait_seconds": seconds.data_wait,
+        "epoch/step_seconds": seconds.step,
+        "epoch/monitor_seconds": seconds.monitor,
     }

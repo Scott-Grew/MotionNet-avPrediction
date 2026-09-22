@@ -13,7 +13,7 @@ from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
 from womd.model import MotionPredictor
 
 
-def build_synthetic_map_rows(dot_count):
+def build_synthetic_map_rows(*, dot_count):
     """Random map rows whose two boundary-crossing columns hold valid codes."""
     map_rows = torch.randn(dot_count, contract.MAP_FEATURE_DIM)
     map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING:] = torch.randint(
@@ -39,7 +39,7 @@ def synthetic_batch():
             ),
         ),
         map=MapArrays(
-            rows=build_synthetic_map_rows(20),
+            rows=build_synthetic_map_rows(dot_count=20),
             dot_chunk_slot=torch.arange(20) // 5,
             chunk_signal_history=torch.zeros(
                 2,
@@ -122,11 +122,17 @@ def test_resuming_never_skips_a_completed_epoch():
                                            scaler,
                                            seed=0,
                                            completed_epochs=3)
-    assert list(train.epochs_left_to_train(interrupted["completed_epochs"],
-                                           5)) == [2, 3, 4]
-    assert list(train.epochs_left_to_train(finished["completed_epochs"],
-                                           5)) == [3, 4]
-    assert list(train.epochs_left_to_train(1, 1)) == []
+    assert list(
+        train.epochs_left_to_train(
+            completed_epochs=interrupted["completed_epochs"],
+            requested_epochs=5)) == [2, 3, 4]
+    assert list(
+        train.epochs_left_to_train(
+            completed_epochs=finished["completed_epochs"],
+            requested_epochs=5)) == [3, 4]
+    assert list(
+        train.epochs_left_to_train(completed_epochs=1,
+                                   requested_epochs=1)) == []
 
 
 def test_checkpoint_round_trips(tmp_path,):

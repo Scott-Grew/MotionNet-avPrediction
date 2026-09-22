@@ -66,7 +66,7 @@ def track_to_scene_frame(track: scenario_pb2.Track, origin: np.ndarray,
 
 
 def track_to_feature_rows(track: scenario_pb2.Track, origin: np.ndarray,
-                          heading: float,
+                          heading: float, *,
                           is_sdc: bool) -> tuple[np.ndarray, np.ndarray]:
     """Builds the (TOTAL_STEPS, AGENT_FEATURE_DIM) feature row array for one
     track in the scene frame, plus its per-step validity.
@@ -109,7 +109,7 @@ def scenario_track_arrays(
             track,
             origin,
             heading,
-            track_index == scenario.sdc_track_index,
+            is_sdc=track_index == scenario.sdc_track_index,
         )
         rows_of_every_track.append(track_rows)
         valid_of_every_track.append(step_valid)

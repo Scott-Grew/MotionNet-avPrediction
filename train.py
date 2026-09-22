@@ -13,7 +13,7 @@ import math
 import os
 from pathlib import Path
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ from womd.loader import SceneBatch
 from womd.metrics import (
     LOG_EVERY_BATCHES,
     EpochProgress,
+    EpochSummary,
     TrainingStep,
     epoch_scalars,
 )
@@ -46,6 +47,19 @@ WEIGHT_DECAY = 0.01
 # Where this process sits among the processes torchrun started; a
 # plain launch is one process of one.
 Processes = namedtuple("Processes", "count rank local_rank is_main")
+
+
+class EpochPlan(NamedTuple):
+    """The optimiser steps in one epoch and the launch layout that fixes it;
+    a checkpoint stores it so a resumed run with the same layout reuses it.
+    """
+    scenario_count: int
+    process_count: int
+    worker_count: int
+    per_process_batch_size: int
+    designated_targets_only: bool
+    steps_per_epoch: int
+
 
 GradScaler = getattr(torch.amp, "GradScaler", torch.cuda.amp.GradScaler)
 
@@ -73,7 +87,7 @@ def parameter_groups(predictor: torch.nn.Module) -> list[dict[str, Any]]:
     ]
 
 
-def optimiser_steps_per_epoch(scenario_paths: list[Path], worker_count: int,
+def optimiser_steps_per_epoch(scenario_paths: list[Path], *, worker_count: int,
                               batch_size: int,
                               designated_targets_only: bool) -> int:
     """Steps per epoch, the sum over worker streams of ceil(targets / batch
@@ -151,7 +165,8 @@ def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
     return bool(shared_decision.item())
 
 
-def epochs_left_to_train(completed_epochs: int, requested_epochs: int) -> range:
+def epochs_left_to_train(*, completed_epochs: int,
+                         requested_epochs: int) -> range:
     return range(completed_epochs, requested_epochs)
 
 
@@ -201,12 +216,10 @@ def optimisation_step(predictor: torch.nn.Module,
     return gradient_norm > gradient_clip_norm, was_skipped
 
 
-def train_epoch(
-    predictor: torch.nn.Module, optimizer: torch.optim.Optimizer,
-    gradient_scaler: GradScaler, batches: Iterable[SceneBatch],
-    device: torch.device, settings: RunSettings, epoch_index: int,
-    steps_before_epoch: int
-) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+def train_epoch(predictor: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                gradient_scaler: GradScaler, batches: Iterable[SceneBatch],
+                device: torch.device, settings: RunSettings, epoch_index: int,
+                steps_before_epoch: int) -> EpochSummary:
     """One pass over the data.
 
     Each batch goes through forward and loss, the optimiser step and the
@@ -219,7 +232,7 @@ def train_epoch(
     wait_start = time.perf_counter()
     checkpoint_wait_start = time.perf_counter()
     for batch in batches:
-        progress.seconds["data_wait"] += time.perf_counter() - wait_start
+        progress.seconds.data_wait += time.perf_counter() - wait_start
 
         step_start = time.perf_counter()
         batch = batch.each(lambda tensor: tensor.to(device, non_blocking=True))
@@ -241,11 +254,11 @@ def train_epoch(
         total_is_finite = progress.record_step(
             step, was_clipped, was_skipped,
             batch.targets.agent_history.shape[0])
-        progress.seconds["step"] += time.perf_counter() - step_start
+        progress.seconds.step += time.perf_counter() - step_start
 
         monitor_start = time.perf_counter()
         progress.record_monitor(step, batch)
-        progress.seconds["monitor"] += time.perf_counter() - monitor_start
+        progress.seconds.monitor += time.perf_counter() - monitor_start
 
         if progress.batch_count % LOG_EVERY_BATCHES == 0:
             if settings.is_main_process:
@@ -271,11 +284,11 @@ def train_epoch(
                                      gradient_scaler,
                                      seed=settings.seed,
                                      completed_epochs=epoch_index,
-                                     epoch_plan=settings.epoch_plan),
+                                     epoch_plan=settings.epoch_plan._asdict()),
                 )
             checkpoint_wait_start = time.perf_counter()
         wait_start = time.perf_counter()
-    return progress.averages(), progress.accumulator.results(), progress.seconds
+    return progress.summary()
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -344,7 +357,7 @@ def resume_training(arguments: argparse.Namespace, predictor: MotionPredictor,
                     optimizer: torch.optim.Optimizer,
                     gradient_scaler: GradScaler, previous_checkpoint_path: Path,
                     device: torch.device,
-                    processes: Processes) -> tuple[int, dict[str, Any] | None]:
+                    processes: Processes) -> tuple[int, EpochPlan | None]:
     """Loads the checkpoint when --resume is set and returns how many epochs
     are already complete and the epoch plan it was trained under.
 
@@ -370,7 +383,9 @@ def resume_training(arguments: argparse.Namespace, predictor: MotionPredictor,
     completed_epochs = checkpoint["completed_epochs"]
     announce(processes,
              f"resuming {resume_path}: {completed_epochs} epochs complete")
-    return completed_epochs, checkpoint.get("epoch_plan")
+    stored_plan = checkpoint.get("epoch_plan")
+    return completed_epochs, (None if stored_plan is None else EpochPlan(
+        **stored_plan))
 
 
 def decay_window(arguments: argparse.Namespace,
@@ -399,10 +414,9 @@ def build_training_objects(
     return predictor, optimizer, gradient_scaler
 
 
-def plan_epochs(
-        arguments: argparse.Namespace, processes: Processes,
-        device: torch.device, stored_plan: dict[str, Any] | None
-) -> tuple[list[Path], dict[str, Any]]:
+def plan_epochs(arguments: argparse.Namespace, processes: Processes,
+                device: torch.device,
+                stored_plan: EpochPlan | None) -> tuple[list[Path], EpochPlan]:
     """Finds this process's share of the staged scenarios and the optimiser
     steps in one epoch, which the learning-rate schedule is measured in.
 
@@ -412,23 +426,23 @@ def plan_epochs(
     every_scenario_path = sorted(arguments.staged_directory.glob("*.npz"))
     scenario_paths = every_scenario_path[processes.rank::processes.count]
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
-    epoch_plan = {
-        "scenario_count": len(every_scenario_path),
-        "process_count": processes.count,
-        "worker_count": arguments.workers,
-        "per_process_batch_size": arguments.batch_size // processes.count,
-        "designated_targets_only": not arguments.all_eligible_agents,
-    }
-    if stored_plan is not None and all(
-            stored_plan.get(name) == value
-            for name, value in epoch_plan.items()):
-        epoch_plan["steps_per_epoch"] = stored_plan["steps_per_epoch"]
+    layout = EpochPlan(
+        scenario_count=len(every_scenario_path),
+        process_count=processes.count,
+        worker_count=arguments.workers,
+        per_process_batch_size=arguments.batch_size // processes.count,
+        designated_targets_only=not arguments.all_eligible_agents,
+        steps_per_epoch=0,
+    )
+    if (stored_plan is not None and
+            stored_plan._replace(steps_per_epoch=0) == layout):
         announce(processes, "optimiser step count read from the checkpoint")
-        return scenario_paths, epoch_plan
+        return scenario_paths, stored_plan
     steps_per_epoch = optimiser_steps_per_epoch(
-        scenario_paths, arguments.workers,
-        arguments.batch_size // processes.count,
-        not arguments.all_eligible_agents)
+        scenario_paths,
+        worker_count=layout.worker_count,
+        batch_size=layout.per_process_batch_size,
+        designated_targets_only=layout.designated_targets_only)
     if processes.count > 1:
         # Every process uses the longest share's step count, so the
         # schedule is the same everywhere.
@@ -442,19 +456,17 @@ def plan_epochs(
         f" {arguments.epochs} epochs, learning rate"
         f" {arguments.learning_rate} held after"
         f" {arguments.warmup_steps} warmup steps")
-    epoch_plan["steps_per_epoch"] = steps_per_epoch
-    return scenario_paths, epoch_plan
+    return scenario_paths, layout._replace(steps_per_epoch=steps_per_epoch)
 
 
 def build_run_settings(arguments: argparse.Namespace,
-                       previous_checkpoint_path: Path, epoch_plan: dict[str,
-                                                                        Any],
+                       previous_checkpoint_path: Path, epoch_plan: EpochPlan,
                        processes: Processes) -> RunSettings:
     """Gathers the settings that stay fixed for the whole run, and opens the
     TensorBoard event file beside the checkpoint on the main process.
     """
-    decay_start_step, decay_end_step = decay_window(
-        arguments, epoch_plan["steps_per_epoch"])
+    decay_start_step, decay_end_step = decay_window(arguments,
+                                                    epoch_plan.steps_per_epoch)
     summary_writer = None
     if processes.is_main:
         summary_writer = SummaryWriter(arguments.checkpoint_path.parent /
@@ -496,7 +508,8 @@ def main() -> None:
                                                     optimizer, gradient_scaler,
                                                     previous_checkpoint_path,
                                                     device, processes)
-    remaining_epochs = epochs_left_to_train(completed_epochs, arguments.epochs)
+    remaining_epochs = epochs_left_to_train(completed_epochs=completed_epochs,
+                                            requested_epochs=arguments.epochs)
     if not remaining_epochs:
         announce(
             processes, f"NOTHING TO TRAIN: {arguments.checkpoint_path} already"
@@ -506,7 +519,7 @@ def main() -> None:
 
     scenario_paths, epoch_plan = plan_epochs(arguments, processes, device,
                                              stored_plan)
-    steps_per_epoch = epoch_plan["steps_per_epoch"]
+    steps_per_epoch = epoch_plan.steps_per_epoch
     settings = build_run_settings(arguments, previous_checkpoint_path,
                                   epoch_plan, processes)
     if arguments.compile:
@@ -548,26 +561,24 @@ def main() -> None:
         if processes.count > 1:
             uneven_shares = Join([predictor])
         with uneven_shares:
-            averages, monitor, seconds = train_epoch(predictor, optimizer,
-                                                     gradient_scaler, batches,
-                                                     device, settings,
-                                                     epoch_index,
-                                                     steps_before_epoch)
+            summary = train_epoch(predictor, optimizer, gradient_scaler,
+                                  batches, device, settings, epoch_index,
+                                  steps_before_epoch)
         steps_before_epoch += steps_per_epoch
         last_epoch_seconds = time.perf_counter() - epoch_start
         if processes.is_main:
             report_scalars(
                 settings.summary_writer,
                 f"epoch {epoch_index + 1}/{arguments.epochs}",
-                epoch_scalars(averages, monitor, seconds),
+                epoch_scalars(summary),
                 epoch_index + 1,
             )
             settings.summary_writer.flush()
 
-        if not math.isfinite(averages["total"]):
+        if not math.isfinite(summary.losses.total):
             announce(
                 processes, f"epoch {epoch_index + 1} mean total loss"
-                f" {averages['total']}, checkpoint left as it was")
+                f" {summary.losses.total}, checkpoint left as it was")
         elif processes.is_main:
             save_checkpoint(
                 arguments.checkpoint_path,
@@ -577,7 +588,7 @@ def main() -> None:
                                  gradient_scaler,
                                  seed=arguments.seed,
                                  completed_epochs=epoch_index + 1,
-                                 epoch_plan=settings.epoch_plan),
+                                 epoch_plan=settings.epoch_plan._asdict()),
             )
 
         elapsed_seconds = time.perf_counter() - training_start

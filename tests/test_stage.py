@@ -15,7 +15,7 @@ from womd_protos import map_pb2, scenario_pb2
 STAGING_PIN_PATH = Path(__file__).parent / "staging_pinned.json"
 
 
-def add_track(scenario, track_id, object_type, base_x, base_y):
+def add_track(scenario, *, track_id, object_type, base_x, base_y):
     """Adds a fully valid track that moves 0.1 m per step along x."""
     track = scenario.tracks.add()
     track.id = track_id
@@ -40,9 +40,21 @@ def build_fixture_scenario(scenario_id):
     scenario.scenario_id = scenario_id
     scenario.current_time_index = contract.CURRENT_STEP_INDEX
     scenario.sdc_track_index = 0
-    add_track(scenario, 100, scenario_pb2.Track.TYPE_VEHICLE, 0.0, 0.0)
-    add_track(scenario, 200, scenario_pb2.Track.TYPE_PEDESTRIAN, 5.0, 5.0)
-    add_track(scenario, 300, scenario_pb2.Track.TYPE_OTHER, -5.0, 2.0)
+    add_track(scenario,
+              track_id=100,
+              object_type=scenario_pb2.Track.TYPE_VEHICLE,
+              base_x=0.0,
+              base_y=0.0)
+    add_track(scenario,
+              track_id=200,
+              object_type=scenario_pb2.Track.TYPE_PEDESTRIAN,
+              base_x=5.0,
+              base_y=5.0)
+    add_track(scenario,
+              track_id=300,
+              object_type=scenario_pb2.Track.TYPE_OTHER,
+              base_x=-5.0,
+              base_y=2.0)
     scenario.tracks_to_predict.add().track_index = 1
     scenario.objects_of_interest.append(300)
 

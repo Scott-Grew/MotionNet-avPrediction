@@ -53,7 +53,7 @@ def eligible_track_indices(track_rows: np.ndarray, track_valid: np.ndarray,
     return np.flatnonzero(is_eligible)
 
 
-def sample_frame(track_rows: np.ndarray,
+def sample_frame(track_rows: np.ndarray, *,
                  track_index: int) -> tuple[np.ndarray, float]:
     """A track's agent frame at the current step, its position and heading."""
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
@@ -373,7 +373,7 @@ def build_target(scenario: StagedScenario, track_index: int,
     history = slice(0, contract.HISTORY_STEPS)
     future = slice(contract.CURRENT_STEP_INDEX + 1, None)
 
-    origin, heading = sample_frame(track_rows, track_index)
+    origin, heading = sample_frame(track_rows, track_index=track_index)
     agent_track = track_rows_to_agent_frame(track_rows[track_index], origin,
                                             heading)
 
