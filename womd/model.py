@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from womd import contract
+from womd.loader import SceneBatch
 
 # What the decoder returns per mode, a path and its per-step log sigma
 # in metres, a confidence logit and the anchor it grew from.
@@ -136,7 +137,7 @@ class MapDotEncoder(nn.Module):
 
 
 def pool_dots_to_chunk_tokens(
-        dot_embeddings: torch.Tensor, dot_chunk_slot: torch.Tensor,
+        dot_embeddings: torch.Tensor, dot_chunk_slot: torch.Tensor, *,
         batch_size: int, max_chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Max-pools dot embeddings (dots, hidden) into chunk tokens (batch, chunks,
     hidden); a chunk slot with no dots is absent.
@@ -235,49 +236,44 @@ class SceneEncoder(nn.Module):
         self.layers = nn.ModuleList(
             scene_attention_layer() for _ in range(SCENE_ATTENTION_ROUNDS))
 
-    def scene_tokens(
-            self,
-            batch: dict[str,
-                        torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def scene_tokens(self,
+                     batch: SceneBatch) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns tokens (scenes, agents + chunks, hidden), in that order,
         after self-attention, and a mask of which tokens are real.
         """
-        agent_signals = batch["scene_agent_signal_history"].flatten(
-            start_dim=-2)
-        agent_motion = self.scene_agent_encoder(
-            batch["scene_agent_history"], batch["scene_agent_history_mask"])
+        agent_signals = batch.scene_agent_signal_history.flatten(start_dim=-2)
+        agent_motion = self.scene_agent_encoder(batch.scene_agent_history,
+                                                batch.scene_agent_history_mask)
         agent_tokens = agent_motion + self.signal_projection(agent_signals)
 
         map_tokens, map_present = pool_dots_to_chunk_tokens(
-            self.map_encoder(batch["map_rows"]),
-            batch["map_dot_chunk_slot"],
-            agent_tokens.shape[0],
-            batch["map_chunk_signal_history"].shape[1],
+            self.map_encoder(batch.map_rows),
+            batch.map_dot_chunk_slot,
+            batch_size=agent_tokens.shape[0],
+            max_chunks=batch.map_chunk_signal_history.shape[1],
         )
         map_tokens = map_tokens + self.signal_projection(
-            batch["map_chunk_signal_history"].flatten(start_dim=-2))
+            batch.map_chunk_signal_history.flatten(start_dim=-2))
 
         tokens = torch.cat([agent_tokens, map_tokens], dim=1)
-        agent_present = batch["scene_agent_history_mask"].any(dim=-1)
+        agent_present = batch.scene_agent_history_mask.any(dim=-1)
         token_present = torch.cat([agent_present, map_present], dim=1)
         token_absent = ~token_present
         for layer in self.layers:
             tokens = layer(tokens, src_key_padding_mask=token_absent)
         return tokens, token_present
 
-    def forward(
-            self,
-            batch: dict[str,
-                        torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns each target's memory (targets, 1 + agents + chunks, hidden):
-        its own history token, then its scene's tokens with each token's pose in
-        the target's frame added, and a mask hiding tokens outside its crop.
+    def forward(self, batch: SceneBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns each target's memory (targets, 1 + agents + chunks, hidden),
+        its own history token and then its scene's tokens with each token's
+        pose in the target's frame added, and a mask hiding tokens outside its
+        crop.
         """
         tokens, token_present = self.scene_tokens(batch)
 
-        own_signals = batch["agent_signal_history"].flatten(start_dim=-2)
-        own_motion = self.agent_encoder(batch["agent_history"],
-                                        batch["agent_history_mask"])
+        own_signals = batch.agent_signal_history.flatten(start_dim=-2)
+        own_motion = self.agent_encoder(batch.agent_history,
+                                        batch.agent_history_mask)
         own_token = own_motion + self.signal_projection(own_signals)
         own_token = own_token.unsqueeze(1)
         own_present = torch.ones(
@@ -287,11 +283,11 @@ class SceneEncoder(nn.Module):
         )
 
         # A scene with several targets is repeated once per target.
-        scene_of_target = batch["target_scene_index"]
-        pose_embedding = self.pose_projection(batch["token_pose"] /
+        scene_of_target = batch.target_scene_index
+        pose_embedding = self.pose_projection(batch.token_pose /
                                               self.pose_divisors)
         target_view = tokens[scene_of_target] + pose_embedding
-        view_present = token_present[scene_of_target] & batch["token_visible"]
+        view_present = token_present[scene_of_target] & batch.token_visible
         return (
             torch.cat([own_token, target_view], dim=1),
             torch.cat([own_present, view_present], dim=1),
@@ -423,7 +419,7 @@ class MotionPredictor(nn.Module):
     def unit_anchors(self) -> torch.Tensor:
         return self.mode_decoder.unit_anchors
 
-    def predict(self, batch: dict[str, torch.Tensor]) -> ModePredictions:
+    def predict(self, batch: SceneBatch) -> ModePredictions:
         """Runs the full scene encoder and mode decoder pipeline for one batch,
         selecting anchors by each agent's predicted type.
         """
@@ -431,12 +427,12 @@ class MotionPredictor(nn.Module):
         return self.mode_decoder(
             tokens,
             token_present,
-            predicted_type_index(batch["agent_history"]),
+            predicted_type_index(batch.agent_history),
         )
 
     def forward(
         self,
-        batch: dict[str, torch.Tensor],
+        batch: SceneBatch,
         with_likelihood_outputs: bool = False
     ) -> ModePredictions | tuple[torch.Tensor, torch.Tensor]:
         """Returns everything predict() does for training, or just the

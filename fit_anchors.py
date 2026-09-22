@@ -44,7 +44,7 @@ def metre_endpoints(
             scenario_array["track_rows"],
             scenario_array["track_valid"],
             scenario_array["is_designated_target"],
-            True,
+            designated_targets_only=True,
         )
         scene_sample = loader.build_scene_sample(scenario_array,
                                                  eligible.tolist())

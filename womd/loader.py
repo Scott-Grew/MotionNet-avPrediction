@@ -1,6 +1,7 @@
 """Turns a staged scenario into model inputs, the scene once in the staged
-scene frame plus each predicted agent's own view of it. The layout is drawn at
-the end of this file.
+scene frame plus each predicted agent's own view of it. SceneBatch names every
+array the model reads, and the two row layouts are drawn at the end of this
+file.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ BASE_RADIUS_METRES = 80.0
 STRETCH_GAIN = 0.5
 
 
-def inside_crop(agent_frame_points: np.ndarray, base_radius: float,
+def inside_crop(agent_frame_points: np.ndarray, *, base_radius: float,
                 forward_stretch: float) -> np.ndarray:
     """Ellipse crop test in agent-frame coordinates. Ahead of the agent the
     radius stretches by forward_stretch; behind it is a circle.
@@ -36,7 +37,7 @@ def inside_crop(agent_frame_points: np.ndarray, base_radius: float,
 
 
 def eligible_track_indices(track_rows: np.ndarray, track_valid: np.ndarray,
-                           is_designated_target: np.ndarray,
+                           is_designated_target: np.ndarray, *,
                            designated_targets_only: bool) -> np.ndarray:
     """Indices of tracks valid at the current step and of a predicted object
     type, optionally restricted to designated targets.
@@ -322,8 +323,8 @@ def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
     dot_inside_crop = inside_crop(
         frame_ops.positions_to_frame(map_rows[:, contract.MAP_POSITION], origin,
                                      heading),
-        BASE_RADIUS_METRES,
-        1.0 + STRETCH_GAIN * speed,
+        base_radius=BASE_RADIUS_METRES,
+        forward_stretch=1.0 + STRETCH_GAIN * speed,
     )
     # A chunk is visible if any of its dots falls inside the crop.
     dots_inside_per_chunk = np.bincount(tokens.dot_chunk_index,
@@ -390,8 +391,32 @@ def pad_and_stack(arrays: list[np.ndarray], padded_length: int,
     return padded
 
 
-def build_scene_batch(
-        scene_samples: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+class SceneBatch(NamedTuple):
+    """One batch of S scenes holding B predicted agents, with A agents and C
+    map chunks in the largest scene and D map dots in the whole batch.
+
+    Padding is zero. The scene fields are in the staged scene frame and the
+    target fields in each predicted agent's own frame. The DataLoader hands
+    the same fields on as torch tensors. The two future fields are absent
+    from an inference batch.
+    """
+    scene_agent_history: np.ndarray  # (S, A, 11, 13)
+    scene_agent_history_mask: np.ndarray  # (S, A, 11)
+    scene_agent_signal_history: np.ndarray  # (S, A, 11, 9)
+    map_rows: np.ndarray  # (D, 32)
+    map_dot_chunk_slot: np.ndarray  # (D,) scene * C + chunk
+    map_chunk_signal_history: np.ndarray  # (S, C, 11, 9)
+    target_scene_index: np.ndarray  # (B,)
+    agent_history: np.ndarray  # (B, 11, 13)
+    agent_history_mask: np.ndarray  # (B, 11)
+    agent_signal_history: np.ndarray  # (B, 11, 9)
+    token_visible: np.ndarray  # (B, A + C)
+    token_pose: np.ndarray  # (B, A + C, 4) x, y, cos, sin
+    future_positions: np.ndarray | None = None  # (B, 80, 2)
+    future_mask: np.ndarray | None = None  # (B, 80)
+
+
+def build_scene_batch(scene_samples: list[dict[str, Any]]) -> SceneBatch:
     """Joins scene samples into one batch.
 
     Scene agents and map chunks are zero-padded to the largest scene, map dots
@@ -432,55 +457,34 @@ def build_scene_batch(
         for scene_index, scene in enumerate(scene_samples)
     ]
 
-    batch = {
-        "scene_agent_history": scene_entry("scene_agent_history", max_agents,
-                                           np.float32),
-        "scene_agent_history_mask": scene_entry("scene_agent_history_mask",
-                                                max_agents, bool),
-        "scene_agent_signal_history": scene_entry("scene_agent_signal_history",
-                                                  max_agents, np.float32),
-        "map_rows": np.concatenate(
-            [scene["map_rows"] for scene in scene_samples], dtype=np.float32),
-        "map_dot_chunk_slot": np.concatenate(dot_chunk_slots, dtype=np.int64),
-        "map_chunk_signal_history": scene_entry("map_chunk_signal_history",
-                                                max_chunks, np.float32),
-        "target_scene_index": np.array(
-            [scene_index for scene_index, _ in targets], dtype=np.int64),
-    }
-    for key in ("agent_history", "agent_history_mask", "agent_signal_history",
-                "future_positions", "future_mask"):
-        batch[key] = target_entry(key)
-    batch["token_visible"] = target_tokens("agent_token_visible",
-                                           "chunk_token_visible", bool)
-    batch["token_pose"] = target_tokens("agent_token_pose", "chunk_token_pose",
-                                        np.float32)
-    return batch
+    return SceneBatch(
+        scene_agent_history=scene_entry("scene_agent_history", max_agents,
+                                        np.float32),
+        scene_agent_history_mask=scene_entry("scene_agent_history_mask",
+                                             max_agents, bool),
+        scene_agent_signal_history=scene_entry("scene_agent_signal_history",
+                                               max_agents, np.float32),
+        map_rows=np.concatenate([scene["map_rows"] for scene in scene_samples],
+                                dtype=np.float32),
+        map_dot_chunk_slot=np.concatenate(dot_chunk_slots, dtype=np.int64),
+        map_chunk_signal_history=scene_entry("map_chunk_signal_history",
+                                             max_chunks, np.float32),
+        target_scene_index=np.array([scene_index for scene_index, _ in targets],
+                                    dtype=np.int64),
+        agent_history=target_entry("agent_history"),
+        agent_history_mask=target_entry("agent_history_mask"),
+        agent_signal_history=target_entry("agent_signal_history"),
+        token_visible=target_tokens("agent_token_visible",
+                                    "chunk_token_visible", bool),
+        token_pose=target_tokens("agent_token_pose", "chunk_token_pose",
+                                 np.float32),
+        future_positions=target_entry("future_positions"),
+        future_mask=target_entry("future_mask"),
+    )
 
 
 # ------------------------------------------------------------------
-# WHAT THE MODEL READS, one batch from build_scene_batch(). S scenes,
-# B predicted agents across them, A agents and C map chunks in the
-# largest scene, D map dots in the whole batch. Padding is zero.
-#
-# Once per scene, in the staged scene frame.
-#
-#   scene_agent_history         (S, A, 11, 13)  every agent, 11 steps
-#   scene_agent_history_mask    (S, A, 11)
-#   scene_agent_signal_history  (S, A, 11, 9)   its lane's traffic light
-#   map_rows                    (D, 32)         one row per map dot
-#   map_dot_chunk_slot          (D,)            scene * C + chunk
-#   map_chunk_signal_history    (S, C, 11, 9)
-#
-# Once per predicted agent, in that agent's own frame.
-#
-#   target_scene_index    (B,)            which scene it belongs to
-#   agent_history         (B, 11, 13)     the agent, 11 steps
-#   agent_history_mask    (B, 11)
-#   agent_signal_history  (B, 11, 9)
-#   token_visible         (B, A + C)      tokens inside its crop
-#   token_pose            (B, A + C, 4)   each token's x y cos sin
-#   future_positions      (B, 80, 2)      the answer, for the loss
-#   future_mask           (B, 80)
+# THE TWO ROW LAYOUTS a SceneBatch is built from.
 #
 # One agent row, per 0.1 s step.
 #

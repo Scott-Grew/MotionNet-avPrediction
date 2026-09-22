@@ -15,8 +15,9 @@ import numpy as np
 import onnxruntime
 import torch
 
-from womd import loader, model
+from womd import loader, model, pipeline
 from womd.checkpoint import load_anchor_file, load_checkpoint_state
+from womd.loader import SceneBatch
 
 SCENE_AGENT_NAMES = [
     "scene_agent_history",
@@ -31,11 +32,9 @@ TARGET_NAMES = [
     "token_visible",
     "token_pose",
 ]
-INPUT_NAMES = (SCENE_AGENT_NAMES + [
-    "map_rows",
-    "map_dot_chunk_slot",
-    "map_chunk_signal_history",
-] + TARGET_NAMES)
+INPUT_NAMES = [
+    name for name in SceneBatch._fields if not name.startswith("future")
+]
 OUTPUT_NAMES = ["trajectories", "confidence_logits"]
 WARMUP_RUNS = 2
 
@@ -51,10 +50,10 @@ class PositionalInputs(torch.nn.Module):
 
     def forward(self, *tensors:
                 torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rebuilds the model's dict input from positional tensors, in the fixed
+        """Rebuilds the model's SceneBatch from positional tensors, in the fixed
         order INPUT_NAMES declares.
         """
-        return self.predictor(dict(zip(INPUT_NAMES, tensors)))
+        return self.predictor(SceneBatch(**dict(zip(INPUT_NAMES, tensors))))
 
 
 def padded_along(tensor: torch.Tensor, dimension: int,
@@ -77,22 +76,22 @@ def last_row_repeated_to(tensor: torch.Tensor, length: int) -> torch.Tensor:
     ])
 
 
-def padded_to_fixed_shape(batch: dict[str, torch.Tensor], agent_count: int,
+def padded_to_fixed_shape(batch: SceneBatch, *, agent_count: int,
                           chunk_count: int, dot_count: int,
-                          target_count: int) -> dict[str, torch.Tensor]:
+                          target_count: int) -> SceneBatch:
     """Pads one scene batch to fixed agent, chunk, dot and target counts so
     differently sized scenes can share one exported graph.
     """
-    batch_agent_count = batch["scene_agent_history"].shape[1]
-    batch_chunk_count = batch["map_chunk_signal_history"].shape[1]
-    slot = batch["map_dot_chunk_slot"]
+    batch_agent_count = batch.scene_agent_history.shape[1]
+    batch_chunk_count = batch.map_chunk_signal_history.shape[1]
+    slot = batch.map_dot_chunk_slot
     fixed = {
-        name: padded_along(batch[name], 1, agent_count)
+        name: padded_along(getattr(batch, name), 1, agent_count)
         for name in SCENE_AGENT_NAMES
     }
     fixed["map_chunk_signal_history"] = padded_along(
-        batch["map_chunk_signal_history"], 1, chunk_count)
-    fixed["map_rows"] = last_row_repeated_to(batch["map_rows"], dot_count)
+        batch.map_chunk_signal_history, 1, chunk_count)
+    fixed["map_rows"] = last_row_repeated_to(batch.map_rows, dot_count)
     # A slot is scene index * chunk count + chunk index, so the stride
     # changes when the chunk count is padded.
     fixed["map_dot_chunk_slot"] = last_row_repeated_to(
@@ -102,24 +101,22 @@ def padded_to_fixed_shape(batch: dict[str, torch.Tensor], agent_count: int,
     # The token axis holds the scene agents and then the map chunks, so each
     # half is padded separately before being joined back together.
     for name in ("token_visible", "token_pose"):
+        tokens = getattr(batch, name)
         fixed[name] = torch.cat(
             [
-                padded_along(batch[name][:, :batch_agent_count], 1,
-                             agent_count),
-                padded_along(batch[name][:, batch_agent_count:], 1,
-                             chunk_count),
+                padded_along(tokens[:, :batch_agent_count], 1, agent_count),
+                padded_along(tokens[:, batch_agent_count:], 1, chunk_count),
             ],
             dim=1,
         )
     for name in TARGET_NAMES:
-        fixed[name] = last_row_repeated_to(fixed.get(name, batch[name]),
-                                           target_count)
-    return fixed
+        fixed[name] = last_row_repeated_to(
+            fixed.get(name, getattr(batch, name)), target_count)
+    return SceneBatch(**fixed)
 
 
-def milliseconds_per_scene(
-        run_once: Callable[[dict[str, torch.Tensor]], object],
-        fixed_batches: list[dict[str, torch.Tensor]]) -> list[float]:
+def milliseconds_per_scene(run_once: Callable[[SceneBatch], object],
+                           fixed_batches: list[SceneBatch]) -> list[float]:
     """Times run_once over each fixed batch after a few warm-up calls, returning
     one duration in milliseconds per scene.
     """
@@ -134,33 +131,35 @@ def milliseconds_per_scene(
 
 
 def export_and_measure_bucket(
-        predictor: torch.nn.Module, batches: list[dict[str, torch.Tensor]],
-        onnx_path: Path, thread_count: int,
+        predictor: torch.nn.Module, batches: list[SceneBatch], onnx_path: Path,
+        thread_count: int,
         device: torch.device) -> tuple[float, float, list[float], list[float]]:
     """Pads a bucket's scenes to its largest shape, exports at that shape,
     measures padding and export error, and times both.
     """
-    agent_count = max(
-        batch["scene_agent_history"].shape[1] for batch in batches)
+    agent_count = max(batch.scene_agent_history.shape[1] for batch in batches)
     chunk_count = max(
-        batch["map_chunk_signal_history"].shape[1] for batch in batches)
-    dot_count = max(len(batch["map_rows"]) for batch in batches)
-    target_count = max(len(batch["agent_history"]) for batch in batches)
+        batch.map_chunk_signal_history.shape[1] for batch in batches)
+    dot_count = max(len(batch.map_rows) for batch in batches)
+    target_count = max(len(batch.agent_history) for batch in batches)
     fixed_batches = [
-        padded_to_fixed_shape(batch, agent_count, chunk_count, dot_count,
-                              target_count) for batch in batches
+        padded_to_fixed_shape(batch,
+                              agent_count=agent_count,
+                              chunk_count=chunk_count,
+                              dot_count=dot_count,
+                              target_count=target_count) for batch in batches
     ]
     with torch.no_grad():
         padding_gap = max(
             float((predictor(batch)[0] -
-                   predictor(fixed_batch)[0][:len(batch["agent_history"])]
+                   predictor(fixed_batch)[0][:len(batch.agent_history)]
                   ).abs().max())
             for batch, fixed_batch in zip(batches, fixed_batches))
     # The map-chunk axis is left symbolic because the exporter folds it
     # incorrectly when it is treated as fixed like the other axes.
     torch.onnx.export(
         PositionalInputs(predictor),
-        tuple(fixed_batches[0][name] for name in INPUT_NAMES),
+        tuple(getattr(fixed_batches[0], name) for name in INPUT_NAMES),
         str(onnx_path),
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
@@ -180,18 +179,16 @@ def export_and_measure_bucket(
     )
     device_predictor = PositionalInputs(predictor).to(device)
 
-    def run_onnx(fixed_batch: dict[str, torch.Tensor]) -> list[np.ndarray]:
+    def run_onnx(fixed_batch: SceneBatch) -> list[np.ndarray]:
         return session.run(
             OUTPUT_NAMES,
-            {name: fixed_batch[name].numpy() for name in INPUT_NAMES},
+            {name: getattr(fixed_batch, name).numpy() for name in INPUT_NAMES},
         )
 
-    def run_torch(
-        fixed_batch: dict[str,
-                          torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def run_torch(fixed_batch: SceneBatch) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            trajectories, confidence_logits = device_predictor(
-                *(fixed_batch[name].to(device) for name in INPUT_NAMES))
+            trajectories, confidence_logits = device_predictor(*(
+                getattr(fixed_batch, name).to(device) for name in INPUT_NAMES))
         return trajectories.cpu(), confidence_logits.cpu()
 
     export_gap = max(
@@ -212,7 +209,7 @@ def export_and_measure_bucket(
 
 
 def designated_target_scene_batches(
-        scenario_paths: list[Path]) -> Iterator[dict[str, torch.Tensor]]:
+        scenario_paths: list[Path]) -> Iterator[SceneBatch]:
     """Yields one scene batch per scenario that has designated targets, skipping
     any scenario with none.
     """
@@ -222,17 +219,15 @@ def designated_target_scene_batches(
             scenario_array["track_rows"],
             scenario_array["track_valid"],
             scenario_array["is_designated_target"],
-            True,
+            designated_targets_only=True,
         )
         if not len(track_indices):
             continue
-        yield {
-            name: torch.from_numpy(array)
-            for name, array in loader.build_scene_batch([
+        yield pipeline.torch_batch(
+            loader.build_scene_batch([
                 loader.build_scene_sample(scenario_array,
                                           track_indices.tolist())
-            ]).items()
-        }
+            ]))
 
 
 def main() -> None:
@@ -261,7 +256,7 @@ def main() -> None:
         designated_target_scene_batches(
             sorted(arguments.staged_directory.glob("*.npz"))
             [:arguments.scenarios]),
-        key=lambda batch: batch["token_visible"].shape[1],
+        key=lambda batch: batch.token_visible.shape[1],
     )
     assert (len(batches) >= arguments.buckets
            ), f"{len(batches)} scenes cannot fill {arguments.buckets} buckets"

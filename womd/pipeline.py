@@ -15,6 +15,13 @@ from torch.utils.data import (
 )
 
 from womd import loader
+from womd.loader import SceneBatch
+
+
+def torch_batch(batch: SceneBatch) -> SceneBatch:
+    """The same batch with every numpy array turned into a torch tensor."""
+    return SceneBatch(*(
+        None if array is None else torch.from_numpy(array) for array in batch))
 
 
 class SceneBatchStream(IterableDataset):
@@ -22,14 +29,14 @@ class SceneBatchStream(IterableDataset):
     predicted agents, splitting scenario files across DataLoader workers.
     """
 
-    def __init__(self, scenario_paths: list[Path], seed: int,
+    def __init__(self, scenario_paths: list[Path], *, seed: int,
                  designated_targets_only: bool, targets_per_batch: int) -> None:
         self.scenario_paths = scenario_paths
         self.seed = seed
         self.designated_targets_only = designated_targets_only
         self.targets_per_batch = targets_per_batch
 
-    def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
+    def __iter__(self) -> Iterator[SceneBatch]:
         """For this worker's scenario slice, shuffles scenarios and each one's
         eligible tracks with a per-worker seeded generator.
 
@@ -51,7 +58,7 @@ class SceneBatchStream(IterableDataset):
                     scenario_arrays["track_rows"],
                     scenario_arrays["track_valid"],
                     scenario_arrays["is_designated_target"],
-                    self.designated_targets_only,
+                    designated_targets_only=self.designated_targets_only,
                 )).tolist()
             while waiting_track_indices:
                 taken_track_indices = waiting_track_indices[:free_slots]
@@ -69,7 +76,7 @@ class SceneBatchStream(IterableDataset):
             yield loader.build_scene_batch(scene_samples)
 
 
-def batches(scenario_paths: list[Path], worker_count: int, batch_size: int,
+def batches(scenario_paths: list[Path], *, worker_count: int, batch_size: int,
             prefetch_batches: int, seed: int,
             designated_targets_only: bool) -> DataLoader:
     """Wraps SceneBatchStream in a DataLoader with the given worker count and
@@ -79,8 +86,10 @@ def batches(scenario_paths: list[Path], worker_count: int, batch_size: int,
     DataLoader only converts their numpy arrays to torch tensors.
     """
     return DataLoader(
-        SceneBatchStream(scenario_paths, seed, designated_targets_only,
-                         batch_size),
+        SceneBatchStream(scenario_paths,
+                         seed=seed,
+                         designated_targets_only=designated_targets_only,
+                         targets_per_batch=batch_size),
         batch_size=None,
         num_workers=worker_count,
         prefetch_factor=(prefetch_batches if worker_count > 0 else None),

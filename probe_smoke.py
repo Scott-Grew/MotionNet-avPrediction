@@ -14,6 +14,7 @@ import torch
 import train
 from womd import baseline, metrics, pipeline
 from womd.checkpoint import load_anchor_file
+from womd.loader import SceneBatch
 from womd.model import QUERY_COUNT, MotionPredictor
 
 
@@ -62,15 +63,15 @@ def check_step_is_healthy(step: train.TrainingStep, batch_index: int) -> None:
 
 
 def median_end_distances(
-    step: train.TrainingStep, batch: dict[str, torch.Tensor]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        step: train.TrainingStep,
+        batch: SceneBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Median distance from the start to the final step, in metres, for the
     predictions, the logged futures and the constant-velocity null.
     """
-    scoreable = batch["future_mask"].any(dim=-1)
+    scoreable = batch.future_mask.any(dim=-1)
     predicted_ends = step.trajectories.detach()[scoreable, :, -1]
-    logged_ends = batch["future_positions"][scoreable, -1]
-    null_trajectories, _ = baseline.constant_velocity(batch)
+    logged_ends = batch.future_positions[scoreable, -1]
+    null_trajectories, _ = baseline.constant_velocity(batch.agent_history)
     null_ends = null_trajectories[scoreable, 0, -1]
     return (
         predicted_ends.norm(dim=-1).median(),
@@ -95,8 +96,14 @@ def main() -> None:
         raise SystemExit(
             f"{arguments.staged_directory} has fewer than one batch"
             f" of scenarios")
-    batches = pipeline.batches(scenario_paths, 0, arguments.batch_size, 0,
-                               arguments.seed, True)
+    batches = pipeline.batches(
+        scenario_paths,
+        worker_count=0,
+        batch_size=arguments.batch_size,
+        prefetch_batches=0,
+        seed=arguments.seed,
+        designated_targets_only=True,
+    )
 
     winner_counts = torch.zeros(QUERY_COUNT, dtype=torch.long)
     end_distances = []
@@ -115,8 +122,8 @@ def main() -> None:
         optimizer.step()
 
         mode_distances = metrics.mean_distance_per_mode(
-            step.trajectories.detach(), batch["future_positions"],
-            batch["future_mask"])
+            step.trajectories.detach(), batch.future_positions,
+            batch.future_mask)
         winners = mode_distances.argmin(dim=1)
         winner_counts.scatter_add_(0, winners, torch.ones_like(winners))
         end_distances.append(median_end_distances(step, batch))

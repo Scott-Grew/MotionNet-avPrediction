@@ -9,6 +9,7 @@ import torch
 import train
 from reference_implementations import unit_anchor_offsets_per_type
 from womd import checkpoint, contract, model
+from womd.loader import SceneBatch
 from womd.model import MotionPredictor
 
 
@@ -22,43 +23,43 @@ def build_synthetic_map_rows(dot_count):
 
 def synthetic_batch():
     """A random two-target batch with three scene agents and four map chunks."""
-    return {
-        "agent_history": torch.randn(2, contract.HISTORY_STEPS,
-                                     contract.AGENT_FEATURE_DIM),
-        "agent_history_mask": torch.ones(2,
-                                         contract.HISTORY_STEPS,
-                                         dtype=torch.bool),
-        "scene_agent_history": torch.randn(2, 3, contract.HISTORY_STEPS,
-                                           contract.AGENT_FEATURE_DIM),
-        "scene_agent_history_mask": torch.ones(2,
-                                               3,
-                                               contract.HISTORY_STEPS,
-                                               dtype=torch.bool),
-        "agent_signal_history": torch.zeros(
-            2,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
-        ),
-        "scene_agent_signal_history": torch.zeros(
+    return SceneBatch(
+        scene_agent_history=torch.randn(2, 3, contract.HISTORY_STEPS,
+                                        contract.AGENT_FEATURE_DIM),
+        scene_agent_history_mask=torch.ones(2,
+                                            3,
+                                            contract.HISTORY_STEPS,
+                                            dtype=torch.bool),
+        scene_agent_signal_history=torch.zeros(
             2,
             3,
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "map_rows": build_synthetic_map_rows(20),
-        "map_dot_chunk_slot": torch.arange(20) // 5,
-        "map_chunk_signal_history": torch.zeros(
+        map_rows=build_synthetic_map_rows(20),
+        map_dot_chunk_slot=torch.arange(20) // 5,
+        map_chunk_signal_history=torch.zeros(
             2,
             4,
             contract.HISTORY_STEPS,
             contract.NUM_TRAFFIC_SIGNAL_STATES,
         ),
-        "target_scene_index": torch.arange(2),
-        "token_visible": torch.ones(2, 3 + 4, dtype=torch.bool),
-        "token_pose": torch.randn(2, 3 + 4, 4),
-        "future_positions": torch.randn(2, contract.FUTURE_STEPS, 2),
-        "future_mask": torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
-    }
+        target_scene_index=torch.arange(2),
+        agent_history=torch.randn(2, contract.HISTORY_STEPS,
+                                  contract.AGENT_FEATURE_DIM),
+        agent_history_mask=torch.ones(2,
+                                      contract.HISTORY_STEPS,
+                                      dtype=torch.bool),
+        agent_signal_history=torch.zeros(
+            2,
+            contract.HISTORY_STEPS,
+            contract.NUM_TRAFFIC_SIGNAL_STATES,
+        ),
+        token_visible=torch.ones(2, 3 + 4, dtype=torch.bool),
+        token_pose=torch.randn(2, 3 + 4, 4),
+        future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
+        future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
+    )
 
 
 def test_warmup_rises_then_holds():
@@ -67,15 +68,17 @@ def test_warmup_rises_then_holds():
     """
     warmup_steps = 20
     rates = [
-        train.scheduled_learning_rate(step, warmup_steps) for step in range(200)
+        train.scheduled_learning_rate(step, warmup_steps=warmup_steps)
+        for step in range(200)
     ]
     assert rates[0] < rates[warmup_steps - 1]
     assert all(
         later >= earlier
         for earlier, later in zip(rates[:warmup_steps], rates[1:warmup_steps]))
     assert all(rate == train.LEARNING_RATE for rate in rates[warmup_steps:])
-    assert (train.scheduled_learning_rate(warmup_steps + 5, warmup_steps,
-                                          1e-4) == 1e-4)
+    assert (train.scheduled_learning_rate(warmup_steps + 5,
+                                          warmup_steps=warmup_steps,
+                                          learning_rate=1e-4) == 1e-4)
 
 
 def test_rate_holds_then_falls_to_zero():
@@ -83,8 +86,8 @@ def test_rate_holds_then_falls_to_zero():
     rates = [
         train.scheduled_learning_rate(
             step,
-            20,
-            1e-3,
+            warmup_steps=20,
+            learning_rate=1e-3,
             decay_start_step=100,
             decay_end_step=200,
         ) for step in range(200)
@@ -103,8 +106,16 @@ def test_resuming_never_skips_a_completed_epoch():
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
-    interrupted = train.checkpoint_state(predictor, optimizer, scaler, 0, 2)
-    finished = train.checkpoint_state(predictor, optimizer, scaler, 0, 3)
+    interrupted = train.checkpoint_state(predictor,
+                                         optimizer,
+                                         scaler,
+                                         seed=0,
+                                         completed_epochs=2)
+    finished = train.checkpoint_state(predictor,
+                                      optimizer,
+                                      scaler,
+                                      seed=0,
+                                      completed_epochs=3)
     assert list(train.epochs_left_to_train(interrupted["completed_epochs"],
                                            5)) == [2, 3, 4]
     assert list(train.epochs_left_to_train(finished["completed_epochs"],
@@ -117,7 +128,11 @@ def test_checkpoint_round_trips(tmp_path,):
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
-    state = train.checkpoint_state(predictor, optimizer, scaler, 0, 1)
+    state = train.checkpoint_state(predictor,
+                                   optimizer,
+                                   scaler,
+                                   seed=0,
+                                   completed_epochs=1)
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(state, checkpoint_path)
     reloaded_state = checkpoint.load_checkpoint_state(checkpoint_path)

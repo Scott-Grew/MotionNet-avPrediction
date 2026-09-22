@@ -28,6 +28,7 @@ from womd.checkpoint import (
     load_checkpoint_state,
     parameter_fingerprint,
 )
+from womd.loader import SceneBatch
 from womd.model import QUERY_COUNT, MotionPredictor
 
 # One training step's three loss values and the raw predictions
@@ -91,13 +92,14 @@ def optimiser_steps_per_epoch(scenario_paths: list[Path], worker_count: int,
                         scenario_file["track_rows"],
                         scenario_file["track_valid"],
                         scenario_file["is_designated_target"],
-                        designated_targets_only,
+                        designated_targets_only=designated_targets_only,
                     ))
         step_count += math.ceil(stream_sample_count / batch_size)
     return step_count
 
 
 def scheduled_learning_rate(process_steps: int,
+                            *,
                             warmup_steps: int,
                             learning_rate: float = LEARNING_RATE,
                             decay_start_step: int | None = None,
@@ -118,7 +120,7 @@ def scheduled_learning_rate(process_steps: int,
 
 
 def training_losses(predictor: torch.nn.Module,
-                    batch: dict[str, torch.Tensor]) -> TrainingStep:
+                    batch: SceneBatch) -> TrainingStep:
     """Runs the predictor on a batch and returns its losses plus its raw
     trajectories and confidence logits.
     """
@@ -127,8 +129,8 @@ def training_losses(predictor: torch.nn.Module,
         predictions.trajectories,
         predictions.log_standard_deviation,
         predictions.confidence_logits,
-        batch["future_positions"],
-        batch["future_mask"],
+        batch.future_positions,
+        batch.future_mask,
         predictions.anchors,
     )
     return TrainingStep(
@@ -162,7 +164,7 @@ def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
 
 def checkpoint_state(predictor: torch.nn.Module,
                      optimizer: torch.optim.Optimizer,
-                     gradient_scaler: GradScaler, seed: int,
+                     gradient_scaler: GradScaler, *, seed: int,
                      completed_epochs: int) -> dict[str, Any]:
     """Bundles the model, optimizer and scaler state, training progress and a
     parameter fingerprint into a checkpoint dict.
@@ -261,16 +263,15 @@ class EpochProgress:
         self.gradient_scaler_skip_count += int(was_skipped)
         return total_is_finite
 
-    def record_monitor(self, step: TrainingStep,
-                       batch: dict[str, torch.Tensor]) -> None:
+    def record_monitor(self, step: TrainingStep, batch: SceneBatch) -> None:
         """Records the training monitor, which steers runs and is never a
         reported number. Also counts which mode came closest, to spot modes
         that never win.
         """
         trajectories = step.trajectories.detach().float()
         confidence_logits = step.confidence_logits.detach().float()
-        future_positions = batch["future_positions"]
-        future_mask = batch["future_mask"]
+        future_positions = batch.future_positions
+        future_mask = batch.future_mask
         with torch.no_grad():
             for metric_accumulator in (self.accumulator,
                                        self.window_accumulator):
@@ -282,7 +283,7 @@ class EpochProgress:
             self.window_winner_counts.scatter_add_(
                 0, window_winners, torch.ones_like(window_winners))
         self.batch_count += 1
-        self.sample_count += batch["agent_history"].shape[0]
+        self.sample_count += batch.agent_history.shape[0]
 
     def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
         """The table reported every LOG_EVERY_BATCHES, the losses, the training
@@ -378,7 +379,7 @@ def optimisation_step(predictor: torch.nn.Module,
 
 def train_epoch(
     predictor: torch.nn.Module, optimizer: torch.optim.Optimizer,
-    gradient_scaler: GradScaler, batches: Iterable[dict[str, torch.Tensor]],
+    gradient_scaler: GradScaler, batches: Iterable[SceneBatch],
     device: torch.device, settings: RunSettings, epoch_index: int,
     steps_before_epoch: int
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
@@ -397,10 +398,8 @@ def train_epoch(
         progress.seconds["data_wait"] += time.perf_counter() - wait_start
 
         step_start = time.perf_counter()
-        batch = {
-            name: tensor.to(device, non_blocking=True)
-            for name, tensor in batch.items()
-        }
+        batch = SceneBatch(
+            *(tensor.to(device, non_blocking=True) for tensor in batch))
         with torch.amp.autocast(device_type=device.type,
                                 enabled=gradient_scaler.is_enabled()):
             step = training_losses(predictor, batch)
@@ -408,10 +407,10 @@ def train_epoch(
         # resumed run needs no scheduler state.
         step_learning_rate = scheduled_learning_rate(
             steps_before_epoch + progress.batch_count,
-            settings.warmup_steps,
-            settings.learning_rate,
-            settings.decay_start_step,
-            settings.decay_end_step,
+            warmup_steps=settings.warmup_steps,
+            learning_rate=settings.learning_rate,
+            decay_start_step=settings.decay_start_step,
+            decay_end_step=settings.decay_end_step,
         )
         was_clipped, was_skipped = optimisation_step(
             predictor, optimizer, gradient_scaler, step.total,
@@ -442,8 +441,11 @@ def train_epoch(
                 save_checkpoint(
                     settings.checkpoint_path,
                     settings.previous_checkpoint_path,
-                    checkpoint_state(predictor, optimizer, gradient_scaler,
-                                     settings.seed, epoch_index),
+                    checkpoint_state(predictor,
+                                     optimizer,
+                                     gradient_scaler,
+                                     seed=settings.seed,
+                                     completed_epochs=epoch_index),
                 )
             checkpoint_wait_start = time.perf_counter()
         wait_start = time.perf_counter()
@@ -672,11 +674,11 @@ def main() -> None:
         epoch_start = time.perf_counter()
         batches = pipeline.batches(
             scenario_paths,
-            arguments.workers,
-            arguments.batch_size // processes.count,
-            arguments.prefetch,
-            arguments.seed + epoch_index,
-            designated_targets_only,
+            worker_count=arguments.workers,
+            batch_size=arguments.batch_size // processes.count,
+            prefetch_batches=arguments.prefetch,
+            seed=arguments.seed + epoch_index,
+            designated_targets_only=designated_targets_only,
         )
         uneven_shares = contextlib.nullcontext()
         if processes.count > 1:
@@ -706,8 +708,11 @@ def main() -> None:
             save_checkpoint(
                 arguments.checkpoint_path,
                 previous_checkpoint_path,
-                checkpoint_state(predictor, optimizer, gradient_scaler,
-                                 arguments.seed, epoch_index + 1),
+                checkpoint_state(predictor,
+                                 optimizer,
+                                 gradient_scaler,
+                                 seed=arguments.seed,
+                                 completed_epochs=epoch_index + 1),
             )
 
         elapsed_seconds = time.perf_counter() - training_start

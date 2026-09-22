@@ -21,12 +21,12 @@ def future_elapsed_seconds(device: torch.device,
 
 
 def current_state(
-    batch: dict[str, torch.Tensor]
+    agent_history: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reads each agent's current position, heading (from sin/cos) and velocity
     from the current history step.
     """
-    now_row = batch["agent_history"][:, contract.CURRENT_STEP_INDEX]
+    now_row = agent_history[:, contract.CURRENT_STEP_INDEX]
     heading = torch.atan2(
         now_row[:, contract.AGENT_HEADING_SINE],
         now_row[:, contract.AGENT_HEADING_COSINE],
@@ -53,27 +53,27 @@ def as_single_mode(
 
 
 def constant_velocity(
-        batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        agent_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Extrapolates the current position at the current velocity, unchanged
     over the horizon.
     """
-    position, _, velocity = current_state(batch)
+    position, _, velocity = current_state(agent_history)
     elapsed_seconds = future_elapsed_seconds(position.device, position.dtype)
     displacement = velocity[:, None, :] * elapsed_seconds[None, :, None]
     return as_single_mode(position[:, None, :] + displacement)
 
 
-def observed_yaw_rate(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+def observed_yaw_rate(agent_history: torch.Tensor,
+                      agent_history_mask: torch.Tensor) -> torch.Tensor:
     """Estimates a constant yaw rate from the heading change between the current
     step and the earliest valid history step.
     """
-    agent_history = batch["agent_history"]
     step_indices = torch.arange(contract.HISTORY_STEPS,
                                 device=agent_history.device)
     # Invalid steps are pushed past the last real index so that
     # min() finds the earliest step that actually has data.
     valid_step_indices = torch.where(
-        batch["agent_history_mask"],
+        agent_history_mask,
         step_indices,
         torch.full_like(step_indices, contract.HISTORY_STEPS),
     )
@@ -102,17 +102,20 @@ def observed_yaw_rate(batch: dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def constant_turn_rate_and_velocity(
-        batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        agent_history: torch.Tensor,
+        agent_history_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Extrapolates position along a constant-turn-rate, constant-speed arc
     from the observed yaw rate and forward speed.
     """
-    position, heading, velocity = current_state(batch)
+    position, heading, velocity = current_state(agent_history)
     heading_direction = torch.stack(
         [torch.cos(heading), torch.sin(heading)], dim=-1)
     forward_speed = (velocity * heading_direction).sum(dim=-1)
 
     elapsed_seconds = future_elapsed_seconds(position.device, position.dtype)
-    turn_angle = observed_yaw_rate(batch)[:, None] * elapsed_seconds[None, :]
+    turn_angle = (
+        observed_yaw_rate(agent_history, agent_history_mask)[:, None] *
+        elapsed_seconds[None, :])
     # For turn angle theta the chord is arc * sin(theta / 2) / (theta / 2),
     # which is arc * sinc(theta / 2 pi), and the chord direction bisects
     # the turn from the heading.
@@ -132,15 +135,15 @@ def constant_turn_rate_and_velocity(
 
 
 def straight_lines_to_most_used_anchors(
-        batch: dict[str, torch.Tensor],
+        agent_history: torch.Tensor,
         unit_anchors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Straight lines to each type's first NUM_PREDICTED_MODES anchor
     endpoints, with uniform confidence.
     """
-    predicted_type_index = model.predicted_type_index(batch["agent_history"])
-    endpoints = unit_anchors[
-        predicted_type_index][:, :contract.NUM_PREDICTED_MODES].to(
-            batch["agent_history"].dtype)
+    predicted_type_index = model.predicted_type_index(agent_history)
+    endpoints = unit_anchors[predicted_type_index][:, :contract.
+                                                   NUM_PREDICTED_MODES].to(
+                                                       agent_history.dtype)
     elapsed_seconds = future_elapsed_seconds(endpoints.device, endpoints.dtype)
     horizon_fraction = elapsed_seconds / FUTURE_HORIZON_SECONDS
     trajectories = (endpoints[:, :, None, :] *

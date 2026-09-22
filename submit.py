@@ -19,6 +19,7 @@ from womd import (
     frame_ops,
     loader,
     model,
+    pipeline,
     pruning,
 )
 from womd.checkpoint import load_anchor_file, load_checkpoint_state
@@ -58,7 +59,7 @@ def designated_target_scenes(
             scenario_array["track_rows"],
             scenario_array["track_valid"],
             scenario_array["is_designated_target"],
-            True,
+            designated_targets_only=True,
         )
         assert len(track_indices) == designated_count, (
             f"{scenario_path} designates {designated_count} targets"
@@ -74,13 +75,11 @@ def predict_for_submission(
     """One scene in, and its 54 modes at 10 Hz become Waymo's format of the 6
     kept modes at 2 Hz. predictor=None runs the constant-velocity null.
     """
-    scene_batch = loader.build_scene_batch([scene_sample])
-    batch = {
-        name: torch.from_numpy(array) for name, array in scene_batch.items()
-    }
+    batch = pipeline.torch_batch(loader.build_scene_batch([scene_sample]))
     with torch.no_grad():
         if predictor is None:
-            trajectories, confidence_logits = baseline.constant_velocity(batch)
+            trajectories, confidence_logits = baseline.constant_velocity(
+                batch.agent_history)
         else:
             trajectories, confidence_logits = predictor(batch)
     pruned_trajectories, _ = pruning.prune_modes_batched(
