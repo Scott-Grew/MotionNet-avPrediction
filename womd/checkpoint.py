@@ -74,12 +74,12 @@ def load_anchor_file(anchors_path: Path | str) -> torch.Tensor:
 
 
 def unwrapped(predictor: torch.nn.Module) -> torch.nn.Module:
-    """The bare model under the multi-process and torch.compile wrappers, so
-    a checkpoint holds plain parameter names however the run was launched.
+    """The bare model under the multi-process wrapper, so a checkpoint holds
+    plain parameter names whatever the process count.
     """
     if isinstance(predictor, DistributedDataParallel):
-        predictor = predictor.module
-    return getattr(predictor, "_orig_mod", predictor)
+        return predictor.module
+    return predictor
 
 
 def checkpoint_state(

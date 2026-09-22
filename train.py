@@ -314,7 +314,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
-    parser.add_argument("--compile", action="store_true")
     parser.add_argument("--all-eligible-agents", action="store_true")
     return parser.parse_args()
 
@@ -522,8 +521,6 @@ def main() -> None:
     steps_per_epoch = epoch_plan.steps_per_epoch
     settings = build_run_settings(arguments, previous_checkpoint_path,
                                   epoch_plan, processes)
-    if arguments.compile:
-        predictor = torch.compile(predictor, dynamic=True)
     if processes.count > 1:
         device_ids = [processes.local_rank] if device.type == "cuda" else None
         predictor = DistributedDataParallel(predictor, device_ids=device_ids)
