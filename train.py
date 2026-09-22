@@ -129,8 +129,8 @@ def training_losses(predictor: torch.nn.Module,
         predictions.trajectories,
         predictions.log_standard_deviation,
         predictions.confidence_logits,
-        batch.future_positions,
-        batch.future_mask,
+        batch.targets.future_positions,
+        batch.targets.future_mask,
         predictions.anchors,
     )
     return TrainingStep(
@@ -270,8 +270,8 @@ class EpochProgress:
         """
         trajectories = step.trajectories.detach().float()
         confidence_logits = step.confidence_logits.detach().float()
-        future_positions = batch.future_positions
-        future_mask = batch.future_mask
+        future_positions = batch.targets.future_positions
+        future_mask = batch.targets.future_mask
         with torch.no_grad():
             for metric_accumulator in (self.accumulator,
                                        self.window_accumulator):
@@ -283,7 +283,7 @@ class EpochProgress:
             self.window_winner_counts.scatter_add_(
                 0, window_winners, torch.ones_like(window_winners))
         self.batch_count += 1
-        self.sample_count += batch.agent_history.shape[0]
+        self.sample_count += batch.targets.agent_history.shape[0]
 
     def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
         """The table reported every LOG_EVERY_BATCHES, the losses, the training
@@ -398,8 +398,7 @@ def train_epoch(
         progress.seconds["data_wait"] += time.perf_counter() - wait_start
 
         step_start = time.perf_counter()
-        batch = SceneBatch(
-            *(tensor.to(device, non_blocking=True) for tensor in batch))
+        batch = batch.each(lambda tensor: tensor.to(device, non_blocking=True))
         with torch.amp.autocast(device_type=device.type,
                                 enabled=gradient_scaler.is_enabled()):
             step = training_losses(predictor, batch)

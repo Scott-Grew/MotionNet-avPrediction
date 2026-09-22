@@ -20,8 +20,7 @@ from womd.loader import SceneBatch
 
 def torch_batch(batch: SceneBatch) -> SceneBatch:
     """The same batch with every numpy array turned into a torch tensor."""
-    return SceneBatch(*(
-        None if array is None else torch.from_numpy(array) for array in batch))
+    return batch.each(torch.from_numpy)
 
 
 class SceneBatchStream(IterableDataset):

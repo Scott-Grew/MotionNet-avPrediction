@@ -68,10 +68,11 @@ def median_end_distances(
     """Median distance from the start to the final step, in metres, for the
     predictions, the logged futures and the constant-velocity null.
     """
-    scoreable = batch.future_mask.any(dim=-1)
+    targets = batch.targets
+    scoreable = targets.future_mask.any(dim=-1)
     predicted_ends = step.trajectories.detach()[scoreable, :, -1]
-    logged_ends = batch.future_positions[scoreable, -1]
-    null_trajectories, _ = baseline.constant_velocity(batch.agent_history)
+    logged_ends = targets.future_positions[scoreable, -1]
+    null_trajectories, _ = baseline.constant_velocity(targets.agent_history)
     null_ends = null_trajectories[scoreable, 0, -1]
     return (
         predicted_ends.norm(dim=-1).median(),
@@ -122,8 +123,8 @@ def main() -> None:
         optimizer.step()
 
         mode_distances = metrics.mean_distance_per_mode(
-            step.trajectories.detach(), batch.future_positions,
-            batch.future_mask)
+            step.trajectories.detach(), batch.targets.future_positions,
+            batch.targets.future_mask)
         winners = mode_distances.argmin(dim=1)
         winner_counts.scatter_add_(0, winners, torch.ones_like(winners))
         end_distances.append(median_end_distances(step, batch))

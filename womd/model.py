@@ -241,22 +241,23 @@ class SceneEncoder(nn.Module):
         """Returns tokens (scenes, agents + chunks, hidden), in that order,
         after self-attention, and a mask of which tokens are real.
         """
-        agent_signals = batch.scene_agent_signal_history.flatten(start_dim=-2)
-        agent_motion = self.scene_agent_encoder(batch.scene_agent_history,
-                                                batch.scene_agent_history_mask)
+        scene, scene_map = batch.scene, batch.map
+        agent_signals = scene.agent_signal_history.flatten(start_dim=-2)
+        agent_motion = self.scene_agent_encoder(scene.agent_history,
+                                                scene.agent_history_mask)
         agent_tokens = agent_motion + self.signal_projection(agent_signals)
 
         map_tokens, map_present = pool_dots_to_chunk_tokens(
-            self.map_encoder(batch.map_rows),
-            batch.map_dot_chunk_slot,
+            self.map_encoder(scene_map.rows),
+            scene_map.dot_chunk_slot,
             batch_size=agent_tokens.shape[0],
-            max_chunks=batch.map_chunk_signal_history.shape[1],
+            max_chunks=scene_map.chunk_signal_history.shape[1],
         )
         map_tokens = map_tokens + self.signal_projection(
-            batch.map_chunk_signal_history.flatten(start_dim=-2))
+            scene_map.chunk_signal_history.flatten(start_dim=-2))
 
         tokens = torch.cat([agent_tokens, map_tokens], dim=1)
-        agent_present = batch.scene_agent_history_mask.any(dim=-1)
+        agent_present = scene.agent_history_mask.any(dim=-1)
         token_present = torch.cat([agent_present, map_present], dim=1)
         token_absent = ~token_present
         for layer in self.layers:
@@ -270,10 +271,11 @@ class SceneEncoder(nn.Module):
         crop.
         """
         tokens, token_present = self.scene_tokens(batch)
+        targets = batch.targets
 
-        own_signals = batch.agent_signal_history.flatten(start_dim=-2)
-        own_motion = self.agent_encoder(batch.agent_history,
-                                        batch.agent_history_mask)
+        own_signals = targets.agent_signal_history.flatten(start_dim=-2)
+        own_motion = self.agent_encoder(targets.agent_history,
+                                        targets.agent_history_mask)
         own_token = own_motion + self.signal_projection(own_signals)
         own_token = own_token.unsqueeze(1)
         own_present = torch.ones(
@@ -283,11 +285,11 @@ class SceneEncoder(nn.Module):
         )
 
         # A scene with several targets is repeated once per target.
-        scene_of_target = batch.target_scene_index
-        pose_embedding = self.pose_projection(batch.token_pose /
+        scene_of_target = targets.scene_index
+        pose_embedding = self.pose_projection(targets.token_pose /
                                               self.pose_divisors)
         target_view = tokens[scene_of_target] + pose_embedding
-        view_present = token_present[scene_of_target] & batch.token_visible
+        view_present = token_present[scene_of_target] & targets.token_visible
         return (
             torch.cat([own_token, target_view], dim=1),
             torch.cat([own_present, view_present], dim=1),
@@ -427,7 +429,7 @@ class MotionPredictor(nn.Module):
         return self.mode_decoder(
             tokens,
             token_present,
-            predicted_type_index(batch.agent_history),
+            predicted_type_index(batch.targets.agent_history),
         )
 
     def forward(

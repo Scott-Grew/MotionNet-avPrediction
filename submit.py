@@ -29,15 +29,15 @@ SUBMISSION_STEP_SELECTOR = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
 
 
 def agent_frame_to_world_frame(
-        agent_frame_positions: np.ndarray, target: dict[str, Any],
+        agent_frame_positions: np.ndarray, target: loader.TargetSample,
         scenario_array: dict[str, np.ndarray]) -> np.ndarray:
     """Converts a prediction from the agent's own frame to world coordinates via
     the scene frame stored on the scenario.
     """
     scene_frame_positions = frame_ops.positions_from_frame(
         agent_frame_positions,
-        target["frame_origin"],
-        target["frame_heading"],
+        target.frame_origin,
+        target.frame_heading,
     )
     return frame_ops.positions_from_frame(
         scene_frame_positions,
@@ -48,7 +48,7 @@ def agent_frame_to_world_frame(
 
 def designated_target_scenes(
     staged_directory: Path | str
-) -> Iterator[tuple[dict[str, np.ndarray], dict[str, Any]]]:
+) -> Iterator[tuple[dict[str, np.ndarray], loader.SceneSample]]:
     """Yields (scenario_array, scene_sample) for each staged scenario, in file
     order, holding only the targets Waymo designated for scoring.
     """
@@ -71,7 +71,7 @@ def designated_target_scenes(
 
 def predict_for_submission(
         predictor: model.MotionPredictor | None,
-        scene_sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        scene_sample: loader.SceneSample) -> tuple[np.ndarray, np.ndarray]:
     """One scene in, and its 54 modes at 10 Hz become Waymo's format of the 6
     kept modes at 2 Hz. predictor=None runs the constant-velocity null.
     """
@@ -79,7 +79,7 @@ def predict_for_submission(
     with torch.no_grad():
         if predictor is None:
             trajectories, confidence_logits = baseline.constant_velocity(
-                batch.agent_history)
+                batch.targets.agent_history)
         else:
             trajectories, confidence_logits = predictor(batch)
     pruned_trajectories, _ = pruning.prune_modes_batched(
@@ -119,9 +119,9 @@ def write_submission_arrays(predictor: model.MotionPredictor | None,
         scene_trajectories, scene_confidences = predict_for_submission(
             predictor, scene_sample)
         for target, trajectories, target_confidences in zip(
-                scene_sample["targets"], scene_trajectories, scene_confidences):
-            scenario_ids.append(str(scene_sample["scenario_id"]))
-            track_ids.append(int(target["track_id"]))
+                scene_sample.targets, scene_trajectories, scene_confidences):
+            scenario_ids.append(str(scene_sample.scenario_id))
+            track_ids.append(int(target.track_id))
             world_trajectories.append(
                 agent_frame_to_world_frame(trajectories, target,
                                            scenario_array))
