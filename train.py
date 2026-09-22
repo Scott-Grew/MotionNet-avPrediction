@@ -143,12 +143,12 @@ def training_losses(predictor: torch.nn.Module,
 
 
 def unwrapped(predictor: torch.nn.Module) -> torch.nn.Module:
-    """The bare model under the multi-process wrapper, so a checkpoint holds
-    plain parameter names whatever the process count.
+    """The bare model under the multi-process and torch.compile wrappers, so
+    a checkpoint holds plain parameter names however the run was launched.
     """
     if isinstance(predictor, DistributedDataParallel):
-        return predictor.module
-    return predictor
+        predictor = predictor.module
+    return getattr(predictor, "_orig_mod", predictor)
 
 
 def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
@@ -162,10 +162,14 @@ def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
     return bool(shared_decision.item())
 
 
-def checkpoint_state(predictor: torch.nn.Module,
-                     optimizer: torch.optim.Optimizer,
-                     gradient_scaler: GradScaler, *, seed: int,
-                     completed_epochs: int) -> dict[str, Any]:
+def checkpoint_state(
+        predictor: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        gradient_scaler: GradScaler,
+        *,
+        seed: int,
+        completed_epochs: int,
+        epoch_plan: dict[str, Any] | None = None) -> dict[str, Any]:
     """Bundles the model, optimizer and scaler state, training progress and a
     parameter fingerprint into a checkpoint dict.
     """
@@ -178,6 +182,7 @@ def checkpoint_state(predictor: torch.nn.Module,
         "seed": seed,
         "code_version": contract.STAGING_CODE_VERSION,
         "parameter_fingerprint": parameter_fingerprint(model_state),
+        "epoch_plan": epoch_plan,
     }
 
 
@@ -215,7 +220,7 @@ RunSettings = namedtuple(
     "RunSettings",
     "checkpoint_path previous_checkpoint_path checkpoint_every_seconds seed"
     " warmup_steps gradient_clip_norm learning_rate decay_start_step"
-    " decay_end_step summary_writer is_main_process",
+    " decay_end_step summary_writer is_main_process epoch_plan",
 )
 
 
@@ -245,7 +250,7 @@ class EpochProgress:
                                                 device=device)
 
     def record_step(self, step: TrainingStep, was_clipped: bool,
-                    was_skipped: bool) -> bool:
+                    was_skipped: bool, sample_count: int) -> bool:
         """Folds one step's losses and optimiser health into the totals, and
         returns whether the total loss was finite.
         """
@@ -261,29 +266,32 @@ class EpochProgress:
         self.non_finite_total_count += int(not total_is_finite)
         self.clipped_step_count += int(was_clipped)
         self.gradient_scaler_skip_count += int(was_skipped)
+        self.batch_count += 1
+        self.sample_count += sample_count
         return total_is_finite
 
     def record_monitor(self, step: TrainingStep, batch: SceneBatch) -> None:
         """Records the training monitor, which steers runs and is never a
-        reported number. Also counts which mode came closest, to spot modes
-        that never win.
+        reported number. Every batch counts which mode came closest, to spot
+        modes that never win; the pruned minADE and minFDE run on one batch
+        in LOG_EVERY_BATCHES, because pruning is the monitor's slow part.
         """
         trajectories = step.trajectories.detach().float()
         confidence_logits = step.confidence_logits.detach().float()
         future_positions = batch.targets.future_positions
         future_mask = batch.targets.future_mask
         with torch.no_grad():
-            for metric_accumulator in (self.accumulator,
-                                       self.window_accumulator):
-                metric_accumulator.update(trajectories, confidence_logits,
-                                          future_positions, future_mask)
             mode_distances = metrics.mean_distance_per_mode(
                 trajectories, future_positions, future_mask)
             window_winners = mode_distances.argmin(dim=1)
             self.window_winner_counts.scatter_add_(
                 0, window_winners, torch.ones_like(window_winners))
-        self.batch_count += 1
-        self.sample_count += batch.targets.agent_history.shape[0]
+            if self.batch_count % LOG_EVERY_BATCHES != 0:
+                return
+            for metric_accumulator in (self.accumulator,
+                                       self.window_accumulator):
+                metric_accumulator.update(trajectories, confidence_logits,
+                                          future_positions, future_mask)
 
     def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
         """The table reported every LOG_EVERY_BATCHES, the losses, the training
@@ -414,7 +422,9 @@ def train_epoch(
         was_clipped, was_skipped = optimisation_step(
             predictor, optimizer, gradient_scaler, step.total,
             step_learning_rate, settings.gradient_clip_norm)
-        total_is_finite = progress.record_step(step, was_clipped, was_skipped)
+        total_is_finite = progress.record_step(
+            step, was_clipped, was_skipped,
+            batch.targets.agent_history.shape[0])
         progress.seconds["step"] += time.perf_counter() - step_start
 
         monitor_start = time.perf_counter()
@@ -444,7 +454,8 @@ def train_epoch(
                                      optimizer,
                                      gradient_scaler,
                                      seed=settings.seed,
-                                     completed_epochs=epoch_index),
+                                     completed_epochs=epoch_index,
+                                     epoch_plan=settings.epoch_plan),
                 )
             checkpoint_wait_start = time.perf_counter()
         wait_start = time.perf_counter()
@@ -474,6 +485,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
+    parser.add_argument("--compile", action="store_true")
     parser.add_argument("--all-eligible-agents", action="store_true")
     return parser.parse_args()
 
@@ -504,15 +516,16 @@ def announce(processes: Processes, message: str) -> None:
 def resume_training(arguments: argparse.Namespace, predictor: MotionPredictor,
                     optimizer: torch.optim.Optimizer,
                     gradient_scaler: GradScaler, previous_checkpoint_path: Path,
-                    device: torch.device, processes: Processes) -> int:
+                    device: torch.device,
+                    processes: Processes) -> tuple[int, dict[str, Any] | None]:
     """Loads the checkpoint when --resume is set and returns how many epochs
-    are already complete.
+    are already complete and the epoch plan it was trained under.
 
     Falls back to the previous checkpoint when the current one is missing,
     which a crash between save_checkpoint's two renames leaves behind.
     """
     if not arguments.resume:
-        return 0
+        return 0, None
     resume_path = arguments.checkpoint_path
     if not resume_path.exists() and previous_checkpoint_path.exists():
         resume_path = previous_checkpoint_path
@@ -520,7 +533,7 @@ def resume_training(arguments: argparse.Namespace, predictor: MotionPredictor,
             processes,
             f"{arguments.checkpoint_path} missing, resuming from {resume_path}")
     if not resume_path.exists():
-        return 0
+        return 0, None
 
     checkpoint = load_checkpoint_state(resume_path, map_location=device)
     predictor.load_state_dict(checkpoint["model_state"])
@@ -530,7 +543,7 @@ def resume_training(arguments: argparse.Namespace, predictor: MotionPredictor,
     completed_epochs = checkpoint["completed_epochs"]
     announce(processes,
              f"resuming {resume_path}: {completed_epochs} epochs complete")
-    return completed_epochs
+    return completed_epochs, checkpoint.get("epoch_plan")
 
 
 def decay_window(arguments: argparse.Namespace,
@@ -559,15 +572,32 @@ def build_training_objects(
     return predictor, optimizer, gradient_scaler
 
 
-def plan_epochs(arguments: argparse.Namespace, processes: Processes,
-                device: torch.device) -> tuple[list[Path], int]:
-    """Finds this process's share of the staged scenarios and counts the
-    optimiser steps in one epoch, which the learning-rate schedule is measured
-    in.
+def plan_epochs(
+        arguments: argparse.Namespace, processes: Processes,
+        device: torch.device, stored_plan: dict[str, Any] | None
+) -> tuple[list[Path], dict[str, Any]]:
+    """Finds this process's share of the staged scenarios and the optimiser
+    steps in one epoch, which the learning-rate schedule is measured in.
+
+    Counting opens every staged file, so the count is saved in the checkpoint
+    and reused while the scenarios and the launch layout are unchanged.
     """
     every_scenario_path = sorted(arguments.staged_directory.glob("*.npz"))
     scenario_paths = every_scenario_path[processes.rank::processes.count]
     assert scenario_paths, f"no .npz scenarios in {arguments.staged_directory}"
+    epoch_plan = {
+        "scenario_count": len(every_scenario_path),
+        "process_count": processes.count,
+        "worker_count": arguments.workers,
+        "per_process_batch_size": arguments.batch_size // processes.count,
+        "designated_targets_only": not arguments.all_eligible_agents,
+    }
+    if stored_plan is not None and all(
+            stored_plan.get(name) == value
+            for name, value in epoch_plan.items()):
+        epoch_plan["steps_per_epoch"] = stored_plan["steps_per_epoch"]
+        announce(processes, "optimiser step count read from the checkpoint")
+        return scenario_paths, epoch_plan
     steps_per_epoch = optimiser_steps_per_epoch(
         scenario_paths, arguments.workers,
         arguments.batch_size // processes.count,
@@ -585,16 +615,19 @@ def plan_epochs(arguments: argparse.Namespace, processes: Processes,
         f" {arguments.epochs} epochs, learning rate"
         f" {arguments.learning_rate} held after"
         f" {arguments.warmup_steps} warmup steps")
-    return scenario_paths, steps_per_epoch
+    epoch_plan["steps_per_epoch"] = steps_per_epoch
+    return scenario_paths, epoch_plan
 
 
 def build_run_settings(arguments: argparse.Namespace,
-                       previous_checkpoint_path: Path, steps_per_epoch: int,
+                       previous_checkpoint_path: Path, epoch_plan: dict[str,
+                                                                        Any],
                        processes: Processes) -> RunSettings:
     """Gathers the settings that stay fixed for the whole run, and opens the
     TensorBoard event file beside the checkpoint on the main process.
     """
-    decay_start_step, decay_end_step = decay_window(arguments, steps_per_epoch)
+    decay_start_step, decay_end_step = decay_window(
+        arguments, epoch_plan["steps_per_epoch"])
     summary_writer = None
     if processes.is_main:
         summary_writer = SummaryWriter(arguments.checkpoint_path.parent /
@@ -611,6 +644,7 @@ def build_run_settings(arguments: argparse.Namespace,
         decay_end_step=decay_end_step,
         summary_writer=summary_writer,
         is_main_process=processes.is_main,
+        epoch_plan=epoch_plan,
     )
 
 
@@ -627,15 +661,14 @@ def main() -> None:
     torch.manual_seed(arguments.seed)
     predictor, optimizer, gradient_scaler = build_training_objects(
         arguments, device)
-    scenario_paths, steps_per_epoch = plan_epochs(arguments, processes, device)
     designated_targets_only = not arguments.all_eligible_agents
 
     previous_checkpoint_path = arguments.checkpoint_path.with_suffix(
         arguments.checkpoint_path.suffix + ".previous")
-    completed_epochs = resume_training(arguments, predictor, optimizer,
-                                       gradient_scaler,
-                                       previous_checkpoint_path, device,
-                                       processes)
+    completed_epochs, stored_plan = resume_training(arguments, predictor,
+                                                    optimizer, gradient_scaler,
+                                                    previous_checkpoint_path,
+                                                    device, processes)
     remaining_epochs = epochs_left_to_train(completed_epochs, arguments.epochs)
     if not remaining_epochs:
         announce(
@@ -644,8 +677,13 @@ def main() -> None:
             f" --epochs is {arguments.epochs}.")
         return
 
+    scenario_paths, epoch_plan = plan_epochs(arguments, processes, device,
+                                             stored_plan)
+    steps_per_epoch = epoch_plan["steps_per_epoch"]
     settings = build_run_settings(arguments, previous_checkpoint_path,
-                                  steps_per_epoch, processes)
+                                  epoch_plan, processes)
+    if arguments.compile:
+        predictor = torch.compile(predictor, dynamic=True)
     if processes.count > 1:
         device_ids = [processes.local_rank] if device.type == "cuda" else None
         predictor = DistributedDataParallel(predictor, device_ids=device_ids)
@@ -711,7 +749,8 @@ def main() -> None:
                                  optimizer,
                                  gradient_scaler,
                                  seed=arguments.seed,
-                                 completed_epochs=epoch_index + 1),
+                                 completed_epochs=epoch_index + 1,
+                                 epoch_plan=settings.epoch_plan),
             )
 
         elapsed_seconds = time.perf_counter() - training_start

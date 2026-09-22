@@ -195,8 +195,10 @@ def kernel_train_arguments():
             for element in argument_list.elts
             if isinstance(element, ast_module.Constant)
         ]
-        if literal_arguments[:2] == ["python", "train.py"]:
-            return literal_arguments, len(argument_list.elts)
+        if "train.py" in literal_arguments:
+            launcher_count = literal_arguments.index("train.py") - 1
+            return (literal_arguments[launcher_count:],
+                    len(argument_list.elts) - launcher_count)
     raise AssertionError(f"no train.py invocation found in {kernel_path}")
 
 
