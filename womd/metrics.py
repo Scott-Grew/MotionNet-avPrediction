@@ -29,7 +29,6 @@ class MetricAccumulator:
     """
 
     def __init__(self) -> None:
-        """Zeroes the running sums and counts."""
         self.ade_sum = 0.0
         self.ade_count = 0
         self.fde_sum = 0.0
@@ -81,7 +80,6 @@ class MetricAccumulator:
         return float(running_sum / count) if count else float("nan")
 
     def results(self) -> dict[str, float]:
-        """Returns the accumulated metrics as plain floats."""
         backfilled = self.backfilled_sample_count
         return {
             "min_ade": self.mean_or_nan(self.ade_sum, self.ade_count),

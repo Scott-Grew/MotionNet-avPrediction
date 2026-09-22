@@ -32,7 +32,7 @@ def track_state_row(state: Any) -> list[float]:
 
 def map_feature_points(feature: Any) -> tuple[str, list[list[float]]] | None:
     """Reads one map feature's kind and points from whichever oneof field is
-    set: a single point, a polygon, or a polyline.
+    set, a single point, a polygon or a polyline.
     """
     kind = feature.WhichOneof("feature_data")
     if kind is None:

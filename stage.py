@@ -66,8 +66,8 @@ def stage_shards(shard_paths: list[Path],
 
 
 def main() -> None:
-    """CLI entry point: stages the given shards and prints how many scenarios
-    were staged and how many had irregular spacing.
+    """Stages the given shards and prints how many scenarios were staged and
+    how many had irregular spacing.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("output_directory", type=Path)

@@ -1,6 +1,6 @@
-"""The network: every agent and map chunk in a scene becomes a token and the
-tokens self-attend once per scene; each predicted agent then reads them through
-its own crop and 54 anchored futures are decoded.
+"""The network. Every agent and map chunk in a scene becomes a token and the
+tokens self-attend once per scene; each predicted agent then reads them
+through its own crop and 54 anchored futures are decoded.
 """
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ from torch import nn
 
 from womd import contract
 
-# What the decoder returns: per mode, a path and its per-step log
-# sigma in metres, a confidence logit, and the anchor it grew from.
+# What the decoder returns per mode, a path and its per-step log sigma
+# in metres, a confidence logit and the anchor it grew from.
 ModePredictions = namedtuple(
     "ModePredictions",
     "trajectories log_standard_deviation confidence_logits anchors",
 )
 
-# Network size, chosen values: tokens, queries and attention layers
+# Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
 HIDDEN_DIM = 192
 FEEDFORWARD_DIM = 4 * HIDDEN_DIM
@@ -52,8 +52,8 @@ def agent_feature_divisors() -> torch.Tensor:
 
 
 def map_feature_divisors() -> torch.Tensor:
-    """Per-feature scale for map rows: position and stop point in metres, speed
-    limit in miles per hour.
+    """Per-feature scale for map rows, position and stop point in metres and
+    speed limit in miles per hour.
     """
     divisors = torch.ones(contract.MAP_FEATURE_DIM)
     divisors[contract.MAP_POSITION] = contract.DISTANCE_NORMALISER_METRES
@@ -67,7 +67,7 @@ class AgentHistoryEncoder(nn.Module):
     """Encodes one agent's history steps into a single hidden-dim token."""
 
     def __init__(self) -> None:
-        """The MLP reads the whole history window at once: each step's features
+        """The MLP reads the whole history window at once, each step's features
         plus one validity flag per step.
         """
         super().__init__()
@@ -192,15 +192,14 @@ def initialise_attention(attention: nn.MultiheadAttention) -> None:
 
 
 def scene_attention_layer() -> nn.TransformerEncoderLayer:
-    """One self-attention round of the scene encoder."""
     layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
     initialise_attention(layer.self_attn)
     return layer
 
 
 def decoder_round_layer() -> nn.TransformerDecoderLayer:
-    """One decoder round: self-attention over the modes, cross-attention to the
-    scene tokens, feedforward.
+    """One decoder round of self-attention over the modes, cross-attention to
+    the scene tokens and feedforward.
     """
     layer = nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
     initialise_attention(layer.self_attn)
@@ -214,9 +213,6 @@ class SceneEncoder(nn.Module):
     """
 
     def __init__(self) -> None:
-        """Builds the two agent encoders, the map-dot encoder, the shared signal
-        projection, the pose projection and the self-attention stack.
-        """
         super().__init__()
         self.agent_encoder = AgentHistoryEncoder()
         self.scene_agent_encoder = AgentHistoryEncoder()
@@ -224,8 +220,8 @@ class SceneEncoder(nn.Module):
         self.signal_projection = nn.Linear(contract.POLYLINE_SIGNAL_DIM,
                                            HIDDEN_DIM,
                                            bias=False)
-        # A token pose is (x, y, cosine, sine): only x and y are
-        # metres and need scaling.
+        # A token pose is (x, y, cosine, sine), and only x and y are
+        # metres that need scaling.
         self.pose_projection = nn.Linear(4, HIDDEN_DIM)
         self.register_buffer(
             "pose_divisors",
@@ -319,6 +315,7 @@ def agent_reachable_distance(agent_history: torch.Tensor) -> torch.Tensor:
                                   contract.AGENT_VELOCITY].norm(dim=-1)
     horizon = contract.FUTURE_HORIZON_SECONDS
     acceleration = contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED
+    # d = v T + a T^2 / 2 for speed v, horizon T and acceleration a.
     return current_speed * horizon + 0.5 * acceleration * horizon**2
 
 
@@ -350,14 +347,14 @@ class ModeDecoder(nn.Module):
         self.rounds = nn.ModuleList(
             decoder_round_layer() for _ in range(DECODER_ROUNDS))
         self.head_norm = nn.LayerNorm(HIDDEN_DIM)
-        # Per future step: an x, y offset and an x, y log sigma.
+        # Per future step, an x, y offset and an x, y log sigma.
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
             nn.Linear(FEEDFORWARD_DIM, 2 * contract.FUTURE_STEPS * 2),
         )
-        # No final bias: one bias shared by all modes cancels in
-        # the softmax over modes and could never be trained.
+        # There is no final bias because one bias shared by all modes
+        # cancels in the softmax over modes and could never be trained.
         self.confidence_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
@@ -415,19 +412,15 @@ class ModeDecoder(nn.Module):
 
 
 class MotionPredictor(nn.Module):
-    """Top-level model: the scene encoder's memory feeds the mode decoder."""
+    """Top-level model, the scene encoder's memory feeding the mode decoder."""
 
     def __init__(self, unit_anchors: torch.Tensor) -> None:
-        """The encoder turns a batch into each target's tokens; the decoder
-        reads those tokens once per anchor query.
-        """
         super().__init__()
         self.scene_encoder = SceneEncoder()
         self.mode_decoder = ModeDecoder(unit_anchors)
 
     @property
     def unit_anchors(self) -> torch.Tensor:
-        """Exposes the decoder's fitted per-type unit anchors."""
         return self.mode_decoder.unit_anchors
 
     def predict(self, batch: dict[str, torch.Tensor]) -> ModePredictions:
@@ -461,7 +454,7 @@ class MotionPredictor(nn.Module):
 # ------------------------------------------------------------------
 # DATA FLOW for S scenes holding B predicted agents, hidden width 192
 #
-#   once per scene, in the scene frame:
+#   once per scene, in the scene frame.
 #
 #   scene_agent_history  --MLP-->      A tokens  \
 #                                                 >  (S, A+C, 192)
@@ -472,7 +465,7 @@ class MotionPredictor(nn.Module):
 #                          |
 #                     scene tokens
 #                          |
-#   once per predicted agent:
+#   once per predicted agent.
 #
 #   its scene's tokens, each + an embedding of that token's pose
 #   in the agent's frame, masked to the agent's crop

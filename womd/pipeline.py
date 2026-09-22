@@ -24,7 +24,6 @@ class SceneBatchStream(IterableDataset):
 
     def __init__(self, scenario_paths: list[Path], seed: int,
                  designated_targets_only: bool, targets_per_batch: int) -> None:
-        """Stores the scenario paths, seed, target filter and batch size."""
         self.scenario_paths = scenario_paths
         self.seed = seed
         self.designated_targets_only = designated_targets_only
@@ -34,9 +33,9 @@ class SceneBatchStream(IterableDataset):
         """For this worker's scenario slice, shuffles scenarios and each one's
         eligible tracks with a per-worker seeded generator.
 
-        A scene whose targets do not all fit in the batch being filled is split:
-        the ones that fit close this batch and the rest open the next, so the
-        scene is encoded once in each.
+        A scene whose targets do not all fit in the batch being filled is
+        split, so the ones that fit close this batch and the rest open the
+        next, and the scene is encoded once in each.
         """
         worker_info = get_worker_info()
         worker_index = worker_info.id if worker_info else 0

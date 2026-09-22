@@ -1,5 +1,5 @@
-"""Shared constants: sequence lengths, the column layout of agent and map rows,
-and the stamp that ties artifacts to this code.
+"""Shared constants for the sequence lengths, the column layout of agent and
+map rows, and the stamp that ties artifacts to this code.
 """
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-# A scenario is 91 steps at 10 Hz: 11 of history ending at
-# the current step, then the 80 future steps to predict.
+# A scenario is 91 steps at 10 Hz, 11 of history ending at the
+# current step and then the 80 future steps to predict.
 HISTORY_STEPS = 11
 FUTURE_STEPS = 80
 CURRENT_STEP_INDEX = 10
@@ -64,8 +64,8 @@ DIMENSION_NORMALISER_METRES = 1.6
 # Measured over lane dots that carry a posted limit above zero.
 SPEED_LIMIT_NORMALISER_MILES_PER_HOUR = 12.9
 
-# Column layout of one agent feature row: position, heading as
-# cosine/sine, velocity, box size, one-hot type, is-SDC flag.
+# Column layout of one agent feature row, in order. Position, heading
+# as cosine and sine, velocity, box size, one-hot type, is-SDC flag.
 AGENT_POSITION = slice(0, 2)
 AGENT_HEADING_COSINE = 2
 AGENT_HEADING_SINE = 3
@@ -90,8 +90,8 @@ TRAFFIC_SIGNAL_STATES = (
 )
 NUM_TRAFFIC_SIGNAL_STATES = len(TRAFFIC_SIGNAL_STATES)
 
-# Vocabularies for the one-hot blocks of a map dot row: the kind
-# of feature a dot belongs to, then lane, line and edge types.
+# Vocabularies for the one-hot blocks of a map dot row, the kind of
+# feature a dot belongs to and then the lane, line and edge types.
 MAP_POLYLINE_KINDS = (
     "lane",
     "road_line",
@@ -143,8 +143,8 @@ MAP_SPEED_LIMIT = MAP_LANE_TYPE.stop
 MAP_BOUNDARY_TYPE = slice(MAP_SPEED_LIMIT + 1,
                           MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES)
 MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
-# The two crossing codes stay last: the map encoder slices them
-# off the end of the row and one-hot encodes them.
+# The two crossing codes stay last because the map encoder slices
+# them off the end of the row and one-hot encodes them.
 MAP_LEFT_BOUNDARY_CROSSING = MAP_STOP_POINT.stop
 MAP_RIGHT_BOUNDARY_CROSSING = MAP_LEFT_BOUNDARY_CROSSING + 1
 MAP_FEATURE_DIM = MAP_RIGHT_BOUNDARY_CROSSING + 1
@@ -152,7 +152,7 @@ MAP_FEATURE_DIM = MAP_RIGHT_BOUNDARY_CROSSING + 1
 # type of the boundary on that side of the lane.
 NUM_BOUNDARY_CROSSING_CODES = len(ROAD_LINE_TYPES) + 1
 
-# One signal history per polyline, flattened: a one-hot signal
+# One signal history per polyline, flattened to a one-hot signal
 # state for each history step.
 POLYLINE_SIGNAL_DIM = HISTORY_STEPS * NUM_TRAFFIC_SIGNAL_STATES
 

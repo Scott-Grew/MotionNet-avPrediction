@@ -1,7 +1,7 @@
 """Step 5 of 5.
 
-Host-side driver: writes predictions, then runs Waymo's own metrics inside a
-linux/amd64 Docker container.
+Host-side driver that writes predictions, then runs Waymo's own metrics inside
+a linux/amd64 Docker container.
 """
 from __future__ import annotations
 
@@ -113,8 +113,8 @@ def run_check_reader(shard_path: Path, sample_count: int) -> None:
 
 
 def main() -> None:
-    """Drives the container from the host: either scores a checkpoint's
-    predictions or checks the vendored protos against Waymo's.
+    """Drives the container from the host, either scoring a checkpoint's
+    predictions or checking the vendored protos against Waymo's.
     """
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)

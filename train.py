@@ -77,7 +77,7 @@ def parameter_groups(predictor: torch.nn.Module) -> list[dict[str, Any]]:
 def optimiser_steps_per_epoch(scenario_paths: list[Path], worker_count: int,
                               batch_size: int,
                               designated_targets_only: bool) -> int:
-    """Steps per epoch: the sum over worker streams of ceil(targets / batch
+    """Steps per epoch, the sum over worker streams of ceil(targets / batch
     size), because each worker fills its own batches.
     """
     stream_count = max(worker_count, 1)
@@ -102,8 +102,8 @@ def scheduled_learning_rate(process_steps: int,
                             learning_rate: float = LEARNING_RATE,
                             decay_start_step: int | None = None,
                             decay_end_step: int | None = None) -> float:
-    """Learning rate as a pure function of the global step: linear warm-up,
-    hold, then an optional cosine fall to zero.
+    """Learning rate as a pure function of the global step, a linear warm-up,
+    a hold, then an optional cosine fall to zero.
     """
     if process_steps < warmup_steps:
         return learning_rate * (process_steps + 1) / warmup_steps
@@ -112,6 +112,7 @@ def scheduled_learning_rate(process_steps: int,
     steps_into_decay = process_steps - decay_start_step
     decay_length = max(decay_end_step - 1 - decay_start_step, 1)
     decay_fraction = min(steps_into_decay / decay_length, 1.0)
+    # The rate is peak * (1 + cos(pi f)) / 2 for fraction f through the fall.
     cosine_term = 1.0 + math.cos(math.pi * decay_fraction)
     return learning_rate * 0.5 * cosine_term
 
@@ -179,7 +180,6 @@ def checkpoint_state(predictor: torch.nn.Module,
 
 
 def epochs_left_to_train(completed_epochs: int, requested_epochs: int) -> range:
-    """Epoch indices still to run, given how many are already done."""
     return range(completed_epochs, requested_epochs)
 
 
@@ -218,12 +218,11 @@ RunSettings = namedtuple(
 
 
 class EpochProgress:
-    """Running totals for one epoch: losses, the training monitor, optimiser
-    health and timing, overall and per logging window.
+    """Running totals for one epoch, the losses, the training monitor,
+    optimiser health and timing, overall and per logging window.
     """
 
     def __init__(self, device: torch.device) -> None:
-        """Starts every total at zero."""
         self.device = device
         self.accumulator = metrics.MetricAccumulator()
         self.window_accumulator = metrics.MetricAccumulator()
@@ -264,8 +263,9 @@ class EpochProgress:
 
     def record_monitor(self, step: TrainingStep,
                        batch: dict[str, torch.Tensor]) -> None:
-        """Training monitor: steers runs, never a reported number. Also counts
-        which mode came closest, to spot modes that never win.
+        """Records the training monitor, which steers runs and is never a
+        reported number. Also counts which mode came closest, to spot modes
+        that never win.
         """
         trajectories = step.trajectories.detach().float()
         confidence_logits = step.confidence_logits.detach().float()
@@ -285,8 +285,8 @@ class EpochProgress:
         self.sample_count += batch["agent_history"].shape[0]
 
     def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
-        """The table reported every LOG_EVERY_BATCHES: losses, the training
-        monitor, optimiser health, and where the time went.
+        """The table reported every LOG_EVERY_BATCHES, the losses, the training
+        monitor, optimiser health and where the time went.
         """
         monitor = self.accumulator.results()
         window_monitor = self.window_accumulator.results()
@@ -323,7 +323,6 @@ class EpochProgress:
         }
 
     def start_new_window(self) -> None:
-        """Clears the per-window totals once their table is reported."""
         self.window_accumulator = metrics.MetricAccumulator()
         self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
         self.window_winner_counts.zero_()
@@ -338,7 +337,6 @@ class EpochProgress:
 
 def epoch_scalars(averages: dict[str, float], monitor: dict[str, float],
                   seconds: dict[str, float]) -> dict[str, float]:
-    """The summary table reported once an epoch finishes."""
     return {
         "epoch/loss_total": averages["total"],
         "epoch/loss_regression": averages["regression"],
@@ -386,8 +384,9 @@ def train_epoch(
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
     """One pass over the data.
 
-    Each batch: forward and loss, optimiser step, training monitor, then a log
-    line and a timed checkpoint. Only the main process logs and checkpoints.
+    Each batch goes through forward and loss, the optimiser step and the
+    training monitor, then a log line and a timed checkpoint. Only the main
+    process logs and checkpoints.
     With several processes the caller wraps this in Join, so a process whose
     shard runs out first does not hang the others.
     """
@@ -615,8 +614,8 @@ def build_run_settings(arguments: argparse.Namespace,
 
 
 def main() -> None:
-    """Entry point: builds the model, resumes from a checkpoint if asked, and
-    trains the remaining epochs inside the time budget.
+    """Builds the model, resumes from a checkpoint if asked, and trains the
+    remaining epochs inside the time budget.
     """
     arguments = parse_arguments()
     processes, device = start_processes()
@@ -655,7 +654,7 @@ def main() -> None:
     steps_before_epoch = completed_epochs * steps_per_epoch
     last_epoch_seconds = 0.0
     for epoch_index in remaining_epochs:
-        # Stop before an epoch that would not fit in the time budget:
+        # Stop before an epoch that would not fit in the time budget, since
         # Kaggle ends a session without warning.
         elapsed_seconds = time.perf_counter() - training_start
         next_epoch_overruns = (elapsed_seconds + last_epoch_seconds

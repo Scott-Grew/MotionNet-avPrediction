@@ -23,7 +23,7 @@ from womd import (
 )
 from womd.checkpoint import load_anchor_file, load_checkpoint_state
 
-# The 16 of the 80 predicted steps that Waymo scores: 2 Hz from 10 Hz.
+# The 16 of the 80 predicted steps that Waymo scores, 2 Hz from 10 Hz.
 SUBMISSION_STEP_SELECTOR = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
 
 
@@ -71,8 +71,8 @@ def designated_target_scenes(
 def predict_for_submission(
         predictor: model.MotionPredictor | None,
         scene_sample: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    """One scene in; 54 modes at 10 Hz become Waymo's format: the 6 kept modes
-    at 2 Hz. predictor=None runs the constant-velocity null.
+    """One scene in, and its 54 modes at 10 Hz become Waymo's format of the 6
+    kept modes at 2 Hz. predictor=None runs the constant-velocity null.
     """
     scene_batch = loader.build_scene_batch([scene_sample])
     batch = {

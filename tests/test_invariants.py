@@ -875,7 +875,6 @@ def test_target_prediction_ignores_batch_company():
     two_track_scenario = two_lane_signal_scenario(2, signalled_lane_history)
 
     def torch_batch(scene_samples):
-        """Scene samples joined into one batch of torch tensors."""
         scene_batch = loader.build_scene_batch(scene_samples)
         return {
             name: torch.from_numpy(array) for name, array in scene_batch.items()
@@ -1007,7 +1006,6 @@ def test_masked_steps_move_no_loss():
         sample_count, -1, -1) * 40.0)
 
     def components(logged_positions, predicted_positions):
-        """The three loss components as one tensor."""
         return torch.stack(
             loss.prediction_loss(
                 predicted_positions,
@@ -1056,7 +1054,6 @@ def test_every_model_output_moves_the_loss():
     }
 
     def total(quantities):
-        """The total loss for the given model outputs."""
         (
             trajectories,
             log_standard_deviation,

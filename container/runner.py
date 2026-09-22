@@ -1,5 +1,5 @@
-"""Runs inside the container: feeds predictions and ground truth to Waymo's
-metrics op, and checks our protos against theirs.
+"""Runs inside the container, feeding predictions and ground truth to Waymo's
+metrics op and checking our protos against theirs.
 """
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ WAYMO_OPEN_DATASET_DISTRIBUTION_NAME = "waymo-open-dataset-tf-2-12-0"
 # count as agreeing.
 FLOATING_POINT_DISAGREEMENT_TOLERANCE = 1e-4
 
-# Waymo's tutorial metrics configuration: predictions at 2 Hz, scored
-# at 3, 5 and 8 seconds, at most 6 per agent.
+# Waymo's tutorial metrics configuration, predictions at 2 Hz scored at
+# 3, 5 and 8 seconds, at most 6 per agent.
 WAYMO_TUTORIAL_MOTION_METRICS_CONFIG_TEXT = """
 track_steps_per_second: 10
 prediction_steps_per_second: 2
@@ -60,7 +60,7 @@ max_predictions: 6
 def track_row_world_frame_state(track_row: np.ndarray, frame_origin: np.ndarray,
                                 frame_heading: float) -> np.ndarray:
     """One agent's scene-frame rows to the 7 world-frame columns the metrics op
-    wants: x, y, length, width, heading, vx, vy.
+    wants, x, y, length, width, heading, vx and vy.
     """
     positions_world = frame_ops.positions_from_frame(
         track_row[:, contract.AGENT_POSITION],
@@ -115,8 +115,8 @@ def scenario_world_frame_ground_truth(
 
 def prediction_rows_by_scenario(
         scenario_ids: np.ndarray) -> dict[str, list[int]]:
-    """Groups the flat per-target prediction rows by scenario, keeping first-
-    seen order: the metrics op wants one row per scenario.
+    """Groups the flat per-target prediction rows by scenario in first-seen
+    order, because the metrics op wants one row per scenario.
     """
     prediction_rows_of_scenario = {}
     for prediction_index, scenario_id in enumerate(scenario_ids):
@@ -142,7 +142,7 @@ def build_motion_metric_tensors(
         for scenario_id in ordered_scenario_ids
     ]
 
-    # Padded sizes: every scenario gets room for the most agents and
+    # The padded sizes give every scenario room for the most agents and
     # the most predictions any scenario has.
     scenario_count = len(ordered_scenario_ids)
     max_agents = max(
@@ -222,8 +222,8 @@ def load_predictions(predictions_path: Path) -> dict[str, np.ndarray]:
 
 def print_score_table(breakdown_names: list[str],
                       metric_columns: tuple[np.ndarray, ...]) -> None:
-    """Prints one row per breakdown: minADE, minFDE, miss rate, overlap rate
-    and mAP, in the order Waymo's op returns them.
+    """Prints one row per breakdown with minADE, minFDE, miss rate, overlap
+    rate and mAP, in the order Waymo's op returns them.
     """
     min_ade, min_fde, miss_rate, overlap_rate, mean_average_precision = (
         metric_columns)
@@ -416,8 +416,8 @@ def run_check_reader(shard_path: Path, sample_count: int) -> None:
 
 
 def main() -> None:
-    """Container entry point: scores a predictions file or checks the vendored
-    protos against Waymo's.
+    """Container entry point that scores a predictions file or checks the
+    vendored protos against Waymo's.
     """
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)

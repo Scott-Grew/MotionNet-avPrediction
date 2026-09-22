@@ -1,5 +1,5 @@
-"""A few training batches as a smoke test: stops on non-finite losses or on the
-modes all collapsing to one endpoint.
+"""A few training batches as a smoke test that stops on non-finite losses or
+on the modes all collapsing to one endpoint.
 """
 from __future__ import annotations
 
@@ -32,9 +32,6 @@ def first_scenario_paths(staged_directory: Path, needed: int) -> list[Path]:
 
 
 def parse_arguments() -> argparse.Namespace:
-    """The command line: where the data and anchors are, and how many batches to
-    run.
-    """
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)
     parser.add_argument("anchors_path", type=Path)

@@ -54,8 +54,8 @@ def as_single_mode(
 
 def constant_velocity(
         batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Baseline: extrapolates the current position at the current velocity,
-    unchanged over the horizon.
+    """Extrapolates the current position at the current velocity, unchanged
+    over the horizon.
     """
     position, _, velocity = current_state(batch)
     elapsed_seconds = future_elapsed_seconds(position.device, position.dtype)
@@ -85,8 +85,9 @@ def observed_yaw_rate(batch: dict[str, torch.Tensor]) -> torch.Tensor:
     ).squeeze(1)
 
     now_row = agent_history[:, contract.CURRENT_STEP_INDEX]
-    # Sine/cosine angle-difference formula avoids the wraparound
-    # that a plain atan2 subtraction would have.
+    # sin(a - b) = sin a cos b - cos a sin b and cos(a - b) = cos a cos b +
+    # sin a sin b give the change without the wraparound a plain atan2
+    # subtraction would have.
     now_sine = now_row[:, contract.AGENT_HEADING_SINE]
     now_cosine = now_row[:, contract.AGENT_HEADING_COSINE]
     earliest_sine = earliest_row[:, contract.AGENT_HEADING_SINE]
@@ -102,8 +103,8 @@ def observed_yaw_rate(batch: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def constant_turn_rate_and_velocity(
         batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Baseline: extrapolates position along a constant-turn-rate, constant-
-    speed arc from the observed yaw rate and forward speed.
+    """Extrapolates position along a constant-turn-rate, constant-speed arc
+    from the observed yaw rate and forward speed.
     """
     position, heading, velocity = current_state(batch)
     heading_direction = torch.stack(
@@ -112,8 +113,9 @@ def constant_turn_rate_and_velocity(
 
     elapsed_seconds = future_elapsed_seconds(position.device, position.dtype)
     turn_angle = observed_yaw_rate(batch)[:, None] * elapsed_seconds[None, :]
-    # sinc(turn_angle / 2*pi) converts arc length to chord length;
-    # chord_direction bisects the turn angle from the heading.
+    # For turn angle theta the chord is arc * sin(theta / 2) / (theta / 2),
+    # which is arc * sinc(theta / 2 pi), and the chord direction bisects
+    # the turn from the heading.
     chord_to_arc_ratio = torch.sinc(turn_angle / (2.0 * math.pi))
     chord_length = (forward_speed[:, None] * elapsed_seconds[None, :] *
                     chord_to_arc_ratio)
@@ -132,7 +134,7 @@ def constant_turn_rate_and_velocity(
 def straight_lines_to_most_used_anchors(
         batch: dict[str, torch.Tensor],
         unit_anchors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Baseline: straight lines to each type's first NUM_PREDICTED_MODES anchor
+    """Straight lines to each type's first NUM_PREDICTED_MODES anchor
     endpoints, with uniform confidence.
     """
     predicted_type_index = model.predicted_type_index(batch["agent_history"])

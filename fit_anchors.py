@@ -18,8 +18,8 @@ import torch
 
 from womd import contract, loader, model
 
-# The result of one k-means fit: where the centres ended, which
-# centre each endpoint belongs to, and how the search stopped.
+# The result of one k-means fit, where the centres ended, which centre
+# each endpoint belongs to and how the search stopped.
 AnchorFit = namedtuple(
     "AnchorFit",
     "centres assignment iteration_count stopped_by_convergence",
@@ -33,8 +33,8 @@ RANDOM_STATE_SEED = 0
 def metre_endpoints(
     scenario_paths: list[Path]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """For each designated target: its final valid future position, predicted
-    type index, and reachable-distance bound (metres).
+    """For each designated target, its final valid future position, predicted
+    type index and reachable-distance bound in metres.
     """
     agent_histories = []
     logged_endpoints = []
@@ -67,7 +67,6 @@ def metre_endpoints(
 
 def endpoints_per_centre(assignment: torch.Tensor,
                          centre_count: int) -> torch.Tensor:
-    """Counts how many endpoints were assigned to each cluster centre."""
     endpoint_counts = torch.zeros(centre_count, dtype=torch.long)
     return endpoint_counts.index_add_(0, assignment,
                                       torch.ones_like(assignment))
@@ -75,7 +74,6 @@ def endpoints_per_centre(assignment: torch.Tensor,
 
 def fit_unit_anchors(endpoints: torch.Tensor,
                      centre_count: int = model.QUERY_COUNT) -> AnchorFit:
-    """Fits one k-means anchor set with scikit-learn."""
     fitted = KMeans(n_clusters=centre_count,
                     random_state=RANDOM_STATE_SEED).fit(endpoints.numpy())
     return AnchorFit(

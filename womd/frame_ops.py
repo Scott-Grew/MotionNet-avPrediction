@@ -22,13 +22,15 @@ def positions_to_frame(positions: np.ndarray, frame_origin: np.ndarray,
     """
     positions = np.asarray(positions)
     centred = positions - np.asarray(frame_origin, dtype=positions.dtype)
+    # A row vector p lands at (p - origin) R(heading), which is the column
+    # form R(heading)^T (p - origin), a rotation by -heading.
     return centred @ rotation_matrix(frame_heading, positions.dtype)
 
 
 def positions_from_frame(frame_positions: np.ndarray, frame_origin: np.ndarray,
                          frame_heading: float) -> np.ndarray:
-    """Inverse of positions_to_frame: moves points out of a frame, back into the
-    one its origin and heading were measured in.
+    """Moves points out of a frame, back into the one its origin and heading
+    were measured in, inverting positions_to_frame.
     """
     rotated = (np.asarray(frame_positions, dtype=np.float64)
                @ rotation_matrix(frame_heading).T)
@@ -51,7 +53,7 @@ def headings_to_frame(headings: np.ndarray, frame_heading: float) -> np.ndarray:
 
 
 def wrap_to_pi(angles: np.ndarray) -> np.ndarray:
-    """Wraps angles in radians into [-pi, pi]."""
+    # (a + pi) mod 2 pi - pi lands every angle in [-pi, pi).
     full_turn = 2.0 * np.pi
     shifted = np.asarray(angles, dtype=np.float64) + np.pi
     return shifted % full_turn - np.pi
@@ -68,5 +70,5 @@ def wrap_to_pi(angles: np.ndarray) -> np.ndarray:
 #     v
 #   agent            the model reads and predicts here
 #
-#   Predictions travel back up: agent -> scene -> world (submit.py).
+#   Predictions travel back up, agent -> scene -> world (submit.py).
 # ------------------------------------------------------------------

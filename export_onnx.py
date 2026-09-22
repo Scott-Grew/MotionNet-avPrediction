@@ -46,7 +46,6 @@ class PositionalInputs(torch.nn.Module):
     """
 
     def __init__(self, predictor: torch.nn.Module) -> None:
-        """Stores the model being wrapped."""
         super().__init__()
         self.predictor = predictor
 
@@ -94,14 +93,14 @@ def padded_to_fixed_shape(batch: dict[str, torch.Tensor], agent_count: int,
     fixed["map_chunk_signal_history"] = padded_along(
         batch["map_chunk_signal_history"], 1, chunk_count)
     fixed["map_rows"] = last_row_repeated_to(batch["map_rows"], dot_count)
-    # slot = scene index * chunk count + chunk index, so the stride
-    # changes when the chunk count is padded
+    # A slot is scene index * chunk count + chunk index, so the stride
+    # changes when the chunk count is padded.
     fixed["map_dot_chunk_slot"] = last_row_repeated_to(
         (slot // batch_chunk_count) * chunk_count + slot % batch_chunk_count,
         dot_count,
     )
-    # token axis is [scene agents, then map chunks], so each half
-    # is padded separately before being joined back together
+    # The token axis holds the scene agents and then the map chunks, so each
+    # half is padded separately before being joined back together.
     for name in ("token_visible", "token_pose"):
         fixed[name] = torch.cat(
             [
@@ -157,8 +156,8 @@ def export_and_measure_bucket(
                    predictor(fixed_batch)[0][:len(batch["agent_history"])]
                   ).abs().max())
             for batch, fixed_batch in zip(batches, fixed_batches))
-    # the map-chunk axis is left symbolic; the exporter folds it
-    # incorrectly when treated as fixed like the other axes
+    # The map-chunk axis is left symbolic because the exporter folds it
+    # incorrectly when it is treated as fixed like the other axes.
     torch.onnx.export(
         PositionalInputs(predictor),
         tuple(fixed_batches[0][name] for name in INPUT_NAMES),
@@ -182,7 +181,6 @@ def export_and_measure_bucket(
     device_predictor = PositionalInputs(predictor).to(device)
 
     def run_onnx(fixed_batch: dict[str, torch.Tensor]) -> list[np.ndarray]:
-        """Runs the exported graph on one fixed-shape batch."""
         return session.run(
             OUTPUT_NAMES,
             {name: fixed_batch[name].numpy() for name in INPUT_NAMES},
@@ -191,7 +189,6 @@ def export_and_measure_bucket(
     def run_torch(
         fixed_batch: dict[str,
                           torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Runs the torch model on one fixed-shape batch on device."""
         with torch.no_grad():
             trajectories, confidence_logits = device_predictor(
                 *(fixed_batch[name].to(device) for name in INPUT_NAMES))

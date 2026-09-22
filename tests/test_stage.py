@@ -1,5 +1,5 @@
-"""Tests for staging: file naming, duplicate scenario ids, and the pinned layout
-of a staged file.
+"""Tests for staging, covering file naming, duplicate scenario ids and the
+pinned layout of a staged file.
 """
 import json
 from pathlib import Path
@@ -106,7 +106,6 @@ def write_shard(shard_path, scenarios):
 
 
 def stage_fixture(tmp_path):
-    """Stages the fixture scenario and returns its staged file."""
     shard_path = tmp_path / "training.tfrecord-00000-of-01000"
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"

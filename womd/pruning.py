@@ -14,8 +14,8 @@ PRUNE_DISTANCE_METRES = 2.5
 
 def next_free_slot(is_flagged: torch.Tensor, filled_count: torch.Tensor,
                    slot_positions: torch.Tensor) -> torch.Tensor:
-    """A one-hot mask over the output slots: for each flagged sample, the next
-    slot it has not filled yet.
+    """A one-hot mask over the output slots giving, for each flagged sample,
+    the next slot it has not filled yet.
     """
     is_next_slot = slot_positions[None, :] == filled_count[:, None]
     return is_flagged[:, None] & is_next_slot
@@ -34,7 +34,7 @@ def prune_modes_batched_with_kept_count(
     confidence_order = torch.argsort(confidence_logits, dim=-1, descending=True)
     slot_positions = torch.arange(slot_count, device=device)
 
-    # Per sample: the modes kept so far, where they end, and the modes
+    # Per sample, the modes kept so far, where they end, and the modes
     # dropped so far, each with a count of how many slots are filled.
     kept_indices = torch.zeros(batch_size,
                                slot_count,
@@ -96,8 +96,6 @@ def prune_modes_batched_with_kept_count(
 def prune_modes_batched(
         trajectories: torch.Tensor,
         confidence_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Same as prune_modes_batched_with_kept_count, without the kept-mode count.
-    """
     kept_trajectories, kept_confidence_logits, _ = (
         prune_modes_batched_with_kept_count(trajectories, confidence_logits))
     return kept_trajectories, kept_confidence_logits

@@ -1,5 +1,5 @@
-"""Turns one Waymo Scenario proto into staged arrays: agent tracks, map dots one
-metre apart, traffic-light histories.
+"""Turns one Waymo Scenario proto into staged arrays of agent tracks, map dots
+one metre apart and traffic-light histories.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ SceneFrameFeature = namedtuple(
     "points directions crossing_codes kind_index",
 )
 
-# The map features of a scenario: all dots in one array, then one
+# The map features of a scenario, all dots in one array and then one
 # entry per feature saying how many of those dots are its own.
 StagedMap = namedtuple(
     "StagedMap",
@@ -33,7 +33,7 @@ StagedMap = namedtuple(
 
 def scenario_scene_frame(
         scenario: scenario_pb2.Scenario) -> tuple[np.ndarray, float]:
-    """Returns the scene frame's origin and heading: the SDC's world position
+    """Returns the scene frame's origin and heading, the SDC's world position
     and heading at the current step.
     """
     sdc_track = scenario.tracks[scenario.sdc_track_index]
@@ -120,8 +120,8 @@ def scenario_track_arrays(
 def scenario_track_labels(
     scenario: scenario_pb2.Scenario
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-track labels: track id, whether it is a designated prediction target,
-    and whether it is an object of interest.
+    """Per-track labels, the track id, whether it is a designated prediction
+    target and whether it is an object of interest.
     """
     track_ids = np.array([track.id for track in scenario.tracks],
                          dtype=np.int64)
@@ -179,7 +179,7 @@ def polyline_arc_lengths(points: np.ndarray) -> np.ndarray:
 
 def polyline_sample_distances(arc_lengths: np.ndarray,
                               spacing: float) -> np.ndarray:
-    """Arc length positions to resample at: evenly spaced, plus the polyline's
+    """Arc length positions to resample at, evenly spaced plus the polyline's
     final endpoint.
     """
     return np.append(np.arange(0.0, arc_lengths[-1], spacing), arc_lengths[-1])
@@ -238,8 +238,8 @@ def polyline_directions(points: np.ndarray) -> np.ndarray:
 def map_feature_boundary_crossing_codes(feature: map_pb2.MapFeature,
                                         raw_points: np.ndarray,
                                         dot_count: int) -> np.ndarray:
-    """Per-dot left/right boundary crossing codes for a lane feature: 0 means no
-    boundary, otherwise 1 + the road line type.
+    """Per-dot left and right boundary crossing codes for a lane feature, 0 for
+    no boundary and otherwise 1 + the road line type.
     """
     crossing_codes = np.zeros((dot_count, 2))
     if feature.WhichOneof("feature_data") != "lane":
@@ -385,7 +385,6 @@ def map_feature_signal_history(
 
 
 def map_feature_is_interpolating(feature: map_pb2.MapFeature) -> bool:
-    """Whether a lane feature is flagged as interpolating."""
     return (feature.WhichOneof("feature_data") == "lane" and
             feature.lane.interpolating)
 
@@ -446,8 +445,8 @@ def scenario_map_arrays(scenario: scenario_pb2.Scenario) -> StagedMap:
 
 
 def write_scenario(scenario: scenario_pb2.Scenario, output_path: Path) -> float:
-    """Writes one scenario's staged .npz: track and map arrays, labels, the
-    scene frame, and a provenance stamp.
+    """Writes one scenario's staged .npz with its track and map arrays, labels,
+    the scene frame and a provenance stamp.
     """
     assert scenario.current_time_index == contract.CURRENT_STEP_INDEX, (
         f"current_time_index {scenario.current_time_index},"
@@ -485,8 +484,8 @@ def write_scenario(scenario: scenario_pb2.Scenario, output_path: Path) -> float:
     partial_path = output_path.with_suffix(output_path.suffix + ".partial")
     with open(partial_path, "wb") as partial_file:
         np.savez_compressed(partial_file, **staged_arrays)
-    # Renaming from a .partial path makes the write atomic: a
-    # killed process never leaves a half-written file in place.
+    # Renaming from a .partial path makes the write atomic, so a killed
+    # process never leaves a half-written file in place.
     partial_path.replace(output_path)
     return worst_spacing_deviation
 

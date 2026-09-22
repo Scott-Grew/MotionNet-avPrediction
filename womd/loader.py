@@ -1,6 +1,6 @@
-"""Turns a staged scenario into model inputs: the scene once, in the staged
-scene frame, plus each predicted agent's own view of it. Layout drawn at the
-end.
+"""Turns a staged scenario into model inputs, the scene once in the staged
+scene frame plus each predicted agent's own view of it. The layout is drawn at
+the end of this file.
 """
 from __future__ import annotations
 
@@ -19,11 +19,14 @@ STRETCH_GAIN = 0.5
 
 def inside_crop(agent_frame_points: np.ndarray, base_radius: float,
                 forward_stretch: float) -> np.ndarray:
-    """Ellipse crop test in agent-frame coordinates: ahead of the agent it
-    stretches by forward_stretch; behind it is a circle.
+    """Ellipse crop test in agent-frame coordinates. Ahead of the agent the
+    radius stretches by forward_stretch; behind it is a circle.
     """
     ahead = agent_frame_points[:, 0]
     sideways = agent_frame_points[:, 1]
+    # A point (x, y) is inside when (x / (r s))^2 + (y / r)^2 <= 1 ahead of
+    # the agent and (x / r)^2 + (y / r)^2 <= 1 behind it, for radius r and
+    # stretch s.
     sideways_term = (sideways / base_radius)**2
     front_term = (ahead / (base_radius * forward_stretch))**2
     rear_term = (ahead / base_radius)**2
@@ -51,7 +54,7 @@ def eligible_track_indices(track_rows: np.ndarray, track_valid: np.ndarray,
 
 def sample_frame(track_rows: np.ndarray,
                  track_index: int) -> tuple[np.ndarray, float]:
-    """A track's agent frame at the current step: its position and heading."""
+    """A track's agent frame at the current step, its position and heading."""
     now_row = track_rows[track_index, contract.CURRENT_STEP_INDEX]
     origin = now_row[contract.AGENT_POSITION]
     heading = np.arctan2(
@@ -77,6 +80,8 @@ def track_rows_to_agent_frame(track_rows: np.ndarray, origin: np.ndarray,
     heading_cosine = track_rows[..., contract.AGENT_HEADING_COSINE]
     heading_sine = track_rows[..., contract.AGENT_HEADING_SINE]
     rotation_cosine, rotation_sine = np.cos(heading), np.sin(heading)
+    # A heading h relative to the frame heading r is cos(h - r) = cos h cos r
+    # + sin h sin r and sin(h - r) = sin h cos r - cos h sin r.
     agent_frame_rows[..., contract.AGENT_HEADING_COSINE] = (
         heading_cosine * rotation_cosine + heading_sine * rotation_sine)
     agent_frame_rows[..., contract.AGENT_HEADING_SINE] = (
@@ -100,9 +105,6 @@ def nearest_same_direction_lane_dot(
 
 def lane_dots_of_scenario(
         scenario_array: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Selects the map rows and polyline indices belonging to lane-kind dots
-    only.
-    """
     map_rows = scenario_array["map_rows"]
     dot_polyline_index = scenario_array["map_dot_polyline_index"]
     lane_kind_index = contract.MAP_POLYLINE_KINDS.index("lane")
@@ -179,8 +181,8 @@ def chunk_dots_by_polyline(
 
     chunk_dots = contract.MAP_CHUNK_DOTS
     chunks_per_polyline = (dots_per_polyline + chunk_dots - 1) // chunk_dots
-    # Each polyline's chunk indices start where the previous
-    # polyline's chunks left off: an exclusive cumulative sum.
+    # Each polyline's chunk indices start where the previous polyline's
+    # chunks left off, an exclusive cumulative sum.
     chunks_up_to_polyline = np.cumsum(chunks_per_polyline)
     first_chunk_of_polyline = chunks_up_to_polyline - chunks_per_polyline
     first_chunk_of_own_polyline = first_chunk_of_polyline[
@@ -249,8 +251,8 @@ def poses_in_agent_frame(positions: np.ndarray,
 
 
 class SceneTokens(NamedTuple):
-    """Where each scene token sits in the scene frame: one per agent, one per
-    map chunk.
+    """Where each scene token sits in the scene frame, one per agent and one
+    per map chunk.
     """
     agent_present: np.ndarray
     agent_positions: np.ndarray
@@ -354,8 +356,8 @@ def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
 
 def build_scene_sample(scenario_array: dict[str, np.ndarray],
                        track_indices: list[int]) -> dict[str, Any]:
-    """Builds one scene sample: every agent and the whole staged map in the
-    scene frame, plus one target entry per predicted agent.
+    """Builds one scene sample, every agent and the whole staged map in the
+    scene frame plus one target entry per predicted agent.
     """
     tokens = scene_tokens(scenario_array)
     history = slice(0, contract.HISTORY_STEPS)
@@ -406,18 +408,16 @@ def build_scene_batch(
 
     def scene_entry(key: str, padded_length: int,
                     dtype: np.dtype | type) -> np.ndarray:
-        """Pads one per-scene entry across the scenes."""
         return pad_and_stack([scene[key] for scene in scene_samples],
                              padded_length, dtype)
 
     def target_entry(key: str) -> np.ndarray:
-        """Stacks one fixed-shape entry across every target."""
         return np.stack([target[key] for _, target in targets])
 
     def target_tokens(agent_key: str, chunk_key: str,
                       dtype: np.dtype | type) -> np.ndarray:
-        """One per-token entry across every target, in token order: the padded
-        scene agents, then the padded map chunks.
+        """One per-token entry across every target, in token order, the padded
+        scene agents and then the padded map chunks.
         """
         agent_part = pad_and_stack([target[agent_key] for _, target in targets],
                                    max_agents, dtype)
@@ -458,11 +458,11 @@ def build_scene_batch(
 
 
 # ------------------------------------------------------------------
-# WHAT THE MODEL READS: one batch from build_scene_batch(). S scenes,
+# WHAT THE MODEL READS, one batch from build_scene_batch(). S scenes,
 # B predicted agents across them, A agents and C map chunks in the
 # largest scene, D map dots in the whole batch. Padding is zero.
 #
-# Once per scene, in the staged scene frame:
+# Once per scene, in the staged scene frame.
 #
 #   scene_agent_history         (S, A, 11, 13)  every agent, 11 steps
 #   scene_agent_history_mask    (S, A, 11)
@@ -471,7 +471,7 @@ def build_scene_batch(
 #   map_dot_chunk_slot          (D,)            scene * C + chunk
 #   map_chunk_signal_history    (S, C, 11, 9)
 #
-# Once per predicted agent, in that agent's own frame:
+# Once per predicted agent, in that agent's own frame.
 #
 #   target_scene_index    (B,)            which scene it belongs to
 #   agent_history         (B, 11, 13)     the agent, 11 steps
@@ -482,14 +482,14 @@ def build_scene_batch(
 #   future_positions      (B, 80, 2)      the answer, for the loss
 #   future_mask           (B, 80)
 #
-# One agent row, per 0.1 s step:
+# One agent row, per 0.1 s step.
 #
 #     0   1   2   3   4   5   6   7   8   9  10  11  12
 #   +-------+---+---+-------+-------+---------------+---+
 #   | x   y |cos|sin|vx  vy |len wid|veh ped cyc oth|sdc|
 #   +-------+---+---+-------+-------+---------------+---+
 #
-# One map row, per metre of a map feature:
+# One map row, per metre of a map feature.
 #
 #     0-1   2-3    4-10    11-14   15    16-27   28-29  30  31
 #   +-----+-----+--------+-------+-----+--------+------+---+---+
@@ -497,5 +497,5 @@ def build_scene_batch(
 #   |     |     | 1-hot  | type  |limit| type   | x  y |   |   |
 #   +-----+-----+--------+-------+-----+--------+------+---+---+
 #
-#   L, R: marking on the lane's left and right, 0 for none.
+#   L and R are the marking on the lane's left and right, 0 for none.
 # ------------------------------------------------------------------

@@ -1,5 +1,5 @@
-"""The two loss terms: Gaussian likelihood of the assigned anchor's path, and
-cross-entropy over which anchor that was.
+"""The two loss terms, the Gaussian likelihood of the assigned anchor's path
+and cross-entropy over which anchor that was.
 """
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ def gaussian_negative_log_likelihood(predicted_mean: torch.Tensor,
     covariance, log-std parameterised for stability.
     """
     error = predicted_mean - target.unsqueeze(1)
+    # Per axis the NLL is log sigma + (error / sigma)^2 / 2 + log(2 pi) / 2.
     standardised_error = error / log_standard_deviation.exp()
     per_axis_nll = (log_standard_deviation + 0.5 * standardised_error**2 +
                     HALF_LOG_TWO_PI)

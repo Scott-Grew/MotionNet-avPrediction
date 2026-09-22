@@ -1,5 +1,5 @@
-"""Checks run before a Kaggle session: the mounted code matches this working
-copy, and no credential file is present.
+"""Checks run before a Kaggle session, that the mounted code matches this
+working copy and that no credential file is present.
 """
 from __future__ import annotations
 

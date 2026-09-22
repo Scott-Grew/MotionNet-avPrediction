@@ -1,5 +1,5 @@
-"""Tests for the training loop: the learning-rate schedule, resuming, and the
-Kaggle kernel's command line.
+"""Tests for the training loop, covering the learning-rate schedule, resuming
+and the Kaggle kernel's command line.
 """
 from pathlib import Path
 
