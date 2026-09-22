@@ -43,7 +43,7 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def check_step_is_healthy(step: train.TrainingStep, batch_index: int) -> None:
+def check_step_is_healthy(step: metrics.TrainingStep, batch_index: int) -> None:
     """Stops the run if a loss, prediction or logit is not finite, or if the
     modes have all landed on one endpoint.
     """
@@ -63,7 +63,7 @@ def check_step_is_healthy(step: train.TrainingStep, batch_index: int) -> None:
 
 
 def median_end_distances(
-        step: train.TrainingStep,
+        step: metrics.TrainingStep,
         batch: SceneBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Median distance from the start to the final step, in metres, for the
     predictions, the logged futures and the constant-velocity null.

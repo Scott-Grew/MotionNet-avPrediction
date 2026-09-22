@@ -4,10 +4,25 @@ It steers runs; reported numbers come only from Waymo's scorer.
 """
 from __future__ import annotations
 
+from collections import namedtuple
+import math
+
 import torch
 
 from womd import contract
+from womd.loader import SceneBatch
+from womd.model import QUERY_COUNT
 from womd.pruning import prune_modes_batched_with_kept_count
+
+# One training step's three loss values and the raw predictions
+# the training monitor reads.
+TrainingStep = namedtuple(
+    "TrainingStep",
+    "total regression classification trajectories confidence_logits",
+)
+
+# A progress line is printed once per this many batches.
+LOG_EVERY_BATCHES = 20
 
 
 def mean_distance_per_mode(trajectories: torch.Tensor,
@@ -88,3 +103,140 @@ class MetricAccumulator:
                                                 self.sample_count),
             "backfill_rate": self.mean_or_nan(backfilled, self.sample_count),
         }
+
+
+class EpochProgress:
+    """Running totals for one epoch, the losses, the training monitor,
+    optimiser health and timing, overall and per logging window.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.accumulator = MetricAccumulator()
+        self.window_accumulator = MetricAccumulator()
+        self.loss_sums = {
+            "total": 0.0,
+            "regression": 0.0,
+            "classification": 0.0,
+        }
+        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
+        self.seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
+        self.batch_count = 0
+        self.sample_count = 0
+        self.non_finite_total_count = 0
+        self.gradient_scaler_skip_count = 0
+        self.clipped_step_count = 0
+        self.window_winner_counts = torch.zeros(QUERY_COUNT,
+                                                dtype=torch.long,
+                                                device=device)
+
+    def record_step(self, step: TrainingStep, was_clipped: bool,
+                    was_skipped: bool, sample_count: int) -> bool:
+        """Folds one step's losses and optimiser health into the totals, and
+        returns whether the total loss was finite.
+        """
+        loss_values = {
+            "total": float(step.total.detach()),
+            "regression": float(step.regression.detach()),
+            "classification": float(step.classification.detach()),
+        }
+        for name, value in loss_values.items():
+            self.loss_sums[name] += value
+            self.window_loss_sums[name] += value
+        total_is_finite = math.isfinite(loss_values["total"])
+        self.non_finite_total_count += int(not total_is_finite)
+        self.clipped_step_count += int(was_clipped)
+        self.gradient_scaler_skip_count += int(was_skipped)
+        self.batch_count += 1
+        self.sample_count += sample_count
+        return total_is_finite
+
+    def record_monitor(self, step: TrainingStep, batch: SceneBatch) -> None:
+        """Records the training monitor, which steers runs and is never a
+        reported number. Every batch counts which mode came closest, to spot
+        modes that never win; the pruned minADE and minFDE run on one batch
+        in LOG_EVERY_BATCHES, because pruning is the monitor's slow part.
+        """
+        trajectories = step.trajectories.detach().float()
+        confidence_logits = step.confidence_logits.detach().float()
+        future_positions = batch.targets.future_positions
+        future_mask = batch.targets.future_mask
+        with torch.no_grad():
+            mode_distances = mean_distance_per_mode(trajectories,
+                                                    future_positions,
+                                                    future_mask)
+            window_winners = mode_distances.argmin(dim=1)
+            self.window_winner_counts.scatter_add_(
+                0, window_winners, torch.ones_like(window_winners))
+            if self.batch_count % LOG_EVERY_BATCHES != 0:
+                return
+            for metric_accumulator in (self.accumulator,
+                                       self.window_accumulator):
+                metric_accumulator.update(trajectories, confidence_logits,
+                                          future_positions, future_mask)
+
+    def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
+        """The table reported every LOG_EVERY_BATCHES, the losses, the training
+        monitor, optimiser health and where the time went.
+        """
+        monitor = self.accumulator.results()
+        window_monitor = self.window_accumulator.results()
+        never_win_count = int((self.window_winner_counts == 0).sum())
+        peak_gigabytes = 0.0
+        if self.device.type == "cuda":
+            peak_gigabytes = torch.cuda.max_memory_allocated() / 1e9
+        loss_sums = self.loss_sums
+        batch_count = self.batch_count
+        seconds = self.seconds
+        elapsed = sum(seconds.values())
+        return {
+            "loss/total": loss_sums["total"] / batch_count,
+            "loss/regression": loss_sums["regression"] / batch_count,
+            "loss/classification": loss_sums["classification"] / batch_count,
+            "loss_window/total": self.window_loss_sums["total"] /
+                                 LOG_EVERY_BATCHES,
+            "monitor/ade_80step": monitor["min_ade"],
+            "monitor/fde_80step": monitor["min_fde"],
+            "monitor_window/ade_80step": window_monitor["min_ade"],
+            "monitor_window/fde_80step": window_monitor["min_fde"],
+            "monitor_window/kept_modes": window_monitor["mean_kept_modes"],
+            "monitor_window/backfill_rate": window_monitor["backfill_rate"],
+            "monitor_window/never_win_anchors": never_win_count,
+            "health/non_finite_losses": self.non_finite_total_count,
+            "health/skipped_steps": self.gradient_scaler_skip_count,
+            "health/clipped_steps": self.clipped_step_count,
+            "optimisation/learning_rate": step_learning_rate,
+            "throughput/samples_per_second": self.sample_count / elapsed,
+            "time_share/data_wait": seconds["data_wait"] / elapsed,
+            "time_share/step": seconds["step"] / elapsed,
+            "time_share/monitor": seconds["monitor"] / elapsed,
+            "memory/peak_gigabytes": peak_gigabytes,
+        }
+
+    def start_new_window(self) -> None:
+        self.window_accumulator = MetricAccumulator()
+        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
+        self.window_winner_counts.zero_()
+
+    def averages(self) -> dict[str, float]:
+        """Mean of each loss term over the batches seen so far."""
+        return {
+            name: value / max(self.batch_count, 1)
+            for name, value in self.loss_sums.items()
+        }
+
+
+def epoch_scalars(averages: dict[str, float], monitor: dict[str, float],
+                  seconds: dict[str, float]) -> dict[str, float]:
+    return {
+        "epoch/loss_total": averages["total"],
+        "epoch/loss_regression": averages["regression"],
+        "epoch/loss_classification": averages["classification"],
+        "epoch/ade_80step": monitor["min_ade"],
+        "epoch/fde_80step": monitor["min_fde"],
+        "epoch/kept_modes": monitor["mean_kept_modes"],
+        "epoch/backfill_rate": monitor["backfill_rate"],
+        "epoch/data_wait_seconds": seconds["data_wait"],
+        "epoch/step_seconds": seconds["step"],
+        "epoch/monitor_seconds": seconds["monitor"],
+    }

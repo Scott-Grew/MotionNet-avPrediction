@@ -22,28 +22,26 @@ from torch.distributed.algorithms.join import Join
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
-from womd import contract, loader, loss, metrics, pipeline
+from womd import loader, loss, pipeline
 from womd.checkpoint import (
+    checkpoint_state,
     load_anchor_file,
     load_checkpoint_state,
-    parameter_fingerprint,
+    save_checkpoint,
 )
 from womd.loader import SceneBatch
-from womd.model import QUERY_COUNT, MotionPredictor
-
-# One training step's three loss values and the raw predictions
-# the training monitor reads.
-TrainingStep = namedtuple(
-    "TrainingStep",
-    "total regression classification trajectories confidence_logits",
+from womd.metrics import (
+    LOG_EVERY_BATCHES,
+    EpochProgress,
+    TrainingStep,
+    epoch_scalars,
 )
+from womd.model import MotionPredictor
 
 # The peak learning rate unless --learning-rate sets another, and
 # AdamW's own default weight decay.
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
-# A progress line is printed once per this many batches.
-LOG_EVERY_BATCHES = 20
 
 # Where this process sits among the processes torchrun started; a
 # plain launch is one process of one.
@@ -142,15 +140,6 @@ def training_losses(predictor: torch.nn.Module,
     )
 
 
-def unwrapped(predictor: torch.nn.Module) -> torch.nn.Module:
-    """The bare model under the multi-process and torch.compile wrappers, so
-    a checkpoint holds plain parameter names however the run was launched.
-    """
-    if isinstance(predictor, DistributedDataParallel):
-        predictor = predictor.module
-    return getattr(predictor, "_orig_mod", predictor)
-
-
 def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
     """Process 0's decision, shared with every process so they all stop
     together. Every process must make this call or the broadcast hangs.
@@ -162,45 +151,8 @@ def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
     return bool(shared_decision.item())
 
 
-def checkpoint_state(
-        predictor: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        gradient_scaler: GradScaler,
-        *,
-        seed: int,
-        completed_epochs: int,
-        epoch_plan: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Bundles the model, optimizer and scaler state, training progress and a
-    parameter fingerprint into a checkpoint dict.
-    """
-    model_state = unwrapped(predictor).state_dict()
-    return {
-        "model_state": model_state,
-        "optimizer_state": optimizer.state_dict(),
-        "gradient_scaler_state": gradient_scaler.state_dict(),
-        "completed_epochs": completed_epochs,
-        "seed": seed,
-        "code_version": contract.STAGING_CODE_VERSION,
-        "parameter_fingerprint": parameter_fingerprint(model_state),
-        "epoch_plan": epoch_plan,
-    }
-
-
 def epochs_left_to_train(completed_epochs: int, requested_epochs: int) -> range:
     return range(completed_epochs, requested_epochs)
-
-
-def save_checkpoint(checkpoint_path: Path, previous_checkpoint_path: Path,
-                    state: dict[str, Any]) -> None:
-    """Writes to a temporary file, then swaps it in, so a crash never truncates
-    the checkpoint; the prior one is kept as a fallback.
-    """
-    partial_suffix = checkpoint_path.suffix + ".partial"
-    partial_path = checkpoint_path.with_suffix(partial_suffix)
-    torch.save(state, partial_path)
-    if checkpoint_path.exists():
-        checkpoint_path.replace(previous_checkpoint_path)
-    partial_path.replace(checkpoint_path)
 
 
 def report_scalars(summary_writer: SummaryWriter, heading: str,
@@ -222,142 +174,6 @@ RunSettings = namedtuple(
     " warmup_steps gradient_clip_norm learning_rate decay_start_step"
     " decay_end_step summary_writer is_main_process epoch_plan",
 )
-
-
-class EpochProgress:
-    """Running totals for one epoch, the losses, the training monitor,
-    optimiser health and timing, overall and per logging window.
-    """
-
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.accumulator = metrics.MetricAccumulator()
-        self.window_accumulator = metrics.MetricAccumulator()
-        self.loss_sums = {
-            "total": 0.0,
-            "regression": 0.0,
-            "classification": 0.0,
-        }
-        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
-        self.seconds = {"data_wait": 0.0, "step": 0.0, "monitor": 0.0}
-        self.batch_count = 0
-        self.sample_count = 0
-        self.non_finite_total_count = 0
-        self.gradient_scaler_skip_count = 0
-        self.clipped_step_count = 0
-        self.window_winner_counts = torch.zeros(QUERY_COUNT,
-                                                dtype=torch.long,
-                                                device=device)
-
-    def record_step(self, step: TrainingStep, was_clipped: bool,
-                    was_skipped: bool, sample_count: int) -> bool:
-        """Folds one step's losses and optimiser health into the totals, and
-        returns whether the total loss was finite.
-        """
-        loss_values = {
-            "total": float(step.total.detach()),
-            "regression": float(step.regression.detach()),
-            "classification": float(step.classification.detach()),
-        }
-        for name, value in loss_values.items():
-            self.loss_sums[name] += value
-            self.window_loss_sums[name] += value
-        total_is_finite = math.isfinite(loss_values["total"])
-        self.non_finite_total_count += int(not total_is_finite)
-        self.clipped_step_count += int(was_clipped)
-        self.gradient_scaler_skip_count += int(was_skipped)
-        self.batch_count += 1
-        self.sample_count += sample_count
-        return total_is_finite
-
-    def record_monitor(self, step: TrainingStep, batch: SceneBatch) -> None:
-        """Records the training monitor, which steers runs and is never a
-        reported number. Every batch counts which mode came closest, to spot
-        modes that never win; the pruned minADE and minFDE run on one batch
-        in LOG_EVERY_BATCHES, because pruning is the monitor's slow part.
-        """
-        trajectories = step.trajectories.detach().float()
-        confidence_logits = step.confidence_logits.detach().float()
-        future_positions = batch.targets.future_positions
-        future_mask = batch.targets.future_mask
-        with torch.no_grad():
-            mode_distances = metrics.mean_distance_per_mode(
-                trajectories, future_positions, future_mask)
-            window_winners = mode_distances.argmin(dim=1)
-            self.window_winner_counts.scatter_add_(
-                0, window_winners, torch.ones_like(window_winners))
-            if self.batch_count % LOG_EVERY_BATCHES != 0:
-                return
-            for metric_accumulator in (self.accumulator,
-                                       self.window_accumulator):
-                metric_accumulator.update(trajectories, confidence_logits,
-                                          future_positions, future_mask)
-
-    def window_scalars(self, step_learning_rate: float) -> dict[str, float]:
-        """The table reported every LOG_EVERY_BATCHES, the losses, the training
-        monitor, optimiser health and where the time went.
-        """
-        monitor = self.accumulator.results()
-        window_monitor = self.window_accumulator.results()
-        never_win_count = int((self.window_winner_counts == 0).sum())
-        peak_gigabytes = 0.0
-        if self.device.type == "cuda":
-            peak_gigabytes = torch.cuda.max_memory_allocated() / 1e9
-        loss_sums = self.loss_sums
-        batch_count = self.batch_count
-        seconds = self.seconds
-        elapsed = sum(seconds.values())
-        return {
-            "loss/total": loss_sums["total"] / batch_count,
-            "loss/regression": loss_sums["regression"] / batch_count,
-            "loss/classification": loss_sums["classification"] / batch_count,
-            "loss_window/total": self.window_loss_sums["total"] /
-                                 LOG_EVERY_BATCHES,
-            "monitor/ade_80step": monitor["min_ade"],
-            "monitor/fde_80step": monitor["min_fde"],
-            "monitor_window/ade_80step": window_monitor["min_ade"],
-            "monitor_window/fde_80step": window_monitor["min_fde"],
-            "monitor_window/kept_modes": window_monitor["mean_kept_modes"],
-            "monitor_window/backfill_rate": window_monitor["backfill_rate"],
-            "monitor_window/never_win_anchors": never_win_count,
-            "health/non_finite_losses": self.non_finite_total_count,
-            "health/skipped_steps": self.gradient_scaler_skip_count,
-            "health/clipped_steps": self.clipped_step_count,
-            "optimisation/learning_rate": step_learning_rate,
-            "throughput/samples_per_second": self.sample_count / elapsed,
-            "time_share/data_wait": seconds["data_wait"] / elapsed,
-            "time_share/step": seconds["step"] / elapsed,
-            "time_share/monitor": seconds["monitor"] / elapsed,
-            "memory/peak_gigabytes": peak_gigabytes,
-        }
-
-    def start_new_window(self) -> None:
-        self.window_accumulator = metrics.MetricAccumulator()
-        self.window_loss_sums = dict.fromkeys(self.loss_sums, 0.0)
-        self.window_winner_counts.zero_()
-
-    def averages(self) -> dict[str, float]:
-        """Mean of each loss term over the batches seen so far."""
-        return {
-            name: value / max(self.batch_count, 1)
-            for name, value in self.loss_sums.items()
-        }
-
-
-def epoch_scalars(averages: dict[str, float], monitor: dict[str, float],
-                  seconds: dict[str, float]) -> dict[str, float]:
-    return {
-        "epoch/loss_total": averages["total"],
-        "epoch/loss_regression": averages["regression"],
-        "epoch/loss_classification": averages["classification"],
-        "epoch/ade_80step": monitor["min_ade"],
-        "epoch/fde_80step": monitor["min_fde"],
-        "epoch/kept_modes": monitor["mean_kept_modes"],
-        "epoch/backfill_rate": monitor["backfill_rate"],
-        "epoch/data_wait_seconds": seconds["data_wait"],
-        "epoch/step_seconds": seconds["step"],
-        "epoch/monitor_seconds": seconds["monitor"],
-    }
 
 
 def optimisation_step(predictor: torch.nn.Module,
@@ -505,6 +321,17 @@ def start_processes() -> tuple[Processes, torch.device]:
         distributed.init_process_group("nccl" if device.type ==
                                        "cuda" else "gloo")
     return Processes(count, rank, local_rank, rank == 0), device
+
+
+def stopped_by_budget(should_stop: bool, processes: Processes,
+                      device: torch.device, message: str) -> bool:
+    """Whether the main process's stop decision holds, announcing message
+    when it does. Every process must make this call together.
+    """
+    if not agreed_with_main_process(should_stop, device):
+        return False
+    announce(processes, message)
+    return True
 
 
 def announce(processes: Processes, message: str) -> None:
@@ -698,14 +525,14 @@ def main() -> None:
         elapsed_seconds = time.perf_counter() - training_start
         next_epoch_overruns = (elapsed_seconds + last_epoch_seconds
                                > arguments.stop_after_seconds)
-        if agreed_with_main_process(next_epoch_overruns, device):
-            announce(
-                processes, f"STOPPING BEFORE EPOCH {epoch_index + 1}:"
+        if stopped_by_budget(
+                next_epoch_overruns, processes, device,
+                f"STOPPING BEFORE EPOCH {epoch_index + 1}:"
                 f" {elapsed_seconds / 3600:.2f} h elapsed, the last epoch"
                 f" took {last_epoch_seconds / 3600:.2f} h, and the"
                 f" --stop-after-seconds budget is {budget_hours:.2f} h."
                 f" {epoch_index} of {arguments.epochs} epochs are complete"
-                f" and {arguments.checkpoint_path} holds them.")
+                f" and {arguments.checkpoint_path} holds them."):
             return
 
         epoch_start = time.perf_counter()
@@ -755,13 +582,13 @@ def main() -> None:
 
         elapsed_seconds = time.perf_counter() - training_start
         budget_is_spent = elapsed_seconds >= arguments.stop_after_seconds
-        if agreed_with_main_process(budget_is_spent, device):
-            announce(
-                processes, f"STOPPING EARLY: {elapsed_seconds / 3600:.2f} h"
+        if stopped_by_budget(
+                budget_is_spent, processes, device,
+                f"STOPPING EARLY: {elapsed_seconds / 3600:.2f} h"
                 f" elapsed against a --stop-after-seconds budget of"
                 f" {budget_hours:.2f} h. {epoch_index + 1} of"
                 f" {arguments.epochs} epochs are complete and"
-                f" {arguments.checkpoint_path} holds them.")
+                f" {arguments.checkpoint_path} holds them."):
             return
 
 

@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from womd import contract
 from womd.model import QUERY_COUNT
@@ -70,3 +71,49 @@ def load_anchor_file(anchors_path: Path | str) -> torch.Tensor:
         f" ({contract.NUM_OBJECT_TYPES}, {QUERY_COUNT}, 2)."
         f" Re-run fit_anchors.py")
     return unit_anchors
+
+
+def unwrapped(predictor: torch.nn.Module) -> torch.nn.Module:
+    """The bare model under the multi-process and torch.compile wrappers, so
+    a checkpoint holds plain parameter names however the run was launched.
+    """
+    if isinstance(predictor, DistributedDataParallel):
+        predictor = predictor.module
+    return getattr(predictor, "_orig_mod", predictor)
+
+
+def checkpoint_state(
+        predictor: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        gradient_scaler: torch.amp.GradScaler,
+        *,
+        seed: int,
+        completed_epochs: int,
+        epoch_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Bundles the model, optimizer and scaler state, training progress and a
+    parameter fingerprint into a checkpoint dict.
+    """
+    model_state = unwrapped(predictor).state_dict()
+    return {
+        "model_state": model_state,
+        "optimizer_state": optimizer.state_dict(),
+        "gradient_scaler_state": gradient_scaler.state_dict(),
+        "completed_epochs": completed_epochs,
+        "seed": seed,
+        "code_version": contract.STAGING_CODE_VERSION,
+        "parameter_fingerprint": parameter_fingerprint(model_state),
+        "epoch_plan": epoch_plan,
+    }
+
+
+def save_checkpoint(checkpoint_path: Path, previous_checkpoint_path: Path,
+                    state: dict[str, Any]) -> None:
+    """Writes to a temporary file, then swaps it in, so a crash never truncates
+    the checkpoint; the prior one is kept as a fallback.
+    """
+    partial_suffix = checkpoint_path.suffix + ".partial"
+    partial_path = checkpoint_path.with_suffix(partial_suffix)
+    torch.save(state, partial_path)
+    if checkpoint_path.exists():
+        checkpoint_path.replace(previous_checkpoint_path)
+    partial_path.replace(checkpoint_path)

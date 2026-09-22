@@ -112,16 +112,16 @@ def test_resuming_never_skips_a_completed_epoch():
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
-    interrupted = train.checkpoint_state(predictor,
-                                         optimizer,
-                                         scaler,
-                                         seed=0,
-                                         completed_epochs=2)
-    finished = train.checkpoint_state(predictor,
-                                      optimizer,
-                                      scaler,
-                                      seed=0,
-                                      completed_epochs=3)
+    interrupted = checkpoint.checkpoint_state(predictor,
+                                              optimizer,
+                                              scaler,
+                                              seed=0,
+                                              completed_epochs=2)
+    finished = checkpoint.checkpoint_state(predictor,
+                                           optimizer,
+                                           scaler,
+                                           seed=0,
+                                           completed_epochs=3)
     assert list(train.epochs_left_to_train(interrupted["completed_epochs"],
                                            5)) == [2, 3, 4]
     assert list(train.epochs_left_to_train(finished["completed_epochs"],
@@ -134,11 +134,11 @@ def test_checkpoint_round_trips(tmp_path,):
     predictor = torch.nn.Linear(1, 1)
     optimizer = torch.optim.AdamW(predictor.parameters())
     scaler = train.GradScaler(enabled=False)
-    state = train.checkpoint_state(predictor,
-                                   optimizer,
-                                   scaler,
-                                   seed=0,
-                                   completed_epochs=1)
+    state = checkpoint.checkpoint_state(predictor,
+                                        optimizer,
+                                        scaler,
+                                        seed=0,
+                                        completed_epochs=1)
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(state, checkpoint_path)
     reloaded_state = checkpoint.load_checkpoint_state(checkpoint_path)
