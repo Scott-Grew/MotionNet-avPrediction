@@ -9,7 +9,7 @@ import torch
 import train
 from reference_implementations import unit_anchor_offsets_per_type
 from womd import checkpoint, contract, model
-from womd.loader import SceneBatch
+from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
 from womd.model import MotionPredictor
 
 
@@ -24,41 +24,47 @@ def build_synthetic_map_rows(dot_count):
 def synthetic_batch():
     """A random two-target batch with three scene agents and four map chunks."""
     return SceneBatch(
-        scene_agent_history=torch.randn(2, 3, contract.HISTORY_STEPS,
-                                        contract.AGENT_FEATURE_DIM),
-        scene_agent_history_mask=torch.ones(2,
-                                            3,
-                                            contract.HISTORY_STEPS,
-                                            dtype=torch.bool),
-        scene_agent_signal_history=torch.zeros(
-            2,
-            3,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
+        scene=SceneArrays(
+            agent_history=torch.randn(2, 3, contract.HISTORY_STEPS,
+                                      contract.AGENT_FEATURE_DIM),
+            agent_history_mask=torch.ones(2,
+                                          3,
+                                          contract.HISTORY_STEPS,
+                                          dtype=torch.bool),
+            agent_signal_history=torch.zeros(
+                2,
+                3,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
         ),
-        map_rows=build_synthetic_map_rows(20),
-        map_dot_chunk_slot=torch.arange(20) // 5,
-        map_chunk_signal_history=torch.zeros(
-            2,
-            4,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
+        map=MapArrays(
+            rows=build_synthetic_map_rows(20),
+            dot_chunk_slot=torch.arange(20) // 5,
+            chunk_signal_history=torch.zeros(
+                2,
+                4,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
         ),
-        target_scene_index=torch.arange(2),
-        agent_history=torch.randn(2, contract.HISTORY_STEPS,
-                                  contract.AGENT_FEATURE_DIM),
-        agent_history_mask=torch.ones(2,
-                                      contract.HISTORY_STEPS,
-                                      dtype=torch.bool),
-        agent_signal_history=torch.zeros(
-            2,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
+        targets=TargetArrays(
+            scene_index=torch.arange(2),
+            agent_history=torch.randn(2, contract.HISTORY_STEPS,
+                                      contract.AGENT_FEATURE_DIM),
+            agent_history_mask=torch.ones(2,
+                                          contract.HISTORY_STEPS,
+                                          dtype=torch.bool),
+            agent_signal_history=torch.zeros(
+                2,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
+            token_visible=torch.ones(2, 3 + 4, dtype=torch.bool),
+            token_pose=torch.randn(2, 3 + 4, 4),
+            future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
+            future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
         ),
-        token_visible=torch.ones(2, 3 + 4, dtype=torch.bool),
-        token_pose=torch.randn(2, 3 + 4, 4),
-        future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
-        future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
     )
 
 

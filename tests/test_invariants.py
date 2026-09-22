@@ -25,7 +25,7 @@ from womd import (
     pruning,
     store,
 )
-from womd.loader import SceneBatch
+from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
 
 STAGED_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "staged"
 
@@ -75,51 +75,58 @@ def synthetic_scene_batch(sample_count, scene_agent_count, polyline_count,
         dtype=torch.float32,
     )
     return SceneBatch(
-        scene_agent_history=torch.randn(
-            sample_count,
-            scene_agent_count,
-            contract.HISTORY_STEPS,
-            contract.AGENT_FEATURE_DIM,
+        scene=SceneArrays(
+            agent_history=torch.randn(
+                sample_count,
+                scene_agent_count,
+                contract.HISTORY_STEPS,
+                contract.AGENT_FEATURE_DIM,
+            ),
+            agent_history_mask=torch.ones(
+                sample_count,
+                scene_agent_count,
+                contract.HISTORY_STEPS,
+                dtype=torch.bool,
+            ),
+            agent_signal_history=torch.rand(
+                sample_count,
+                scene_agent_count,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
         ),
-        scene_agent_history_mask=torch.ones(
-            sample_count,
-            scene_agent_count,
-            contract.HISTORY_STEPS,
-            dtype=torch.bool,
+        map=MapArrays(
+            rows=map_rows,
+            dot_chunk_slot=torch.arange(dot_count) // dots_per_polyline,
+            chunk_signal_history=torch.rand(
+                sample_count,
+                polyline_count,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
         ),
-        scene_agent_signal_history=torch.rand(
-            sample_count,
-            scene_agent_count,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
+        targets=TargetArrays(
+            scene_index=torch.arange(sample_count),
+            agent_history=agent_history,
+            agent_history_mask=torch.ones(sample_count,
+                                          contract.HISTORY_STEPS,
+                                          dtype=torch.bool),
+            agent_signal_history=torch.rand(
+                sample_count,
+                contract.HISTORY_STEPS,
+                contract.NUM_TRAFFIC_SIGNAL_STATES,
+            ),
+            token_visible=torch.ones(sample_count,
+                                     scene_agent_count + polyline_count,
+                                     dtype=torch.bool),
+            token_pose=torch.randn(sample_count,
+                                   scene_agent_count + polyline_count, 4),
+            future_positions=torch.randn(sample_count, contract.FUTURE_STEPS,
+                                         2),
+            future_mask=torch.ones(sample_count,
+                                   contract.FUTURE_STEPS,
+                                   dtype=torch.bool),
         ),
-        map_rows=map_rows,
-        map_dot_chunk_slot=torch.arange(dot_count) // dots_per_polyline,
-        map_chunk_signal_history=torch.rand(
-            sample_count,
-            polyline_count,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
-        ),
-        target_scene_index=torch.arange(sample_count),
-        agent_history=agent_history,
-        agent_history_mask=torch.ones(sample_count,
-                                      contract.HISTORY_STEPS,
-                                      dtype=torch.bool),
-        agent_signal_history=torch.rand(
-            sample_count,
-            contract.HISTORY_STEPS,
-            contract.NUM_TRAFFIC_SIGNAL_STATES,
-        ),
-        token_visible=torch.ones(sample_count,
-                                 scene_agent_count + polyline_count,
-                                 dtype=torch.bool),
-        token_pose=torch.randn(sample_count, scene_agent_count + polyline_count,
-                               4),
-        future_positions=torch.randn(sample_count, contract.FUTURE_STEPS, 2),
-        future_mask=torch.ones(sample_count,
-                               contract.FUTURE_STEPS,
-                               dtype=torch.bool),
     )
 
 
@@ -487,8 +494,8 @@ def test_submission_returns_to_the_world_frame():
             designated_targets_only=True,
         )[0])
     scene_sample = loader.build_scene_sample(scenario_array, [track_index])
-    sample = scene_sample["targets"][0]
-    agent_frame_future = sample["future_positions"]
+    sample = scene_sample.targets[0]
+    agent_frame_future = sample.future_positions
 
     world_future = submit.agent_frame_to_world_frame(agent_frame_future, sample,
                                                      scenario_array)
@@ -502,8 +509,8 @@ def test_submission_returns_to_the_world_frame():
     )
     back_to_agent_frame = frame_ops.positions_to_frame(
         back_to_storage_frame,
-        sample["frame_origin"],
-        sample["frame_heading"],
+        sample.frame_origin,
+        sample.frame_heading,
     )
     assert np.allclose(
         back_to_agent_frame,
@@ -748,20 +755,24 @@ def test_input_order_does_not_change_predictions():
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()).eval()
     batch = synthetic_scene_batch(2, 6, 5, 16)
-    batch.scene_agent_history_mask[:, 5] = False
+    batch.scene.agent_history_mask[:, 5] = False
     scene_agent_order = torch.randperm(6)
     token_order = torch.cat([scene_agent_order, torch.arange(6, 11)])
-    map_order = torch.randperm(batch.map_rows.shape[0])
-    permuted = batch._replace(
-        scene_agent_history=batch.scene_agent_history[:, scene_agent_order],
-        scene_agent_history_mask=batch.
-        scene_agent_history_mask[:, scene_agent_order],
-        scene_agent_signal_history=batch.
-        scene_agent_signal_history[:, scene_agent_order],
-        token_visible=batch.token_visible[:, token_order],
-        token_pose=batch.token_pose[:, token_order],
-        map_rows=batch.map_rows[map_order],
-        map_dot_chunk_slot=batch.map_dot_chunk_slot[map_order],
+    map_order = torch.randperm(batch.map.rows.shape[0])
+    permuted = SceneBatch(
+        scene=SceneArrays(
+            **{
+                name: array[:, scene_agent_order]
+                for name, array in batch.scene._asdict().items()
+            }),
+        map=batch.map._replace(
+            rows=batch.map.rows[map_order],
+            dot_chunk_slot=batch.map.dot_chunk_slot[map_order],
+        ),
+        targets=batch.targets._replace(
+            token_visible=batch.targets.token_visible[:, token_order],
+            token_pose=batch.targets.token_pose[:, token_order],
+        ),
     )
     with torch.no_grad():
         base_trajectories, base_logits = predictor(batch)
@@ -835,22 +846,23 @@ def test_agents_carry_their_lane_signal_history():
     two_agent_scene = loader.build_scene_sample(
         two_lane_signal_scenario(2, signalled_lane_history), [0])
     assert np.array_equal(
-        three_agent_scene["targets"][0]["agent_signal_history"],
+        three_agent_scene.targets[0].agent_signal_history,
         signalled_lane_history,
     )
-    assert np.all(three_agent_scene["scene_agent_signal_history"][1:] == 0.0)
+    assert np.all(three_agent_scene.scene_agent_signal_history[1:] == 0.0)
     batch = loader.build_scene_batch([three_agent_scene, two_agent_scene])
-    assert batch.scene_agent_signal_history.shape == (
+    assert batch.scene.agent_signal_history.shape == (
         2,
         3,
         contract.HISTORY_STEPS,
         contract.NUM_TRAFFIC_SIGNAL_STATES,
     )
-    assert np.all(batch.scene_agent_signal_history[1, 2] == 0.0)
+    assert np.all(batch.scene.agent_signal_history[1, 2] == 0.0)
     tensor_batch = pipeline.torch_batch(batch)
     silenced_batch = tensor_batch._replace(
-        agent_signal_history=torch.zeros_like(
-            tensor_batch.agent_signal_history))
+        targets=tensor_batch.targets._replace(
+            agent_signal_history=torch.zeros_like(
+                tensor_batch.targets.agent_signal_history)))
     torch.manual_seed(47)
     encoder = model.SceneEncoder()
     with torch.no_grad():
@@ -1057,8 +1069,8 @@ def test_every_model_output_moves_the_loss():
             trajectories,
             log_standard_deviation,
             confidence_logits,
-            batch.future_positions,
-            batch.future_mask,
+            batch.targets.future_positions,
+            batch.targets.future_mask,
             unit_anchors,
         )[0]
 
@@ -1139,8 +1151,8 @@ def test_training_step_runs_on_staged_scenarios(tmp_path,):
     accumulator.update(
         trajectories.detach(),
         confidence_logits.detach(),
-        batch.future_positions,
-        batch.future_mask,
+        batch.targets.future_positions,
+        batch.targets.future_mask,
     )
     assert all(math.isfinite(value) for value in accumulator.results().values())
     checkpoint_path = tmp_path / "predictor.pt"
