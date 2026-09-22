@@ -51,20 +51,19 @@ class SceneBatchStream(IterableDataset):
         scene_samples = []
         free_slots = self.targets_per_batch
         for scenario_index in random_generator.permutation(len(worker_paths)):
-            scenario_arrays = loader.read_scenario(worker_paths[scenario_index])
+            scenario = loader.read_scenario(worker_paths[scenario_index])
             waiting_track_indices = random_generator.permutation(
                 loader.eligible_track_indices(
-                    scenario_arrays["track_rows"],
-                    scenario_arrays["track_valid"],
-                    scenario_arrays["is_designated_target"],
+                    scenario.track_rows,
+                    scenario.track_valid,
+                    scenario.is_designated_target,
                     designated_targets_only=self.designated_targets_only,
                 )).tolist()
             while waiting_track_indices:
                 taken_track_indices = waiting_track_indices[:free_slots]
                 waiting_track_indices = waiting_track_indices[free_slots:]
                 scene_samples.append(
-                    loader.build_scene_sample(scenario_arrays,
-                                              taken_track_indices))
+                    loader.build_scene_sample(scenario, taken_track_indices))
                 free_slots -= len(taken_track_indices)
                 if free_slots:
                     continue

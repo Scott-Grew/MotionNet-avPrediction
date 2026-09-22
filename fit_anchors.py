@@ -39,15 +39,14 @@ def metre_endpoints(
     agent_histories = []
     logged_endpoints = []
     for scenario_path in scenario_paths:
-        scenario_array = loader.read_scenario(scenario_path)
+        scenario = loader.read_scenario(scenario_path)
         eligible = loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
+            scenario.track_rows,
+            scenario.track_valid,
+            scenario.is_designated_target,
             designated_targets_only=True,
         )
-        scene_sample = loader.build_scene_sample(scenario_array,
-                                                 eligible.tolist())
+        scene_sample = loader.build_scene_sample(scenario, eligible.tolist())
         for target in scene_sample.targets:
             valid_future_steps = np.flatnonzero(target.future_mask)
             if valid_future_steps.size == 0:

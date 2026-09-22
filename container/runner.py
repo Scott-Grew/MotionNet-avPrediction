@@ -91,14 +91,14 @@ def track_row_world_frame_state(track_row: np.ndarray, frame_origin: np.ndarray,
 
 
 def scenario_world_frame_ground_truth(
-    scenario_array: dict[str, np.ndarray]
+    scenario: loader.StagedScenario
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Builds world-frame ground truth state, validity, and object type for each
     track in a scenario, for scoring against it.
     """
-    track_rows = scenario_array["track_rows"]
-    frame_origin = scenario_array["frame_origin"]
-    frame_heading = float(scenario_array["frame_heading"])
+    track_rows = scenario.track_rows
+    frame_origin = scenario.frame_origin
+    frame_heading = scenario.frame_heading
     world_frame_states = np.stack([
         track_row_world_frame_state(track_row, frame_origin, frame_heading)
         for track_row in track_rows
@@ -108,7 +108,7 @@ def scenario_world_frame_ground_truth(
     object_types = type_onehots.argmax(axis=-1).astype(np.int64) + 1
     return (
         world_frame_states,
-        scenario_array["track_valid"],
+        scenario.track_valid,
         object_types,
     )
 
@@ -137,7 +137,7 @@ def build_motion_metric_tensors(
     prediction_rows_of_scenario = prediction_rows_by_scenario(
         predictions["scenario_id"])
     ordered_scenario_ids = list(prediction_rows_of_scenario)
-    scenario_arrays = [
+    scenarios = [
         loader.read_scenario(Path(staged_directory) / f"{scenario_id}.npz")
         for scenario_id in ordered_scenario_ids
     ]
@@ -145,8 +145,7 @@ def build_motion_metric_tensors(
     # The padded sizes give every scenario room for the most agents and
     # the most predictions any scenario has.
     scenario_count = len(ordered_scenario_ids)
-    max_agents = max(
-        len(scenario_array["track_ids"]) for scenario_array in scenario_arrays)
+    max_agents = max(len(scenario.track_ids) for scenario in scenarios)
     max_predictions = max(
         len(rows) for rows in prediction_rows_of_scenario.values())
     mode_count, submitted_steps = world_trajectories.shape[1:3]
@@ -172,13 +171,13 @@ def build_motion_metric_tensors(
     }
 
     for scenario_index, scenario_id in enumerate(ordered_scenario_ids):
-        scenario_array = scenario_arrays[scenario_index]
-        scenario_track_ids = scenario_array["track_ids"]
+        scenario = scenarios[scenario_index]
+        scenario_track_ids = scenario.track_ids
         agent_count = len(scenario_track_ids)
 
         # Ground truth holds every agent of the scenario.
         world_frame_states, track_valid, object_types = (
-            scenario_world_frame_ground_truth(scenario_array))
+            scenario_world_frame_ground_truth(scenario))
         agents = (scenario_index, slice(0, agent_count))
         tensors["ground_truth_trajectory"][agents] = world_frame_states
         tensors["ground_truth_is_valid"][agents] = track_valid

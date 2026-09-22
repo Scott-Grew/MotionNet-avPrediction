@@ -485,27 +485,27 @@ def test_submission_returns_to_the_world_frame():
     if not scenario_paths:
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
 
-    scenario_array = loader.read_scenario(scenario_paths[0])
+    scenario = loader.read_scenario(scenario_paths[0])
     track_index = int(
         loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
+            scenario.track_rows,
+            scenario.track_valid,
+            scenario.is_designated_target,
             designated_targets_only=True,
         )[0])
-    scene_sample = loader.build_scene_sample(scenario_array, [track_index])
+    scene_sample = loader.build_scene_sample(scenario, [track_index])
     sample = scene_sample.targets[0]
     agent_frame_future = sample.future_positions
 
     world_future = submit.agent_frame_to_world_frame(agent_frame_future, sample,
-                                                     scenario_array)
+                                                     scenario)
     world_coordinate_resolution = (np.finfo(np.float32).eps *
                                    np.abs(world_future).max())
 
     back_to_storage_frame = frame_ops.positions_to_frame(
         world_future,
-        scenario_array["frame_origin"],
-        scenario_array["frame_heading"],
+        scenario.frame_origin,
+        scenario.frame_heading,
     )
     back_to_agent_frame = frame_ops.positions_to_frame(
         back_to_storage_frame,
@@ -519,16 +519,15 @@ def test_submission_returns_to_the_world_frame():
     )
 
     logged_world_future = frame_ops.positions_from_frame(
-        scenario_array["track_rows"][
+        scenario.track_rows[
             track_index,
             contract.CURRENT_STEP_INDEX + 1:,
             contract.AGENT_POSITION,
         ],
-        scenario_array["frame_origin"],
-        scenario_array["frame_heading"],
+        scenario.frame_origin,
+        scenario.frame_heading,
     )
-    logged = scenario_array["track_valid"][track_index,
-                                           contract.CURRENT_STEP_INDEX + 1:]
+    logged = scenario.track_valid[track_index, contract.CURRENT_STEP_INDEX + 1:]
     assert logged.any()
     assert np.allclose(
         world_future[logged],
@@ -813,7 +812,7 @@ def two_lane_signal_scenario(track_count, signalled_lane_history):
     if track_count > 2:
         track_rows[2, :, contract.AGENT_POSITION] = np.array([7.0, 0.0])
         track_valid[2, contract.CURRENT_STEP_INDEX] = False
-    scenario_array = {
+    scenario = {
         "map_rows": np.concatenate([signalled_lane, unsignalled_lane]),
         "feature_lengths": feature_lengths,
         "feature_ids": np.array([101, 102], dtype=np.int64),
@@ -821,11 +820,13 @@ def two_lane_signal_scenario(track_count, signalled_lane_history):
         "track_rows": track_rows,
         "track_valid": track_valid,
         "scenario_id": np.array("two-lane"),
+        "frame_origin": np.zeros(2, dtype=np.float32),
+        "frame_heading": np.float32(0.0),
         "track_ids": np.arange(track_count),
         "is_designated_target": np.ones(track_count, dtype=bool),
         "is_object_of_interest": np.zeros(track_count, dtype=bool),
     }
-    return loader.with_derived_arrays(scenario_array)
+    return loader.staged_scenario(scenario)
 
 
 def test_agents_carry_their_lane_signal_history():

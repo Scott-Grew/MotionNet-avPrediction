@@ -6,7 +6,7 @@ file.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple
 
 import numpy as np
 
@@ -104,10 +104,8 @@ def nearest_same_direction_lane_dot(
     return np.where(candidates, agent_distances, np.inf).argmin(axis=1)
 
 
-def lane_dots_of_scenario(
-        scenario_array: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    map_rows = scenario_array["map_rows"]
-    dot_polyline_index = scenario_array["map_dot_polyline_index"]
+def lane_dots(map_rows: np.ndarray,
+              dot_polyline_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     lane_kind_index = contract.MAP_POLYLINE_KINDS.index("lane")
     lane_kind_column = contract.MAP_KIND.start + lane_kind_index
     lane_dot_indices = np.flatnonzero(map_rows[:, lane_kind_column] == 1.0)
@@ -195,46 +193,75 @@ def chunk_dots_by_polyline(
     return dot_chunk_index, chunk_polyline
 
 
-def with_derived_arrays(
-        scenario_array: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Adds map_dot_polyline_index (which polyline each map row belongs to) and
-    track_signal_histories to a loaded scenario.
+class StagedScenario(NamedTuple):
+    """One staged scenario in the scene frame, with T tracks, F map features
+    and D map dots. The last two track and map fields are derived on load.
     """
-    feature_lengths = scenario_array["feature_lengths"]
-    scenario_array["map_dot_polyline_index"] = np.repeat(
-        np.arange(len(feature_lengths)), feature_lengths)
-    lane_dot_rows, polyline_row_of_lane_dot = lane_dots_of_scenario(
-        scenario_array)
-    scenario_array["track_signal_histories"] = assigned_lane_signal_histories(
-        lane_dot_rows,
-        polyline_row_of_lane_dot,
-        scenario_array["polyline_signal_histories"],
-        scenario_array["track_rows"][:, contract.CURRENT_STEP_INDEX],
-        scenario_array["track_valid"][:, contract.CURRENT_STEP_INDEX],
+    scenario_id: str
+    frame_origin: np.ndarray  # (2,) scene frame origin in world
+    frame_heading: float  # scene frame heading in world
+    track_ids: np.ndarray  # (T,)
+    track_rows: np.ndarray  # (T, 91, 13)
+    track_valid: np.ndarray  # (T, 91)
+    is_designated_target: np.ndarray  # (T,)
+    map_rows: np.ndarray  # (D, 32)
+    feature_lengths: np.ndarray  # (F,) dots per feature
+    polyline_signal_histories: np.ndarray  # (F, 11, 9)
+    track_signal_histories: np.ndarray  # (T, 11, 9) its lane's light
+    map_dot_polyline_index: np.ndarray  # (D,) feature each dot belongs to
+
+
+def staged_scenario(staged: Mapping[str, np.ndarray]) -> StagedScenario:
+    """Builds a StagedScenario from the arrays of a staged file, deriving
+    which feature each map dot belongs to and each track's lane signal.
+    """
+    feature_lengths = staged["feature_lengths"]
+    map_rows = staged["map_rows"]
+    track_rows = staged["track_rows"]
+    track_valid = staged["track_valid"]
+    polyline_signal_histories = staged["polyline_signal_histories"]
+    map_dot_polyline_index = np.repeat(np.arange(len(feature_lengths)),
+                                       feature_lengths)
+    lane_dot_rows, polyline_row_of_lane_dot = lane_dots(map_rows,
+                                                        map_dot_polyline_index)
+    return StagedScenario(
+        scenario_id=str(staged["scenario_id"]),
+        frame_origin=staged["frame_origin"],
+        frame_heading=float(staged["frame_heading"]),
+        track_ids=staged["track_ids"],
+        track_rows=track_rows,
+        track_valid=track_valid,
+        is_designated_target=staged["is_designated_target"],
+        map_rows=map_rows,
+        feature_lengths=feature_lengths,
+        polyline_signal_histories=polyline_signal_histories,
+        track_signal_histories=assigned_lane_signal_histories(
+            lane_dot_rows,
+            polyline_row_of_lane_dot,
+            polyline_signal_histories,
+            track_rows[:, contract.CURRENT_STEP_INDEX],
+            track_valid[:, contract.CURRENT_STEP_INDEX],
+        ),
+        map_dot_polyline_index=map_dot_polyline_index,
     )
-    return scenario_array
 
 
-def read_scenario(scenario_path: Path | str) -> dict[str, np.ndarray]:
-    """Loads one staged .npz scenario, checks its provenance stamp, and returns
-    it with derived arrays added.
-    """
+def read_scenario(scenario_path: Path | str) -> StagedScenario:
+    """Loads one staged .npz scenario and checks its provenance stamp."""
     with np.load(scenario_path) as scenario_file:
-        scenario_array = {
-            name: scenario_file[name] for name in scenario_file.files
-        }
-    if "provenance" in scenario_array:
+        staged = {name: scenario_file[name] for name in scenario_file.files}
+    if "provenance" in staged:
         contract.check_artifact_provenance(
-            scenario_array["provenance"],
+            staged["provenance"],
             scenario_path,
             "Restage the directory with stage.py.",
         )
-    feature_lengths = scenario_array["feature_lengths"]
-    map_row_count = len(scenario_array["map_rows"])
+    feature_lengths = staged["feature_lengths"]
+    map_row_count = len(staged["map_rows"])
     assert feature_lengths.sum() == map_row_count, (
         f"feature_lengths sum to {feature_lengths.sum()} but"
         f" {scenario_path} holds {map_row_count} map rows")
-    return with_derived_arrays(scenario_array)
+    return staged_scenario(staged)
 
 
 def poses_in_agent_frame(positions: np.ndarray,
@@ -264,13 +291,13 @@ class SceneTokens(NamedTuple):
     chunk_directions: np.ndarray
 
 
-def scene_tokens(scenario_array: dict[str, np.ndarray]) -> SceneTokens:
+def scene_tokens(scenario: StagedScenario) -> SceneTokens:
     """Places every agent at its last valid history step and every map chunk at
     its middle dot.
     """
-    track_rows = scenario_array["track_rows"]
-    map_rows = scenario_array["map_rows"]
-    history_valid = scenario_array["track_valid"][:, :contract.HISTORY_STEPS]
+    track_rows = scenario.track_rows
+    map_rows = scenario.map_rows
+    history_valid = scenario.track_valid[:, :contract.HISTORY_STEPS]
     # The first True in the reversed mask is the last True in the
     # original order.
     steps_from_end = history_valid[:, ::-1].argmax(axis=1)
@@ -285,7 +312,7 @@ def scene_tokens(scenario_array: dict[str, np.ndarray]) -> SceneTokens:
     )
 
     dot_chunk_index, chunk_polyline = chunk_dots_by_polyline(
-        scenario_array["map_dot_polyline_index"])
+        scenario.map_dot_polyline_index)
     _, first_dot_of_chunk, dots_per_chunk = np.unique(dot_chunk_index,
                                                       return_index=True,
                                                       return_counts=True)
@@ -333,16 +360,16 @@ class SceneSample(NamedTuple):
     targets: list[TargetSample]
 
 
-def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
+def build_target(scenario: StagedScenario, track_index: int,
                  tokens: SceneTokens) -> TargetSample:
     """One predicted agent's view of its scene.
 
     Holds its own history and future in its own frame, which scene tokens fall
     inside its crop, and every token's pose re-expressed in its frame.
     """
-    track_rows = scenario_array["track_rows"]
-    track_valid = scenario_array["track_valid"]
-    map_rows = scenario_array["map_rows"]
+    track_rows = scenario.track_rows
+    track_valid = scenario.track_valid
+    map_rows = scenario.map_rows
     history = slice(0, contract.HISTORY_STEPS)
     future = slice(contract.CURRENT_STEP_INDEX + 1, None)
 
@@ -366,7 +393,7 @@ def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
     agent_visible = tokens.agent_present.copy()
     agent_visible[track_index] = False
 
-    signal_histories = scenario_array["track_signal_histories"]
+    signal_histories = scenario.track_signal_histories
     return TargetSample(
         agent_history=agent_track[history],
         agent_history_mask=track_valid[track_index, history],
@@ -383,29 +410,29 @@ def build_target(scenario_array: dict[str, np.ndarray], track_index: int,
                                               heading),
         frame_origin=origin,
         frame_heading=heading,
-        track_id=scenario_array["track_ids"][track_index],
+        track_id=scenario.track_ids[track_index],
     )
 
 
-def build_scene_sample(scenario_array: dict[str, np.ndarray],
+def build_scene_sample(scenario: StagedScenario,
                        track_indices: list[int]) -> SceneSample:
     """Builds one scene sample, every agent and the whole staged map in the
     scene frame plus one target entry per predicted agent.
     """
-    tokens = scene_tokens(scenario_array)
+    tokens = scene_tokens(scenario)
     history = slice(0, contract.HISTORY_STEPS)
-    polyline_signal_histories = scenario_array["polyline_signal_histories"]
+    polyline_signal_histories = scenario.polyline_signal_histories
     return SceneSample(
-        scenario_id=scenario_array["scenario_id"],
-        scene_agent_history=scenario_array["track_rows"][:, history],
-        scene_agent_history_mask=scenario_array["track_valid"][:, history],
-        scene_agent_signal_history=scenario_array["track_signal_histories"],
-        map_rows=scenario_array["map_rows"],
+        scenario_id=scenario.scenario_id,
+        scene_agent_history=scenario.track_rows[:, history],
+        scene_agent_history_mask=scenario.track_valid[:, history],
+        scene_agent_signal_history=scenario.track_signal_histories,
+        map_rows=scenario.map_rows,
         map_chunk_index=tokens.dot_chunk_index.astype(np.int64),
         map_chunk_signal_history=polyline_signal_histories[
             tokens.chunk_polyline],
         targets=[
-            build_target(scenario_array, track_index, tokens)
+            build_target(scenario, track_index, tokens)
             for track_index in track_indices
         ],
     )
@@ -469,11 +496,10 @@ class SceneBatch(NamedTuple):
         """The same batch with function applied to every array, by name."""
 
         def applied(group: NamedTuple) -> NamedTuple:
-            return type(group)(
-                **{
-                    name: None if array is None else function(array)
-                    for name, array in group._asdict().items()
-                })
+            return type(group)(**{
+                name: None if array is None else function(array)
+                for name, array in group._asdict().items()
+            })
 
         return SceneBatch(
             scene=applied(self.scene),
@@ -498,9 +524,8 @@ def build_scene_batch(scene_samples: list[SceneSample]) -> SceneBatch:
 
     def scene_entry(name: str, padded_length: int,
                     dtype: np.dtype | type) -> np.ndarray:
-        return pad_and_stack(
-            [getattr(scene, name) for scene in scene_samples], padded_length,
-            dtype)
+        return pad_and_stack([getattr(scene, name) for scene in scene_samples],
+                             padded_length, dtype)
 
     def target_entry(name: str) -> np.ndarray:
         return np.stack([getattr(target, name) for _, target in targets])

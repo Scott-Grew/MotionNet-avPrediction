@@ -231,20 +231,18 @@ def designated_target_scene_batches(
     any scenario with none.
     """
     for scenario_path in scenario_paths:
-        scenario_array = loader.read_scenario(scenario_path)
+        scenario = loader.read_scenario(scenario_path)
         track_indices = loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
+            scenario.track_rows,
+            scenario.track_valid,
+            scenario.is_designated_target,
             designated_targets_only=True,
         )
         if not len(track_indices):
             continue
         yield pipeline.torch_batch(
-            loader.build_scene_batch([
-                loader.build_scene_sample(scenario_array,
-                                          track_indices.tolist())
-            ]))
+            loader.build_scene_batch(
+                [loader.build_scene_sample(scenario, track_indices.tolist())]))
 
 
 def main() -> None:

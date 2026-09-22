@@ -28,9 +28,9 @@ from womd.checkpoint import load_anchor_file, load_checkpoint_state
 SUBMISSION_STEP_SELECTOR = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
 
 
-def agent_frame_to_world_frame(
-        agent_frame_positions: np.ndarray, target: loader.TargetSample,
-        scenario_array: dict[str, np.ndarray]) -> np.ndarray:
+def agent_frame_to_world_frame(agent_frame_positions: np.ndarray,
+                               target: loader.TargetSample,
+                               scenario: loader.StagedScenario) -> np.ndarray:
     """Converts a prediction from the agent's own frame to world coordinates via
     the scene frame stored on the scenario.
     """
@@ -41,32 +41,32 @@ def agent_frame_to_world_frame(
     )
     return frame_ops.positions_from_frame(
         scene_frame_positions,
-        scenario_array["frame_origin"],
-        scenario_array["frame_heading"],
+        scenario.frame_origin,
+        scenario.frame_heading,
     )
 
 
 def designated_target_scenes(
     staged_directory: Path | str
-) -> Iterator[tuple[dict[str, np.ndarray], loader.SceneSample]]:
-    """Yields (scenario_array, scene_sample) for each staged scenario, in file
+) -> Iterator[tuple[loader.StagedScenario, loader.SceneSample]]:
+    """Yields (scenario, scene_sample) for each staged scenario, in file
     order, holding only the targets Waymo designated for scoring.
     """
     for scenario_path in sorted(Path(staged_directory).glob("*.npz")):
-        scenario_array = loader.read_scenario(scenario_path)
-        designated_count = int(scenario_array["is_designated_target"].sum())
+        scenario = loader.read_scenario(scenario_path)
+        designated_count = int(scenario.is_designated_target.sum())
         track_indices = loader.eligible_track_indices(
-            scenario_array["track_rows"],
-            scenario_array["track_valid"],
-            scenario_array["is_designated_target"],
+            scenario.track_rows,
+            scenario.track_valid,
+            scenario.is_designated_target,
             designated_targets_only=True,
         )
         assert len(track_indices) == designated_count, (
             f"{scenario_path} designates {designated_count} targets"
             f" but {designated_count - len(track_indices)} of them"
             f" cannot be predicted")
-        yield scenario_array, loader.build_scene_sample(scenario_array,
-                                                        track_indices.tolist())
+        yield scenario, loader.build_scene_sample(scenario,
+                                                  track_indices.tolist())
 
 
 def predict_for_submission(
@@ -114,8 +114,7 @@ def write_submission_arrays(predictor: model.MotionPredictor | None,
         [],
         [],
     )
-    for scenario_array, scene_sample in designated_target_scenes(
-            staged_directory):
+    for scenario, scene_sample in designated_target_scenes(staged_directory):
         scene_trajectories, scene_confidences = predict_for_submission(
             predictor, scene_sample)
         for target, trajectories, target_confidences in zip(
@@ -123,8 +122,7 @@ def write_submission_arrays(predictor: model.MotionPredictor | None,
             scenario_ids.append(str(scene_sample.scenario_id))
             track_ids.append(int(target.track_id))
             world_trajectories.append(
-                agent_frame_to_world_frame(trajectories, target,
-                                           scenario_array))
+                agent_frame_to_world_frame(trajectories, target, scenario))
             confidences.append(target_confidences)
 
     stacked_trajectories = np.stack(world_trajectories)
