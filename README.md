@@ -73,3 +73,8 @@ make train     # train, resuming from the checkpoint if one exists
 make predict   # write the model's predictions for the staged scenes
 make score     # score the checkpoint with Waymo's metrics, in Docker
 ```
+
+## References
+
+The scene encoder follows VectorNet (Gao et al., CVPR 2020). The
+decoder's anchor queries match MTR (Shi et al., NeurIPS 2022).
