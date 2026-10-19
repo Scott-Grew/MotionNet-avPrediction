@@ -109,6 +109,8 @@ def synthetic_scene_batch(size):
         targets=TargetArrays(
             scene_index=torch.arange(scenes),
             track_index=torch.zeros(scenes, dtype=torch.long),
+            frame_pose=torch.tensor([0.0, 0.0, 1.0, 0.0]).repeat(scenes, 1),
+            speed=torch.zeros(scenes),
             agent_history=agent_history,
             agent_history_mask=torch.ones(scenes, history, dtype=torch.bool),
             agent_signal_history=torch.rand(scenes, history, signals),
@@ -370,7 +372,7 @@ def test_anchor_null_ends_on_the_most_used_anchors():
         torch.arange(2), contract.CURRENT_STEP_INDEX, type_columns
     ] = 1.0
 
-    trajectories, confidence_logits = baseline.anchor_lines(
+    trajectories, confidence_logits = baseline.straight_to_anchors(
         agent_history, unit_anchors
     )
 

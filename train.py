@@ -19,7 +19,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.tensorboard import SummaryWriter
 
-from womd import loader, loss, pipeline
+from womd import loss, pipeline
 from womd.checkpoint import (
     GradScaler,
     Progress,
@@ -127,24 +127,6 @@ def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
         {"params": decayed, "weight_decay": WEIGHT_DECAY},
         {"params": undecayed, "weight_decay": 0.0},
     ]
-
-
-def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
-    """Optimiser steps per epoch, the sum over worker streams of ceil(targets
-    / batch size), because each DataLoader worker fills its own batches.
-    """
-    stream_count = max(settings.worker_count, 1)
-    step_count = 0
-    for stream_index in range(stream_count):
-        stream_targets = 0
-        for path in paths[stream_index::stream_count]:
-            scenario = loader.read_scenario(path)
-            eligible = loader.eligible_tracks(
-                scenario, settings.designated_only
-            )
-            stream_targets += len(eligible)
-        step_count += math.ceil(stream_targets / settings.batch_size)
-    return step_count
 
 
 def remaining_epochs(completed: int, requested: int) -> range:
@@ -273,7 +255,7 @@ class TrainingRun:
         ):
             print("optimiser step count read from the checkpoint", flush=True)
             return stored
-        count = steps_per_epoch(self.paths, settings)
+        count = pipeline.steps_per_epoch(self.paths, settings)
         epochs = self.arguments.epochs
         print(
             f"{count} optimiser steps per epoch,"

@@ -39,23 +39,10 @@ class TargetView(NamedTuple):
 
 
 def target_frames(batch: SceneBatch) -> TargetFrames:
-    """Each target's frame, read from its own row among its scene's agents."""
+    """Each target's frame and speed, as the loader wrote them."""
     targets = batch.targets
-    history = batch.scene.agent_history
-    agent_count = history.shape[1]
-    # Scene s, agent a is row s * A + a once scenes and agents are flattened.
-    rows = targets.scene_index * agent_count + targets.track_index
-    histories = history.flatten(0, 1).index_select(0, rows)
-    now = histories[:, contract.CURRENT_STEP_INDEX]
-    sine = now[:, contract.AGENT_HEADING_SINE]
-    cosine = now[:, contract.AGENT_HEADING_COSINE]
-    heading = torch.atan2(sine, cosine)
-    velocity = now[:, contract.AGENT_VELOCITY]
-    # The speed is sqrt(vx^2 + vy^2), written out because a norm node does
-    # not export to ONNX opset 18.
-    speed = (velocity**2).sum(dim=-1).sqrt()
-    origin = now[:, contract.AGENT_POSITION]
-    return TargetFrames(origin, heading.cos(), heading.sin(), speed)
+    pose = targets.frame_pose
+    return TargetFrames(pose[:, :2], pose[:, 2], pose[:, 3], targets.speed)
 
 
 def rotate_into(vectors: Tensor, frames: TargetFrames) -> Tensor:

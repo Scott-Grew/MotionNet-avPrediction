@@ -307,6 +307,17 @@ def agent_reachable_distance(history: Tensor) -> Tensor:
     return speed * horizon + 0.5 * acceleration * horizon**2
 
 
+def anchor_lines(anchors: Tensor) -> Tensor:
+    """Each anchor endpoint (..., 2) as a constant-speed straight line from
+    the agent, (..., 80, 2): future step k sits at k / 80 of the endpoint.
+    The decoder adds its offsets to these lines and the loss assigns each
+    logged future to the nearest one, so both must use this one rule.
+    """
+    steps = torch.arange(1, contract.FUTURE_STEPS + 1, device=anchors.device)
+    ramp = steps.to(anchors.dtype) / contract.FUTURE_STEPS
+    return anchors[..., None, :] * ramp[:, None]
+
+
 class ModeDecoder(nn.Module):
     """Decodes the 54 anchor-conditioned trajectory modes and their confidences
     from the memory built by SceneEncoder. Each query is a learned vector plus
@@ -349,14 +360,6 @@ class ModeDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(FEEDFORWARD_DIM, 1, bias=False),
         )
-        step_numbers = torch.arange(
-            1, contract.FUTURE_STEPS + 1, dtype=torch.float32
-        )
-        self.register_buffer(
-            "anchor_ramp",
-            step_numbers / contract.FUTURE_STEPS,
-            persistent=False,
-        )
 
     def forward(self, memory: Memory, type_index: Tensor) -> ModePredictions:
         """Trajectories and log sigmas (batch, modes, steps, 2) in metres,
@@ -381,10 +384,8 @@ class ModeDecoder(nn.Module):
         step_displacements, log_sigma = head_output.unbind(dim=2)
         # A mode is its anchor's straight constant-speed line plus the running
         # sum of the predicted per-step offsets.
-        anchor_lines = (
-            anchors[:, :, None, :] * self.anchor_ramp[None, None, :, None]
-        )
-        trajectories = step_displacements.cumsum(dim=-2) + anchor_lines
+        lines = anchor_lines(anchors)
+        trajectories = step_displacements.cumsum(dim=-2) + lines
         log_sigma = log_sigma.clamp(
             MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
         )

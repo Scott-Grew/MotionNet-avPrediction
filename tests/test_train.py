@@ -61,6 +61,8 @@ def synthetic_batch():
         targets=TargetArrays(
             scene_index=torch.arange(2),
             track_index=torch.zeros(2, dtype=torch.long),
+            frame_pose=torch.tensor([0.0, 0.0, 1.0, 0.0]).repeat(2, 1),
+            speed=torch.zeros(2),
             agent_history=torch.randn(2, history, contract.AGENT_FEATURE_DIM),
             agent_history_mask=torch.ones(2, history, dtype=torch.bool),
             agent_signal_history=torch.zeros(2, history, signals),
@@ -254,7 +256,9 @@ def test_kernel_command_line_parses(tmp_path):
     ] + completed_arguments
 
     patched_argv = unittest.mock.patch("sys.argv", argv)
-    patched_planning = unittest.mock.patch.object(train, "steps_per_epoch")
+    patched_planning = unittest.mock.patch.object(
+        train.pipeline, "steps_per_epoch"
+    )
     with patched_argv, patched_planning as blocked:
         blocked.side_effect = AssertionError(
             "parsing must fail before any work starts"

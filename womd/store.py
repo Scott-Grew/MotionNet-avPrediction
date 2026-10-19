@@ -95,7 +95,7 @@ def type_one_hot(track: Track) -> np.ndarray:
 
 def track_rows(track: Track, frame: Frame, is_sdc: bool) -> np.ndarray:
     """One agent row per step for a track, in the scene frame; the row layout
-    is drawn at the end of womd/loader.py.
+    is drawn in womd/contract.py.
     """
     states = track.states
     positions = np.array([[state.center_x, state.center_y] for state in states])
@@ -282,7 +282,7 @@ class MapStager:
 
     def rows(self, feature: MapFeature) -> np.ndarray | None:
         """One map row per dot of the feature, with the columns of its kind
-        filled; the row layout is drawn at the end of womd/loader.py.
+        filled; the row layout is drawn in womd/contract.py.
         """
         scene_feature = feature_in_scene(feature, self.frame)
         if scene_feature is None or len(scene_feature.points) == 0:

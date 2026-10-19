@@ -52,8 +52,11 @@ def eligible_tracks(scenario: StagedScenario, designated_only: bool) -> ndarray:
     type, optionally restricted to designated targets.
     """
     now_rows = scenario.track_rows[:, contract.CURRENT_STEP_INDEX]
-    type_columns = now_rows[:, contract.AGENT_TYPE]
-    is_predicted_type = type_columns[:, : contract.NUM_OBJECT_TYPES].sum(1) > 0
+    # The predicted types are the first NUM_OBJECT_TYPES columns of the type
+    # one-hot; the column after them is TYPE_OTHER.
+    type_one_hot = now_rows[:, contract.AGENT_TYPE]
+    predicted_columns = type_one_hot[:, : contract.NUM_OBJECT_TYPES]
+    is_predicted_type = predicted_columns.any(axis=1)
     now_valid = scenario.track_valid[:, contract.CURRENT_STEP_INDEX]
     is_eligible = now_valid & is_predicted_type
     if designated_only:
@@ -82,17 +85,9 @@ def rows_to_frame(rows: ndarray, frame: Frame) -> ndarray:
     moved[..., contract.AGENT_VELOCITY] = frame_ops.directions_to_frame(
         rows[..., contract.AGENT_VELOCITY], frame.heading
     )
-    heading_cosine = rows[..., contract.AGENT_HEADING_COSINE]
-    heading_sine = rows[..., contract.AGENT_HEADING_SINE]
-    rotation_cosine = np.cos(frame.heading)
-    rotation_sine = np.sin(frame.heading)
-    # A heading h relative to the frame heading r is cos(h - r) = cos h cos r
-    # + sin h sin r and sin(h - r) = sin h cos r - cos h sin r.
-    moved[..., contract.AGENT_HEADING_COSINE] = (
-        heading_cosine * rotation_cosine + heading_sine * rotation_sine
-    )
-    moved[..., contract.AGENT_HEADING_SINE] = (
-        heading_sine * rotation_cosine - heading_cosine * rotation_sine
+    # A heading's (cos, sin) is a unit direction, so it rotates like one.
+    moved[..., HEADING] = frame_ops.directions_to_frame(
+        rows[..., HEADING], frame.heading
     )
     return moved
 
@@ -210,6 +205,7 @@ class TargetSample(NamedTuple):
     future_mask: ndarray  # (80,)
     track_index: int  # the agent's row among its scene's agents
     frame: Frame  # the agent's frame in the scene frame
+    speed: float  # metres per second at the current step
     track_id: int
 
 
@@ -245,6 +241,8 @@ class SceneView:
         rows = scenario.track_rows[track_index]
         frame = agent_frame(rows)
         agent_track = rows_to_frame(rows, frame)
+        now = rows[contract.CURRENT_STEP_INDEX]
+        speed = float(np.linalg.norm(now[contract.AGENT_VELOCITY]))
         return TargetSample(
             agent_history=agent_track[HISTORY],
             agent_history_mask=scenario.track_valid[track_index, HISTORY],
@@ -253,6 +251,7 @@ class SceneView:
             future_mask=scenario.track_valid[track_index, FUTURE],
             track_index=track_index,
             frame=frame,
+            speed=speed,
             track_id=int(scenario.track_ids[track_index]),
         )
 
@@ -280,6 +279,36 @@ def scene_sample(scenario: StagedScenario, indices: list[int]) -> SceneSample:
     indices.
     """
     return SceneView(scenario).sample(indices)
+
+
+def frame_pose(frame: Frame) -> ndarray:
+    """A frame as (x, y, cos, sin) of its origin and heading."""
+    heading = np.float32(frame.heading)
+    direction = [np.cos(heading), np.sin(heading)]
+    return np.concatenate([frame.origin, direction]).astype(np.float32)
+
+
+class DesignatedScene(NamedTuple):
+    """A staged scenario and the sample holding its designated targets."""
+
+    scenario: StagedScenario
+    sample: SceneSample
+
+
+def designated_scene(path: Path) -> DesignatedScene:
+    """One staged scenario with the targets Waymo designated for scoring;
+    raises if any of them cannot be predicted.
+    """
+    scenario = read_scenario(path)
+    designated_count = int(scenario.is_designated_target.sum())
+    track_indices = eligible_tracks(scenario, designated_only=True)
+    if len(track_indices) != designated_count:
+        raise ValueError(
+            f"{path} designates {designated_count} targets,"
+            f" {len(track_indices)} can be predicted"
+        )
+    sample = scene_sample(scenario, track_indices.tolist())
+    return DesignatedScene(scenario, sample)
 
 
 def pad_and_stack(arrays: Arrays, length: int, dtype: type) -> ndarray:
@@ -319,6 +348,8 @@ class TargetArrays(NamedTuple):
 
     scene_index: ndarray  # (B,) the target's scene in the batch
     track_index: ndarray  # (B,) the target's row among its scene's agents
+    frame_pose: ndarray  # (B, 4) x, y, cos, sin of its frame, scene frame
+    speed: ndarray  # (B,) metres per second
     agent_history: ndarray  # (B, 11, 13)
     agent_history_mask: ndarray  # (B, 11)
     agent_signal_history: ndarray  # (B, 11, 9)
@@ -352,22 +383,45 @@ class SceneBatch(NamedTuple):
         )
 
 
-class BatchBuilder:
-    """Joins scene samples into one batch. Each scene's agents, map dots and
-    map chunks are zero-padded to the largest scene's, and every scene's
-    targets are flattened into one target axis that points back at its scene.
+class BatchSizes(NamedTuple):
+    """How far a batch pads each axis: agents and map dots and chunks per
+    scene, and predicted targets in all.
     """
 
-    def __init__(self, samples: list[SceneSample]) -> None:
+    agents: int
+    dots: int
+    chunks: int
+    targets: int
+
+
+def largest_sizes(samples: list[SceneSample]) -> BatchSizes:
+    return BatchSizes(
+        agents=max(len(sample.scene_agent_history) for sample in samples),
+        dots=max(len(sample.map_rows) for sample in samples),
+        chunks=max(len(sample.map_chunk_pose) for sample in samples),
+        targets=sum(len(sample.targets) for sample in samples),
+    )
+
+
+class BatchBuilder:
+    """Joins scene samples into one batch. Each scene's agents, map dots and
+    map chunks are zero-padded to sizes, by default the largest scene's, and
+    every scene's targets are flattened into one target axis that points back
+    at its scene. Extra target slots repeat the last target, so fixed-size
+    batches give the real targets the same predictions.
+    """
+
+    def __init__(self, samples: list[SceneSample], sizes: BatchSizes) -> None:
         self.samples = samples
+        self.sizes = sizes
         self.targets = []
         self.scene_of_target = []
         for index, sample in enumerate(samples):
             self.targets.extend(sample.targets)
             self.scene_of_target.extend([index] * len(sample.targets))
-        self.agents = max(len(sample.scene_agent_history) for sample in samples)
-        self.dots = max(len(sample.map_rows) for sample in samples)
-        self.chunks = max(len(sample.map_chunk_pose) for sample in samples)
+        extra = sizes.targets - len(self.targets)
+        self.targets.extend([self.targets[-1]] * extra)
+        self.scene_of_target.extend([self.scene_of_target[-1]] * extra)
 
     def scene_arrays(self) -> SceneArrays:
         samples = self.samples
@@ -375,10 +429,12 @@ class BatchBuilder:
         masks = [sample.scene_agent_history_mask for sample in samples]
         signals = [sample.scene_agent_signal_history for sample in samples]
         return SceneArrays(
-            agent_history=pad_and_stack(histories, self.agents, np.float32),
-            agent_history_mask=pad_and_stack(masks, self.agents, bool),
+            agent_history=pad_and_stack(
+                histories, self.sizes.agents, np.float32
+            ),
+            agent_history_mask=pad_and_stack(masks, self.sizes.agents, bool),
             agent_signal_history=pad_and_stack(
-                signals, self.agents, np.float32
+                signals, self.sizes.agents, np.float32
             ),
         )
 
@@ -390,18 +446,20 @@ class BatchBuilder:
         poses = [sample.map_chunk_pose for sample in samples]
         signals = [sample.map_chunk_signal_history for sample in samples]
         return MapArrays(
-            rows=pad_and_stack(rows, self.dots, np.float32),
-            dot_present=pad_and_stack(present, self.dots, bool),
-            dot_chunk=pad_and_stack(dot_chunks, self.dots, np.int64),
-            chunk_pose=pad_and_stack(poses, self.chunks, np.float32),
+            rows=pad_and_stack(rows, self.sizes.dots, np.float32),
+            dot_present=pad_and_stack(present, self.sizes.dots, bool),
+            dot_chunk=pad_and_stack(dot_chunks, self.sizes.dots, np.int64),
+            chunk_pose=pad_and_stack(poses, self.sizes.chunks, np.float32),
             chunk_signal_history=pad_and_stack(
-                signals, self.chunks, np.float32
+                signals, self.sizes.chunks, np.float32
             ),
         )
 
     def target_arrays(self) -> TargetArrays:
         targets = self.targets
         track_indices = [target.track_index for target in targets]
+        frame_poses = [frame_pose(target.frame) for target in targets]
+        speeds = [target.speed for target in targets]
         histories = [target.agent_history for target in targets]
         masks = [target.agent_history_mask for target in targets]
         signals = [target.agent_signal_history for target in targets]
@@ -410,6 +468,8 @@ class BatchBuilder:
         return TargetArrays(
             scene_index=np.array(self.scene_of_target, dtype=np.int64),
             track_index=np.array(track_indices, dtype=np.int64),
+            frame_pose=np.stack(frame_poses),
+            speed=np.array(speeds, dtype=np.float32),
             agent_history=np.stack(histories),
             agent_history_mask=np.stack(masks),
             agent_signal_history=np.stack(signals),
@@ -425,26 +485,5 @@ class BatchBuilder:
 
 def scene_batch(samples: list[SceneSample]) -> SceneBatch:
     """One batch from scene samples, padded as BatchBuilder describes."""
-    return BatchBuilder(samples).build()
-
-
-# ------------------------------------------------------------------
-# THE TWO ROW LAYOUTS a SceneBatch is built from.
-#
-# One agent row, per 0.1 s step.
-#
-#     0   1   2   3   4   5   6   7   8   9  10  11  12
-#   +-------+---+---+-------+-------+---------------+---+
-#   | x   y |cos|sin|vx  vy |len wid|veh ped cyc oth|sdc|
-#   +-------+---+---+-------+-------+---------------+---+
-#
-# One map row, per metre of a map feature.
-#
-#     0-1   2-3    4-10    11-14   15    16-27   28-29  30  31
-#   +-----+-----+--------+-------+-----+--------+------+---+---+
-#   | x y |dx dy| kind   | lane  |speed|boundary| stop | L | R |
-#   |     |     | 1-hot  | type  |limit| type   | x  y |   |   |
-#   +-----+-----+--------+-------+-----+--------+------+---+---+
-#
-#   L and R are the marking on the lane's left and right, 0 for none.
-# ------------------------------------------------------------------
+    sizes = largest_sizes(samples)
+    return BatchBuilder(samples, sizes).build()

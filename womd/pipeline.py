@@ -4,6 +4,7 @@ DataLoader.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -51,28 +52,52 @@ class SceneBatchStream(IterableDataset):
         worker = get_worker_info()
         worker_index = worker.id if worker else 0
         worker_count = worker.num_workers if worker else 1
-        worker_paths = self.paths[worker_index::worker_count]
+        worker_paths = worker_share(self.paths, worker_index, worker_count)
         generator = np.random.default_rng(self.settings.seed + worker_index)
+        batch_size = self.settings.batch_size
         samples = []
-        free_slots = self.settings.batch_size
+        free_slots = batch_size
         for scenario_index in generator.permutation(len(worker_paths)):
             scenario = loader.read_scenario(worker_paths[scenario_index])
-            eligible = loader.eligible_tracks(
-                scenario, self.settings.designated_only
-            )
+            view = loader.SceneView(scenario)
+            designated_only = self.settings.designated_only
+            eligible = loader.eligible_tracks(scenario, designated_only)
             waiting = generator.permutation(eligible).tolist()
             while waiting:
                 taken = waiting[:free_slots]
                 waiting = waiting[free_slots:]
-                samples.append(loader.scene_sample(scenario, taken))
+                samples.append(view.sample(taken))
                 free_slots -= len(taken)
-                if free_slots:
-                    continue
-                yield loader.scene_batch(samples)
-                samples = []
-                free_slots = self.settings.batch_size
+                if free_slots == 0:
+                    yield loader.scene_batch(samples)
+                    samples = []
+                    free_slots = batch_size
         if samples:
             yield loader.scene_batch(samples)
+
+
+def worker_share(paths: list[Path], index: int, count: int) -> list[Path]:
+    """The scenarios DataLoader worker index of count reads."""
+    return paths[index::count]
+
+
+def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
+    """Batches per epoch, the sum over workers of ceil(eligible targets /
+    batch size), because each worker fills its own batches. Counting opens
+    every staged file.
+    """
+    worker_count = max(settings.worker_count, 1)
+    step_count = 0
+    for index in range(worker_count):
+        targets = 0
+        for path in worker_share(paths, index, worker_count):
+            scenario = loader.read_scenario(path)
+            eligible = loader.eligible_tracks(
+                scenario, settings.designated_only
+            )
+            targets += len(eligible)
+        step_count += math.ceil(targets / settings.batch_size)
+    return step_count
 
 
 def batches(paths: list[Path], settings: BatchSettings) -> DataLoader:

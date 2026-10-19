@@ -12,6 +12,10 @@ from torch import Tensor
 
 from womd import contract, model
 
+# Trajectories (B, modes, 80, 2) and confidence logits (B, modes), the
+# model's output shape.
+Modes = tuple[Tensor, Tensor]
+
 
 class CurrentState(NamedTuple):
     """Each agent at the current step, read from its history rows."""
@@ -39,7 +43,7 @@ def current_state(history: Tensor) -> CurrentState:
     )
 
 
-def as_single_mode(trajectories: Tensor) -> tuple[Tensor, Tensor]:
+def as_single_mode(trajectories: Tensor) -> Modes:
     """Wraps one trajectory per sample as a single-mode prediction with a
     constant confidence logit, matching the model's output shape.
     """
@@ -52,7 +56,7 @@ def as_single_mode(trajectories: Tensor) -> tuple[Tensor, Tensor]:
     return trajectories.unsqueeze(1), logits
 
 
-def constant_velocity(history: Tensor) -> tuple[Tensor, Tensor]:
+def constant_velocity(history: Tensor) -> Modes:
     """Extrapolates the current position at the current velocity, unchanged
     over the horizon.
     """
@@ -94,7 +98,7 @@ def observed_yaw_rate(history: Tensor, mask: Tensor) -> Tensor:
     return torch.atan2(change_sine, change_cosine) / observed_seconds
 
 
-def constant_turn_rate(history: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+def constant_turn_rate(history: Tensor, mask: Tensor) -> Modes:
     """Extrapolates position along a constant-turn-rate, constant-speed arc
     from the observed yaw rate and forward speed.
     """
@@ -117,7 +121,7 @@ def constant_turn_rate(history: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
     return as_single_mode(now.position[:, None, :] + displacement)
 
 
-def anchor_lines(history: Tensor, anchors: Tensor) -> tuple[Tensor, Tensor]:
+def straight_to_anchors(history: Tensor, anchors: Tensor) -> Modes:
     """Straight lines to each type's first NUM_PREDICTED_MODES anchor
     endpoints, with uniform confidence.
     """
@@ -125,11 +129,7 @@ def anchor_lines(history: Tensor, anchors: Tensor) -> tuple[Tensor, Tensor]:
     endpoints = anchors[type_index][:, : contract.NUM_PREDICTED_MODES].to(
         history.dtype
     )
-    elapsed = future_elapsed_seconds(endpoints)
-    horizon_fraction = elapsed / contract.FUTURE_HORIZON_SECONDS
-    trajectories = (
-        endpoints[:, :, None, :] * horizon_fraction[None, None, :, None]
-    )
+    trajectories = model.anchor_lines(endpoints)
     logits = torch.zeros(
         trajectories.shape[:2],
         device=trajectories.device,

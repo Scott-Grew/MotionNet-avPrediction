@@ -24,7 +24,14 @@ from torch import Tensor, nn
 
 from womd import loader, pipeline
 from womd.checkpoint import load_predictor
-from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
+from womd.loader import (
+    BatchSizes,
+    MapArrays,
+    SceneArrays,
+    SceneBatch,
+    SceneSample,
+    TargetArrays,
+)
 from womd.pruning import submitted_modes
 
 # The graph's inputs are the batch arrays the model reads, scene group
@@ -37,31 +44,12 @@ INPUT_FIELDS = (
 )
 INPUT_NAMES = [f"{group}_{name}" for group, name in INPUT_FIELDS]
 OUTPUT_NAMES = ["trajectories", "confidences"]
-# Which padded count each map array's second axis follows.
-MAP_AXIS_COUNTS = {
-    "rows": "dots",
-    "dot_present": "dots",
-    "dot_chunk": "dots",
-    "chunk_pose": "chunks",
-    "chunk_signal_history": "chunks",
-}
-# Opset 18 is the first that expresses the max-pooling scatter of map
-# chunks; torch 2.2 warns it is unsupported but exports it.
 OPSET_VERSION = 18
 WARMUP_RUNS = 2
 
 Session = onnxruntime.InferenceSession
 Outputs = tuple[Tensor, Tensor]
 RunOnce = Callable[[SceneBatch], object]
-
-
-class FixedShape(NamedTuple):
-    """The counts a bucket's scenes are padded to, those of its largest."""
-
-    agents: int
-    dots: int
-    chunks: int
-    targets: int
 
 
 class Runtime(NamedTuple):
@@ -93,12 +81,16 @@ def graph_inputs(batch: SceneBatch) -> tuple[Tensor, ...]:
 
 def batch_from_graph_inputs(tensors: tuple[Tensor, ...]) -> SceneBatch:
     """The SceneBatch behind positional tensors in INPUT_FIELDS order."""
-    scene_end = len(SceneArrays._fields)
-    map_end = scene_end + len(MapArrays._fields)
-    scene = SceneArrays(*tensors[:scene_end])
-    scene_map = MapArrays(*tensors[scene_end:map_end])
-    targets = TargetArrays(*tensors[map_end:])
-    return SceneBatch(scene, scene_map, targets)
+    groups: dict[str, dict[str, Tensor]] = {
+        "scene": {},
+        "map": {},
+        "targets": {},
+    }
+    for (group, name), tensor in zip(INPUT_FIELDS, tensors, strict=True):
+        groups[group][name] = tensor
+    scene = SceneArrays(**groups["scene"])
+    scene_map = MapArrays(**groups["map"])
+    return SceneBatch(scene, scene_map, TargetArrays(**groups["targets"]))
 
 
 class InferenceGraph(nn.Module):
@@ -118,49 +110,20 @@ class InferenceGraph(nn.Module):
         return submitted.trajectories, submitted.confidences
 
 
-def pad_axis(tensor: Tensor, length: int) -> Tensor:
-    """Pads a tensor's second axis with zeros up to length. A zero mask or
-    presence flag marks the added agents, dots and chunks as absent.
-    """
-    padding_shape = list(tensor.shape)
-    padding_shape[1] = length - tensor.shape[1]
-    padding = tensor.new_zeros(padding_shape)
-    return torch.cat([tensor, padding], dim=1)
-
-
-def repeat_last_row(tensor: Tensor, length: int) -> Tensor:
-    """Pads the target axis up to length by repeating the last target; each
-    target is predicted on its own, so the real ones do not change.
-    """
-    repeats = tensor[-1:].expand(length - len(tensor), *tensor.shape[1:])
-    return torch.cat([tensor, repeats])
-
-
-def bucket_shape(batches: list[SceneBatch]) -> FixedShape:
+def bucket_sizes(samples: list[SceneSample]) -> BatchSizes:
     """The largest agent, dot, chunk and target counts across a bucket."""
-    return FixedShape(
-        agents=max(batch.scene.agent_history.shape[1] for batch in batches),
-        dots=max(batch.map.rows.shape[1] for batch in batches),
-        chunks=max(batch.map.chunk_pose.shape[1] for batch in batches),
-        targets=max(len(batch.targets.agent_history) for batch in batches),
-    )
+    sizes = [loader.largest_sizes([sample]) for sample in samples]
+    return BatchSizes(*(max(column) for column in zip(*sizes, strict=True)))
 
 
-def padded(batch: SceneBatch, shape: FixedShape) -> SceneBatch:
-    """One scene batch padded to a bucket's fixed shape."""
-    scene = [pad_axis(array, shape.agents) for array in batch.scene]
-    scene_map = []
-    for name, array in zip(MapArrays._fields, batch.map, strict=True):
-        length = getattr(shape, MAP_AXIS_COUNTS[name])
-        scene_map.append(pad_axis(array, length))
-    targets = []
-    for array in batch.targets:
-        if array is not None:
-            array = repeat_last_row(array, shape.targets)
-        targets.append(array)
-    scene_arrays = SceneArrays(*scene)
-    map_arrays = MapArrays(*scene_map)
-    return SceneBatch(scene_arrays, map_arrays, TargetArrays(*targets))
+def padded_batch(sample: SceneSample, sizes: BatchSizes) -> SceneBatch:
+    """One scene's batch padded to a bucket's sizes."""
+    batch = loader.BatchBuilder([sample], sizes).build()
+    return pipeline.torch_batch(batch)
+
+
+def scene_batch(sample: SceneSample) -> SceneBatch:
+    return pipeline.torch_batch(loader.scene_batch([sample]))
 
 
 def onnx_run(session: Session, batch: SceneBatch) -> list[np.ndarray]:
@@ -190,30 +153,30 @@ class Exporter:
     """
 
     def __init__(self, graph: InferenceGraph, runtime: Runtime) -> None:
-        self.graph = graph
+        self.graph = graph.to(runtime.device)
         self.runtime = runtime
-        self.device_graph = InferenceGraph(graph.predictor).to(runtime.device)
+
+    def device_inputs(self, batch: SceneBatch) -> list[Tensor]:
+        device = self.runtime.device
+        return [tensor.to(device) for tensor in graph_inputs(batch)]
 
     def torch_run(self, batch: SceneBatch) -> Outputs:
-        device = self.runtime.device
-        inputs = [tensor.to(device) for tensor in graph_inputs(batch)]
         with torch.no_grad():
-            trajectories, confidences = self.device_graph(*inputs)
+            trajectories, confidences = self.graph(*self.device_inputs(batch))
         return trajectories.cpu(), confidences.cpu()
 
-    def padding_gap(self, batch: SceneBatch, fixed: SceneBatch) -> float:
+    def padding_gap(self, sample: SceneSample, fixed: SceneBatch) -> float:
         """How far padding moves the real targets' futures, in metres."""
-        target_count = len(batch.targets.agent_history)
-        unpadded, _ = self.torch_run(batch)
+        unpadded, _ = self.torch_run(scene_batch(sample))
         padded_output, _ = self.torch_run(fixed)
-        gap = unpadded - padded_output[:target_count]
+        gap = unpadded - padded_output[: len(sample.targets)]
         return float(gap.abs().max())
 
     def export(self, batch: SceneBatch, onnx_path: Path) -> Session:
         """Exports the graph at the batch's shape and opens it."""
         torch.onnx.export(
             self.graph,
-            graph_inputs(batch),
+            tuple(self.device_inputs(batch)),
             str(onnx_path),
             input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
@@ -234,24 +197,24 @@ class Exporter:
         gap = torch_trajectories.numpy() - onnx_trajectories
         return float(np.abs(gap).max())
 
-    def measure(self, batches: list[SceneBatch], path: Path) -> BucketReport:
-        """Pads a bucket's scenes to its largest shape, exports at that shape,
+    def measure(self, samples: list[SceneSample], path: Path) -> BucketReport:
+        """Pads a bucket's scenes to its largest sizes, exports at that shape,
         measures padding and export error, and times both.
         """
-        shape = bucket_shape(batches)
-        fixed = [padded(batch, shape) for batch in batches]
+        sizes = bucket_sizes(samples)
+        fixed = [padded_batch(sample, sizes) for sample in samples]
         padding_gaps = []
-        for batch, fixed_batch in zip(batches, fixed, strict=True):
-            padding_gaps.append(self.padding_gap(batch, fixed_batch))
+        for sample, fixed_batch in zip(samples, fixed, strict=True):
+            padding_gaps.append(self.padding_gap(sample, fixed_batch))
         session = self.export(fixed[0], path)
         export_gaps = [self.export_gap(session, batch) for batch in fixed]
         run_onnx = functools.partial(onnx_run, session)
         torch_milliseconds = scene_milliseconds(self.torch_run, fixed)
         onnx_milliseconds = scene_milliseconds(run_onnx, fixed)
         print(
-            f"{path.name}: {len(fixed)} scenes padded to {shape.targets}"
-            f" targets, {shape.agents} agents, {shape.chunks} map chunks,"
-            f" {shape.dots} map dots"
+            f"{path.name}: {len(fixed)} scenes padded to {sizes.targets}"
+            f" targets, {sizes.agents} agents, {sizes.chunks} map chunks,"
+            f" {sizes.dots} map dots"
         )
         return BucketReport(
             max(padding_gaps),
@@ -261,19 +224,16 @@ class Exporter:
         )
 
 
-def scene_batches(paths: list[Path]) -> Iterator[SceneBatch]:
-    """One scene batch per scenario with designated targets."""
+def designated_samples(paths: list[Path]) -> Iterator[SceneSample]:
+    """Each scenario's designated targets, skipping scenarios without any."""
     for path in paths:
-        scenario = loader.read_scenario(path)
-        track_indices = loader.eligible_tracks(scenario, designated_only=True)
-        if len(track_indices) == 0:
-            continue
-        sample = loader.scene_sample(scenario, track_indices.tolist())
-        yield pipeline.torch_batch(loader.scene_batch([sample]))
+        sample = loader.designated_scene(path).sample
+        if sample.targets:
+            yield sample
 
 
-def scene_size(batch: SceneBatch) -> int:
-    return batch.map.rows.shape[1] + batch.scene.agent_history.shape[1]
+def scene_size(sample: SceneSample) -> int:
+    return len(sample.map_rows) + len(sample.scene_agent_history)
 
 
 def bucket_path(onnx_path: Path, bucket_index: int) -> Path:
@@ -316,17 +276,17 @@ def main() -> None:
     runtime = Runtime(torch.device(arguments.device), arguments.threads)
     graph = InferenceGraph(load_predictor(arguments.checkpoint))
     paths = sorted(arguments.staged_directory.glob("*.npz"))
-    unsorted = scene_batches(paths[: arguments.scenarios])
-    batches = sorted(unsorted, key=scene_size)
-    if len(batches) < arguments.buckets:
+    unsorted = designated_samples(paths[: arguments.scenarios])
+    samples = sorted(unsorted, key=scene_size)
+    if len(samples) < arguments.buckets:
         raise ValueError(
-            f"{len(batches)} scenes cannot fill {arguments.buckets} buckets"
+            f"{len(samples)} scenes cannot fill {arguments.buckets} buckets"
         )
     exporter = Exporter(graph, runtime)
     reports = []
-    buckets = np.array_split(np.arange(len(batches)), arguments.buckets)
+    buckets = np.array_split(np.arange(len(samples)), arguments.buckets)
     for bucket_index, positions in enumerate(buckets):
-        bucket = [batches[position] for position in positions]
+        bucket = [samples[position] for position in positions]
         onnx_path = bucket_path(arguments.onnx_path, bucket_index)
         reports.append(exporter.measure(bucket, onnx_path))
     print_summary(reports, runtime)

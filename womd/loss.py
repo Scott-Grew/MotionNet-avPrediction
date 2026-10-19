@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from womd.loader import TargetArrays
-from womd.model import ModePredictions
+from womd.model import ModePredictions, anchor_lines
 
 # The constant term of a Gaussian's negative log likelihood, per
 # dimension.
@@ -40,12 +40,7 @@ def anchor_assigned_mode(anchors: Tensor, targets: TargetArrays) -> Tensor:
     closest on average to the logged future.
     """
     future = targets.future_positions
-    step_count = future.shape[1]
-    step_numbers = torch.arange(1, step_count + 1, device=future.device)
-    ramp = step_numbers.to(future.dtype) / step_count
-    # Each anchor endpoint is scaled down into a straight-line path over the
-    # future steps, so it can be compared with the real trajectory.
-    anchor_paths = anchors.unsqueeze(2) * ramp[None, None, :, None]
+    anchor_paths = anchor_lines(anchors.to(future.dtype))
     step_distances = (anchor_paths - future.unsqueeze(1)).norm(dim=-1)
     mean_distance = mean_over_valid_steps(step_distances, targets.future_mask)
     return mean_distance.argmin(dim=1)

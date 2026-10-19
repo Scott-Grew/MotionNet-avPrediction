@@ -154,6 +154,27 @@ POLYLINE_SIGNAL_DIM = HISTORY_STEPS * NUM_TRAFFIC_SIGNAL_STATES
 # The two sides a lane boundary can be on.
 LANE_SIDES = ("left", "right")
 
+# ------------------------------------------------------------------
+# THE TWO ROW LAYOUTS the slices above describe.
+#
+# One agent row, per 0.1 s step.
+#
+#     0   1   2   3   4   5   6   7   8   9  10  11  12
+#   +-------+---+---+-------+-------+---------------+---+
+#   | x   y |cos|sin|vx  vy |len wid|veh ped cyc oth|sdc|
+#   +-------+---+---+-------+-------+---------------+---+
+#
+# One map row, per metre of a map feature.
+#
+#     0-1   2-3    4-10    11-14   15    16-27   28-29  30  31
+#   +-----+-----+--------+-------+-----+--------+------+---+---+
+#   | x y |dx dy| kind   | lane  |speed|boundary| stop | L | R |
+#   |     |     | 1-hot  | type  |limit| type   | x  y |   |   |
+#   +-----+-----+--------+-------+-----+--------+------+---+---+
+#
+#   L and R are the marking on the lane's left and right, 0 for none.
+# ------------------------------------------------------------------
+
 
 def artifact_provenance(producer: str, source: Path | str) -> str:
     """The JSON stamp saved into each artifact, naming the code version, the
