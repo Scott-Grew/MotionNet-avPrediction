@@ -3,11 +3,14 @@
 Reads raw Waymo shards and writes one .npz per scenario, in the scene frame, for
 the later steps to read.
 """
+
 from __future__ import annotations
 
-import womd.runtime_env
+import womd.runtime_env  # noqa: F401
+
 import argparse
 from pathlib import Path
+from typing import NamedTuple
 
 import tensorflow
 
@@ -19,50 +22,61 @@ from womd_protos import scenario_pb2
 IRREGULAR_SPACING_SECONDS = 0.005
 
 
-def stage_shard(
-        shard_path: Path | str, output_directory: Path | str,
-        skip_existing: bool) -> tuple[list[Path], list[float], list[Path]]:
-    """Stages each scenario in one shard to its own .npz file, skipping ones
-    already staged when skip_existing is set.
+class StageReport(NamedTuple):
+    """What staging wrote, what it skipped, and each written scenario's worst
+    timestamp spacing deviation in seconds.
     """
-    written_paths = []
-    spacing_deviations = []
-    skipped_paths = []
-    for record_bytes in tensorflow.data.TFRecordDataset(
-            str(shard_path)).as_numpy_iterator():
-        scenario = scenario_pb2.Scenario.FromString(record_bytes)
-        output_path = Path(output_directory) / f"{scenario.scenario_id}.npz"
-        if output_path.exists():
-            assert skip_existing, f"output file already exists: {output_path}"
-            skipped_paths.append(output_path)
-            continue
-        spacing_deviations.append(store.write_scenario(scenario, output_path))
-        written_paths.append(output_path)
-    return written_paths, spacing_deviations, skipped_paths
+
+    written: list[Path]
+    skipped: list[Path]
+    spacing_deviations: list[float]
+
+    def extend(self, other: StageReport) -> None:
+        self.written.extend(other.written)
+        self.skipped.extend(other.skipped)
+        self.spacing_deviations.extend(other.spacing_deviations)
 
 
-def stage_shards(shard_paths: list[Path],
-                 output_directory: Path | str,
-                 skip_existing: bool = False) -> tuple[list[Path], list[float]]:
-    """Runs stage_shard over the shards, asserts no two shards wrote the same
-    output path, and reports how many scenarios skipped.
+class Stager:
+    """Stages shards into one output directory, skipping scenarios already
+    staged there when skip_existing is set and refusing to overwrite them
+    otherwise.
     """
-    written_paths = []
-    spacing_deviations = []
-    skipped_paths = []
-    for shard_path in shard_paths:
-        shard_written_paths, shard_deviations, shard_skipped_paths = (
-            stage_shard(shard_path, output_directory, skip_existing))
-        written_paths.extend(shard_written_paths)
-        spacing_deviations.extend(shard_deviations)
-        skipped_paths.extend(shard_skipped_paths)
-    distinct_paths = set(written_paths)
-    assert len(distinct_paths) == len(
-        written_paths
-    ), f"{len(written_paths) - len(distinct_paths)} colliding output paths"
-    if skip_existing:
-        print(f"{len(skipped_paths)} scenarios already staged, skipped")
-    return written_paths, spacing_deviations
+
+    def __init__(self, output_directory: Path, skip_existing: bool) -> None:
+        self.output_directory = output_directory
+        self.skip_existing = skip_existing
+
+    def shard(self, shard_path: Path) -> StageReport:
+        """Stages each scenario in one shard to its own .npz file."""
+        report = StageReport([], [], [])
+        records = tensorflow.data.TFRecordDataset(
+            str(shard_path)
+        ).as_numpy_iterator()
+        for record_bytes in records:
+            scenario = scenario_pb2.Scenario.FromString(record_bytes)
+            output_path = self.output_directory / f"{scenario.scenario_id}.npz"
+            if output_path.exists():
+                if not self.skip_existing:
+                    raise FileExistsError(
+                        f"output file already exists: {output_path}"
+                    )
+                report.skipped.append(output_path)
+                continue
+            report.spacing_deviations.append(
+                store.write_scenario(scenario, output_path)
+            )
+            report.written.append(output_path)
+        return report
+
+    def shards(self, shard_paths: list[Path]) -> StageReport:
+        """Stages every shard; a scenario id seen twice is refused by shard()
+        since its file then already exists.
+        """
+        report = StageReport([], [], [])
+        for shard_path in shard_paths:
+            report.extend(self.shard(shard_path))
+        return report
 
 
 def main() -> None:
@@ -76,17 +90,25 @@ def main() -> None:
     arguments = parser.parse_args()
 
     arguments.output_directory.mkdir(parents=True, exist_ok=True)
-    written_paths, spacing_deviations = stage_shards(
-        arguments.shard_paths,
-        arguments.output_directory,
-        arguments.skip_existing,
+    stager = Stager(
+        arguments.output_directory, skip_existing=arguments.skip_existing
     )
-    irregular_count = sum(deviation >= IRREGULAR_SPACING_SECONDS
-                          for deviation in spacing_deviations)
-    print(f"{len(written_paths)} scenarios staged into"
-          f" {arguments.output_directory}")
-    print(f"{irregular_count} with irregular timestep spacing"
-          f" (worst deviation {max(spacing_deviations, default=0.0):.4f} s)")
+    report = stager.shards(arguments.shard_paths)
+    irregular = sum(
+        deviation >= IRREGULAR_SPACING_SECONDS
+        for deviation in report.spacing_deviations
+    )
+    worst = max(report.spacing_deviations, default=0.0)
+    if arguments.skip_existing:
+        print(f"{len(report.skipped)} scenarios already staged, skipped")
+    print(
+        f"{len(report.written)} scenarios staged into"
+        f" {arguments.output_directory}"
+    )
+    print(
+        f"{irregular} with irregular timestep spacing"
+        f" (worst deviation {worst:.4f} s)"
+    )
 
 
 if __name__ == "__main__":

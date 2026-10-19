@@ -1,4 +1,7 @@
 PYTHON ?= python3
+# The formatter and linter live in a tool venv, not the project's Python.
+TOOLS ?= $(HOME)/venvs/tracker/bin
+SOURCES := womd/*.py *.py container/*.py tests/*.py
 
 SHARDS ?= data/validation_raw/validation.tfrecord-00000-of-00150
 STAGED ?= data/staged
@@ -29,8 +32,8 @@ EXPORT_BUCKETS ?= 4
 EXPORT_THREADS ?= 4
 
 .DEFAULT_GOAL := help
-.PHONY: help install protos test stage anchors train predict baseline \
-	score check-protos export
+.PHONY: help install protos test check stage anchors train predict \
+	baseline score check-protos export
 
 help: ## list the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | \
@@ -58,6 +61,13 @@ test: womd_protos ## run the test suite, under 30 seconds
 
 womd_protos:
 	$(MAKE) protos
+
+check: ## black, ruff (settings in pyproject.toml), headers, 80 columns
+	$(TOOLS)/black --check --quiet $(SOURCES)
+	$(TOOLS)/ruff check $(SOURCES)
+	$(PYTHON) check_headers.py $(SOURCES)
+	@! awk 'length > 80 {print FILENAME": "FNR}' $(SOURCES) Makefile | \
+		grep . || (echo "lines over 80 columns" && false)
 
 stage: womd_protos ## turn raw WOMD shards into one .npz per scenario
 	$(PYTHON) stage.py $(STAGED) $(SHARDS) --skip-existing

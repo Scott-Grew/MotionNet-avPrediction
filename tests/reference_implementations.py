@@ -1,6 +1,7 @@
 """Plain reference versions of the anchors and the pruning rule, kept only for
 the tests to compare against.
 """
+
 import torch
 
 from womd import contract
@@ -19,13 +20,16 @@ def unit_anchor_offsets():
     # Direction repeats slowest, distance fastest, so the flat
     # index matches ANCHOR_DIRECTION_COUNT * ANCHOR_DISTANCE_COUNT.
     direction_indices = torch.arange(ANCHOR_DIRECTION_COUNT).repeat_interleave(
-        ANCHOR_DISTANCE_COUNT)
+        ANCHOR_DISTANCE_COUNT
+    )
     distance_indices = torch.arange(ANCHOR_DISTANCE_COUNT).repeat(
-        ANCHOR_DIRECTION_COUNT)
+        ANCHOR_DIRECTION_COUNT
+    )
     angles = 2 * torch.pi * direction_indices / ANCHOR_DIRECTION_COUNT
     fractions = (distance_indices + 1) / ANCHOR_DISTANCE_COUNT
     return fractions.unsqueeze(-1) * torch.stack(
-        [angles.cos(), angles.sin()], dim=-1)
+        [angles.cos(), angles.sin()], dim=-1
+    )
 
 
 def unit_anchor_offsets_per_type():
@@ -42,12 +46,17 @@ def prune_modes_single_sample(trajectories, confidence_logits):
     kept_indices = []
     dropped_indices = []
     endpoints = trajectories[:, -1]
-    for mode_index in torch.argsort(confidence_logits,
-                                    descending=True).tolist():
-        if kept_indices and bool((torch.cdist(
-                endpoints[mode_index][None],
-                endpoints[kept_indices],
-        ) < PRUNE_DISTANCE_METRES).any()):
+    for mode_index in torch.argsort(
+        confidence_logits, descending=True
+    ).tolist():
+        if kept_indices and bool(
+            (
+                torch.cdist(
+                    endpoints[mode_index][None], endpoints[kept_indices]
+                )
+                < PRUNE_DISTANCE_METRES
+            ).any()
+        ):
             dropped_indices.append(mode_index)
             continue
         kept_indices.append(mode_index)
@@ -55,7 +64,8 @@ def prune_modes_single_sample(trajectories, confidence_logits):
             break
     # If suppression kept too few modes, pad back up to
     # NUM_PREDICTED_MODES with the highest-confidence dropped ones.
-    kept_indices.extend(dropped_indices[:contract.NUM_PREDICTED_MODES -
-                                        len(kept_indices)])
+    kept_indices.extend(
+        dropped_indices[: contract.NUM_PREDICTED_MODES - len(kept_indices)]
+    )
     kept = torch.tensor(kept_indices, device=trajectories.device)
     return trajectories[kept], confidence_logits[kept]

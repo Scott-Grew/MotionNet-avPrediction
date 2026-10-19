@@ -1,9 +1,13 @@
 """Cuts the model's 54 futures to the 6 Waymo scores and moves the dropped
 futures' probability onto the kept ones.
 """
+
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
+from torch import Tensor
 
 from womd import contract
 
@@ -12,108 +16,121 @@ from womd import contract
 PRUNE_DISTANCE_METRES = 2.5
 
 
-def next_free_slot(is_flagged: torch.Tensor, filled_count: torch.Tensor,
-                   slot_positions: torch.Tensor) -> torch.Tensor:
-    """A one-hot mask over the output slots giving, for each flagged sample,
-    the next slot it has not filled yet.
+class PrunedModes(NamedTuple):
+    """The kept modes of each sample, most confident first, and how many of
+    the slots were kept rather than backfilled.
     """
-    is_next_slot = slot_positions[None, :] == filled_count[:, None]
-    return is_flagged[:, None] & is_next_slot
+
+    trajectories: Tensor  # (batch, 6, steps, 2)
+    confidence_logits: Tensor  # (batch, 6)
+    kept_count: Tensor  # (batch,)
 
 
-def prune_modes_batched_with_kept_count(
-    trajectories: torch.Tensor, confidence_logits: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+class PruneWalk:
+    """Per sample, the modes kept so far with their endpoints, and the modes
+    dropped so far, as the walk down each sample's confidence order fills
+    the output slots.
+    """
+
+    def __init__(self, endpoints: Tensor) -> None:
+        batch_size = endpoints.shape[0]
+        slot_count = contract.NUM_PREDICTED_MODES
+        device = endpoints.device
+        self.slot_positions = torch.arange(slot_count, device=device)
+        self.kept_indices = torch.zeros(
+            batch_size, slot_count, dtype=torch.long, device=device
+        )
+        self.kept_endpoints = torch.zeros_like(endpoints[:, :slot_count])
+        self.kept_slot_filled = torch.zeros_like(
+            self.kept_indices, dtype=torch.bool
+        )
+        self.kept_count = torch.zeros(
+            batch_size, dtype=torch.long, device=device
+        )
+        self.dropped_indices = torch.zeros_like(self.kept_indices)
+        self.dropped_count = torch.zeros_like(self.kept_count)
+
+    def finished(self) -> bool:
+        return bool((self.kept_count == len(self.slot_positions)).all())
+
+    def next_slot(self, flagged: Tensor, filled: Tensor) -> Tensor:
+        """A one-hot mask over the slots giving, for each flagged sample, the
+        next slot it has not filled yet.
+        """
+        is_next = self.slot_positions[None, :] == filled[:, None]
+        return flagged[:, None] & is_next
+
+    def consider(self, candidate: Tensor, endpoint: Tensor) -> None:
+        """Keeps each sample's candidate mode unless it ends within the prune
+        distance of a kept one, in which case it is dropped.
+        """
+        separations = torch.cdist(endpoint, self.kept_endpoints).squeeze(1)
+        near_a_kept_mode = separations < PRUNE_DISTANCE_METRES
+        too_close = (near_a_kept_mode & self.kept_slot_filled).any(dim=-1)
+        still_walking = self.kept_count < len(self.slot_positions)
+
+        keeps = still_walking & ~too_close
+        keep_slot = self.next_slot(keeps, self.kept_count)
+        self.kept_indices = torch.where(
+            keep_slot, candidate[:, None], self.kept_indices
+        )
+        self.kept_endpoints = torch.where(
+            keep_slot[:, :, None], endpoint, self.kept_endpoints
+        )
+        self.kept_slot_filled = self.kept_slot_filled | keep_slot
+        self.kept_count = self.kept_count + keeps.long()
+
+        drops = still_walking & too_close
+        drop_slot = self.next_slot(drops, self.dropped_count)
+        self.dropped_indices = torch.where(
+            drop_slot, candidate[:, None], self.dropped_indices
+        )
+        self.dropped_count = self.dropped_count + drops.long()
+
+    def final_indices(self) -> Tensor:
+        """The kept modes, then dropped modes most confident first for any
+        sample that kept fewer than the slot count.
+        """
+        slots = self.slot_positions[None, :]
+        backfill_positions = (slots - self.kept_count[:, None]).clamp(min=0)
+        is_kept_slot = slots < self.kept_count[:, None]
+        backfill = self.dropped_indices.gather(1, backfill_positions)
+        return torch.where(is_kept_slot, self.kept_indices, backfill)
+
+
+def prune_modes(trajectories: Tensor, logits: Tensor) -> PrunedModes:
     """Walks each sample's modes from most to least confident, keeps one unless
     it ends near a kept one, then backfills to 6.
     """
-    batch_size, mode_count = confidence_logits.shape
-    slot_count = contract.NUM_PREDICTED_MODES
-    device = trajectories.device
+    mode_count = logits.shape[1]
     endpoints = trajectories[:, :, -1]
-    confidence_order = torch.argsort(confidence_logits, dim=-1, descending=True)
-    slot_positions = torch.arange(slot_count, device=device)
-
-    # Per sample, the modes kept so far, where they end, and the modes
-    # dropped so far, each with a count of how many slots are filled.
-    kept_indices = torch.zeros(batch_size,
-                               slot_count,
-                               dtype=torch.long,
-                               device=device)
-    kept_endpoints = torch.zeros_like(endpoints[:, :slot_count])
-    kept_slot_filled = torch.zeros_like(kept_indices, dtype=torch.bool)
-    kept_count = torch.zeros(batch_size, dtype=torch.long, device=device)
-    dropped_indices = torch.zeros_like(kept_indices)
-    dropped_count = torch.zeros_like(kept_count)
-
-    for walk_position in range(mode_count):
-        # Each sample's next candidate in its own confidence order.
-        candidate_index = confidence_order[:, walk_position]
-        candidate_endpoint = endpoints.gather(
-            1, candidate_index[:, None, None].expand(-1, -1, 2))
-
-        separations = torch.cdist(candidate_endpoint, kept_endpoints).squeeze(1)
-        near_a_kept_mode = separations < PRUNE_DISTANCE_METRES
-        too_close = (near_a_kept_mode & kept_slot_filled).any(dim=-1)
-        still_walking = kept_count < slot_count
-
-        keeps = still_walking & ~too_close
-        keep_slot = next_free_slot(keeps, kept_count, slot_positions)
-        kept_indices = torch.where(keep_slot, candidate_index[:, None],
-                                   kept_indices)
-        kept_endpoints = torch.where(keep_slot[:, :, None], candidate_endpoint,
-                                     kept_endpoints)
-        kept_slot_filled = kept_slot_filled | keep_slot
-        kept_count = kept_count + keeps.long()
-
-        drops = still_walking & too_close
-        drop_slot = next_free_slot(drops, dropped_count, slot_positions)
-        dropped_indices = torch.where(drop_slot, candidate_index[:, None],
-                                      dropped_indices)
-        dropped_count = dropped_count + drops.long()
-
-        if bool((kept_count == slot_count).all()):
+    confidence_order = torch.argsort(logits, dim=-1, descending=True)
+    walk = PruneWalk(endpoints)
+    for position in range(mode_count):
+        candidate = confidence_order[:, position]
+        selector = candidate[:, None, None].expand(-1, -1, 2)
+        walk.consider(candidate, endpoints.gather(1, selector))
+        if walk.finished():
             break
 
-    # A sample that kept fewer than 6 fills its remaining slots from
-    # its dropped modes, most confident first.
-    slots_past_the_kept = slot_positions[None, :] - kept_count[:, None]
-    backfill_positions = slots_past_the_kept.clamp(min=0)
-    is_kept_slot = slot_positions[None, :] < kept_count[:, None]
-    backfill_indices = dropped_indices.gather(1, backfill_positions)
-    final_indices = torch.where(is_kept_slot, kept_indices, backfill_indices)
-
+    final_indices = walk.final_indices()
     trailing_shape = trajectories.shape[2:]
-    trajectory_selector = final_indices[:, :, None,
-                                        None].expand(-1, -1, *trailing_shape)
-    return (
-        trajectories.gather(1, trajectory_selector),
-        confidence_logits.gather(1, final_indices),
-        kept_count,
+    selector = final_indices[:, :, None, None].expand(-1, -1, *trailing_shape)
+    return PrunedModes(
+        trajectories.gather(1, selector),
+        logits.gather(1, final_indices),
+        walk.kept_count,
     )
 
 
-def prune_modes_batched(
-        trajectories: torch.Tensor,
-        confidence_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    kept_trajectories, kept_confidence_logits, _ = (
-        prune_modes_batched_with_kept_count(trajectories, confidence_logits))
-    return kept_trajectories, kept_confidence_logits
-
-
-def aggregated_confidences(trajectories: torch.Tensor,
-                           confidence_logits: torch.Tensor,
-                           kept_trajectories: torch.Tensor) -> torch.Tensor:
+def kept_confidences(paths: Tensor, logits: Tensor, kept: Tensor) -> Tensor:
     """Moves each original mode's softmax probability mass onto whichever kept
     mode has the nearest endpoint.
     """
-    probabilities = torch.softmax(confidence_logits, dim=-1)
-    separations = torch.cdist(trajectories[:, :, -1], kept_trajectories[:, :,
-                                                                        -1])
+    probabilities = torch.softmax(logits, dim=-1)
+    separations = torch.cdist(paths[:, :, -1], kept[:, :, -1])
     nearest_kept = separations.argmin(dim=-1)
     aggregated = torch.zeros(
-        kept_trajectories.shape[:2],
-        dtype=probabilities.dtype,
-        device=probabilities.device,
+        kept.shape[:2], dtype=probabilities.dtype, device=probabilities.device
     )
     return aggregated.scatter_add(1, nearest_kept, probabilities)

@@ -3,227 +3,200 @@
 Clusters where training agents ended up after 8 s into 54 anchor endpoints per
 object type.
 """
+
 from __future__ import annotations
 
-import womd.runtime_env
+import womd.runtime_env  # noqa: F401
+
 import argparse
 import math
 import time
-from collections import namedtuple
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
-from sklearn.cluster import KMeans
 import torch
+from sklearn.cluster import KMeans
+from torch import Tensor
 
 from womd import contract, loader, model
-
-# The result of one k-means fit, where the centres ended, which centre
-# each endpoint belongs to and how the search stopped.
-AnchorFit = namedtuple(
-    "AnchorFit",
-    "centres assignment iteration_count stopped_by_convergence",
-)
 
 # Fixed, so a refit on the same endpoints gives the same anchors.
 # Every other k-means setting is scikit-learn's default.
 RANDOM_STATE_SEED = 0
 
 
-def metre_endpoints(
-    scenario_paths: list[Path]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """For each designated target, its final valid future position, predicted
-    type index and reachable-distance bound in metres.
+class Endpoints(NamedTuple):
+    """Where each designated training target ended up after 8 s, in its own
+    frame, with its predicted type and how far it could have driven.
     """
-    agent_histories = []
-    logged_endpoints = []
-    for scenario_path in scenario_paths:
-        scenario = loader.read_scenario(scenario_path)
-        eligible = loader.eligible_track_indices(
-            scenario.track_rows,
-            scenario.track_valid,
-            scenario.is_designated_target,
-            designated_targets_only=True,
-        )
-        scene_sample = loader.build_scene_sample(scenario, eligible.tolist())
-        for target in scene_sample.targets:
-            valid_future_steps = np.flatnonzero(target.future_mask)
-            if valid_future_steps.size == 0:
-                continue
-            agent_histories.append(target.agent_history)
-            logged_endpoints.append(
-                target.future_positions[valid_future_steps[-1]])
 
-    agent_history = torch.from_numpy(np.stack(agent_histories))
-    endpoints = torch.from_numpy(np.stack(logged_endpoints))
-    return (
-        endpoints,
-        model.predicted_type_index(agent_history),
-        model.agent_reachable_distance(agent_history),
+    positions: Tensor  # (N, 2) metres
+    type_index: Tensor  # (N,)
+    reachable_metres: Tensor  # (N,)
+
+    def of_type(self, type_index: int) -> Tensor:
+        return self.positions[self.type_index == type_index]
+
+
+class TypeFit(NamedTuple):
+    """One object type's fitted anchors, most-used first, with how many
+    endpoints each drew and how k-means stopped.
+    """
+
+    type_name: str
+    sample_count: int
+    anchors: Tensor  # (54, 2)
+    counts: Tensor  # (54,)
+    iteration_count: int
+    stopped_by_convergence: bool
+
+
+def extract_endpoints(paths: list[Path]) -> Endpoints:
+    """Reads every designated target's final valid future position from the
+    staged scenarios.
+    """
+    histories = []
+    positions = []
+    for path in paths:
+        scenario = loader.read_scenario(path)
+        eligible = loader.eligible_tracks(scenario, designated_only=True)
+        sample = loader.scene_sample(scenario, eligible.tolist())
+        for target in sample.targets:
+            valid_steps = np.flatnonzero(target.future_mask)
+            if valid_steps.size == 0:
+                continue
+            histories.append(target.agent_history)
+            positions.append(target.future_positions[valid_steps[-1]])
+    history = torch.from_numpy(np.stack(histories))
+    return Endpoints(
+        torch.from_numpy(np.stack(positions)),
+        model.predicted_type_index(history),
+        model.agent_reachable_distance(history),
     )
 
 
-def endpoints_per_centre(assignment: torch.Tensor,
-                         centre_count: int) -> torch.Tensor:
-    endpoint_counts = torch.zeros(centre_count, dtype=torch.long)
-    return endpoint_counts.index_add_(0, assignment,
-                                      torch.ones_like(assignment))
+def cached_endpoints(staged_directory: Path) -> Endpoints:
+    """Extracting endpoints reads the whole staged directory, so the result is
+    cached beside it and reused while its provenance matches this code.
+    """
+    cache_path = (
+        staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
+    )
+    if cache_path.exists():
+        with np.load(cache_path) as cache:
+            stamp = cache["provenance"] if "provenance" in cache else None
+            try:
+                contract.check_provenance(
+                    stamp, cache_path, "Re-extracting endpoints now."
+                )
+            except ValueError as refusal:
+                print(refusal)
+            else:
+                print(f"endpoints read from {cache_path}")
+                return Endpoints(
+                    torch.from_numpy(cache["endpoints"]),
+                    torch.from_numpy(cache["predicted_type_index"]),
+                    torch.from_numpy(cache["reachable_distance_metres"]),
+                )
+    endpoints = extract_endpoints(sorted(staged_directory.glob("*.npz")))
+    np.savez(
+        cache_path,
+        endpoints=endpoints.positions.numpy().astype(np.float32),
+        predicted_type_index=endpoints.type_index.numpy().astype(np.int64),
+        reachable_distance_metres=endpoints.reachable_metres.numpy().astype(
+            np.float32
+        ),
+        provenance=contract.artifact_provenance(
+            "fit_anchors.py", staged_directory
+        ),
+    )
+    print(f"endpoints cached to {cache_path}")
+    return endpoints
 
 
-def fit_unit_anchors(endpoints: torch.Tensor,
-                     centre_count: int = model.QUERY_COUNT) -> AnchorFit:
-    fitted = KMeans(n_clusters=centre_count,
-                    random_state=RANDOM_STATE_SEED).fit(endpoints.numpy())
-    return AnchorFit(
-        centres=torch.from_numpy(fitted.cluster_centers_).to(endpoints.dtype),
-        assignment=torch.from_numpy(fitted.labels_).to(torch.long),
+def reachable_only(endpoints: Endpoints) -> Endpoints:
+    """Leaves out endpoints further away than their agent could have driven.
+    They stay training samples; they only do not shape the anchors.
+    """
+    reachable = endpoints.positions.norm(dim=-1) <= endpoints.reachable_metres
+    print(
+        f"{int((~reachable).sum())} endpoints beyond reachable distance"
+        f" left out of the fit"
+    )
+    return Endpoints(*(field[reachable] for field in endpoints))
+
+
+def fit_type(type_name: str, positions: Tensor) -> TypeFit:
+    """Fits one object type's anchors with k-means and orders them most-used
+    first.
+    """
+    if len(positions) < model.QUERY_COUNT:
+        raise ValueError(
+            f"{type_name} has {len(positions)} endpoints,"
+            f" fewer than {model.QUERY_COUNT} anchors"
+        )
+    kmeans = KMeans(
+        n_clusters=model.QUERY_COUNT, random_state=RANDOM_STATE_SEED
+    )
+    fitted = kmeans.fit(positions.numpy())
+    assignment = torch.from_numpy(fitted.labels_).to(torch.long)
+    counts = torch.zeros(model.QUERY_COUNT, dtype=torch.long)
+    counts.index_add_(0, assignment, torch.ones_like(assignment))
+    order = torch.argsort(counts, descending=True, stable=True)
+    centres = torch.from_numpy(fitted.cluster_centers_).to(positions.dtype)
+    return TypeFit(
+        type_name=type_name,
+        sample_count=len(positions),
+        anchors=centres[order],
+        counts=counts[order],
         iteration_count=fitted.n_iter_,
         stopped_by_convergence=fitted.n_iter_ < fitted.max_iter,
     )
 
 
-def minimum_pairwise_distance(anchors: torch.Tensor) -> float:
+def minimum_pairwise_distance(anchors: Tensor) -> float:
     """Smallest distance between any two distinct anchors, in metres."""
     separations = torch.cdist(anchors, anchors)
     separations.fill_diagonal_(float("inf"))
     return float(separations.min())
 
 
-def print_one_type(type_name: str, type_sample_count: int,
-                   fitted_anchors: torch.Tensor, fitted_counts: torch.Tensor,
-                   iteration_count: int, stopped_by_convergence: bool) -> None:
-    """Prints one object type's fitted anchors with their offset, distance,
-    angle and share of endpoints assigned to them.
+def print_fit(fit: TypeFit) -> None:
+    """Prints one object type's anchors with their offset, distance, angle and
+    share of endpoints.
     """
-    stop_reason = ("convergence"
-                   if stopped_by_convergence else "the iteration cap")
-    print(f"{type_name} | samples {type_sample_count} |"
-          f" {len(fitted_anchors)} anchors | k-means ran"
-          f" {iteration_count} iterations, stopped by {stop_reason}")
-    print(f"{'anchor':>7}{'x':>10}{'y':>10}{'distance':>10}"
-          f"{'angle deg':>11}{'share':>9}")
-    for anchor_index in range(len(fitted_anchors)):
-        offset_x, offset_y = fitted_anchors[anchor_index].tolist()
-        print(f"{anchor_index:>7}{offset_x:>10.3f}{offset_y:>10.3f}"
-              f"{math.hypot(offset_x, offset_y):>10.3f}"
-              f"{math.degrees(math.atan2(offset_y, offset_x)):>11.1f}"
-              f"{int(fitted_counts[anchor_index]) / type_sample_count:>9.1%}")
-    largest_share = int(fitted_counts.max()) / type_sample_count
-    print(f"{'largest single share':<28}{largest_share:>12.1%}")
-    print(f"{'minimum pairwise distance':<28}"
-          f"{minimum_pairwise_distance(fitted_anchors):>12.3f}")
-    print()
-
-
-def load_or_extract_endpoints(
-        staged_directory: Path
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Extracting endpoints reads the whole staged directory, so the result is
-    cached beside the staged directory and reused while valid.
-    """
-    cache_name = f"{staged_directory.name}_endpoints_cache.npz"
-    endpoints_cache_path = staged_directory.parent / cache_name
-    cached_arrays = None
-    if endpoints_cache_path.exists():
-        with np.load(endpoints_cache_path) as endpoints_cache:
-            cache_provenance = (endpoints_cache["provenance"]
-                                if "provenance" in endpoints_cache else None)
-            try:
-                contract.check_artifact_provenance(
-                    cache_provenance,
-                    endpoints_cache_path,
-                    "Re-extracting endpoints now.",
-                )
-                cached_arrays = {
-                    name: endpoints_cache[name] for name in (
-                        "endpoints",
-                        "predicted_type_index",
-                        "reachable_distance_metres",
-                    )
-                }
-            except AssertionError as refusal:
-                print(refusal)
-    if cached_arrays is not None:
-        endpoints = torch.from_numpy(cached_arrays["endpoints"])
-        predicted_type_index = torch.from_numpy(
-            cached_arrays["predicted_type_index"])
-        reachable_distance_metres = torch.from_numpy(
-            cached_arrays["reachable_distance_metres"])
-        print(f"endpoints read from {endpoints_cache_path}")
-    else:
-        scenario_paths = sorted(staged_directory.glob("*.npz"))
-        endpoints, predicted_type_index, reachable_distance_metres = (
-            metre_endpoints(scenario_paths))
-        reachable_distances = reachable_distance_metres.numpy()
-        cached_endpoint_arrays = {
-            "endpoints": endpoints.numpy().astype(np.float32),
-            "predicted_type_index": predicted_type_index.numpy().astype(np.int64
-                                                                       ),
-            "reachable_distance_metres": reachable_distances.astype(np.float32),
-            "provenance": contract.artifact_provenance("fit_anchors.py",
-                                                       staged_directory),
-        }
-        np.savez(endpoints_cache_path, **cached_endpoint_arrays)
-        print(f"endpoints cached to {endpoints_cache_path}")
-    return endpoints, predicted_type_index, reachable_distance_metres
-
-
-def drop_unreachable_endpoints(
-    endpoints: torch.Tensor, predicted_type_index: torch.Tensor,
-    reachable_distance_metres: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Leaves out endpoints further away than their agent could have driven.
-
-    They stay training samples; they only do not shape the anchors.
-    """
-    physically_reachable = endpoints.norm(dim=-1) <= reachable_distance_metres
-    excluded_count = int((~physically_reachable).sum())
-    print(f"{excluded_count} endpoints beyond reachable distance"
-          f" left out of the fit")
-    return (endpoints[physically_reachable],
-            predicted_type_index[physically_reachable])
-
-
-def count_endpoints_per_type(predicted_type_index: torch.Tensor,
-                             staged_directory: Path) -> list[int]:
-    """Counts the endpoints of each object type and refuses a type with fewer
-    endpoints than anchors.
-    """
-    type_sample_counts = [
-        int((predicted_type_index == type_index).sum())
-        for type_index in range(contract.NUM_OBJECT_TYPES)
-    ]
-    starved_types = [
-        f"{type_name} has {type_sample_count}" for type_name, type_sample_count
-        in zip(contract.PREDICTED_OBJECT_TYPES, type_sample_counts)
-        if type_sample_count < model.QUERY_COUNT
-    ]
-    starved_summary = ", ".join(starved_types)
-    assert not starved_types, (
-        f"each type needs at least {model.QUERY_COUNT} endpoints, but"
-        f" {starved_summary} in {staged_directory}")
-    return type_sample_counts
-
-
-def fit_one_type(type_name: str, type_endpoints: torch.Tensor) -> torch.Tensor:
-    """Fits one object type's anchors, orders them most-used first, and prints
-    the table for that type.
-    """
-    anchor_fit = fit_unit_anchors(type_endpoints)
-    fitted_counts = endpoints_per_centre(anchor_fit.assignment,
-                                         model.QUERY_COUNT)
-    share_order = torch.argsort(fitted_counts, descending=True, stable=True)
-    fitted_anchors = anchor_fit.centres[share_order]
-    print_one_type(
-        type_name,
-        type_endpoints.shape[0],
-        fitted_anchors,
-        fitted_counts[share_order],
-        anchor_fit.iteration_count,
-        anchor_fit.stopped_by_convergence,
+    stop_reason = (
+        "convergence" if fit.stopped_by_convergence else "the iteration cap"
     )
-    return fitted_anchors
+    print(
+        f"{fit.type_name} | samples {fit.sample_count}"
+        f" | {len(fit.anchors)} anchors"
+        f" | k-means ran {fit.iteration_count} iterations,"
+        f" stopped by {stop_reason}"
+    )
+    print(
+        f"{'anchor':>7}{'x':>10}{'y':>10}"
+        f"{'distance':>10}{'angle deg':>11}{'share':>9}"
+    )
+    for index, (anchor, count) in enumerate(
+        zip(fit.anchors, fit.counts, strict=True)
+    ):
+        offset_x, offset_y = anchor.tolist()
+        distance = math.hypot(offset_x, offset_y)
+        angle = math.degrees(math.atan2(offset_y, offset_x))
+        share = int(count) / fit.sample_count
+        print(
+            f"{index:>7}{offset_x:>10.3f}{offset_y:>10.3f}"
+            f"{distance:>10.3f}{angle:>11.1f}{share:>9.1%}"
+        )
+    largest_share = int(fit.counts.max()) / fit.sample_count
+    print(f"{'largest single share':<28}{largest_share:>12.1%}")
+    print(
+        f"{'minimum pairwise distance':<28}"
+        f"{minimum_pairwise_distance(fit.anchors):>12.3f}"
+    )
+    print()
 
 
 def main() -> None:
@@ -234,42 +207,34 @@ def main() -> None:
     parser.add_argument("staged_directory", type=Path)
     parser.add_argument("output_path", type=Path)
     arguments = parser.parse_args()
-    staged_directory = arguments.staged_directory
-    output_path = arguments.output_path
 
-    start_seconds = time.perf_counter()
-    endpoints, predicted_type_index, reachable_distance_metres = (
-        load_or_extract_endpoints(staged_directory))
-    elapsed_seconds = time.perf_counter() - start_seconds
-
-    endpoints, predicted_type_index = drop_unreachable_endpoints(
-        endpoints, predicted_type_index, reachable_distance_metres)
-    type_sample_counts = count_endpoints_per_type(predicted_type_index,
-                                                  staged_directory)
-
-    print(f"samples {endpoints.shape[0]} | {elapsed_seconds:.1f} s")
-    per_type_summary = " ".join(
-        f"{type_name} {type_sample_count}" for type_name, type_sample_count in
-        zip(contract.PREDICTED_OBJECT_TYPES, type_sample_counts))
-    print(f"samples per type | {per_type_summary}")
-    print()
-
-    fitted_anchors_per_type = [
-        fit_one_type(type_name, endpoints[predicted_type_index == type_index])
+    start = time.perf_counter()
+    endpoints = reachable_only(cached_endpoints(arguments.staged_directory))
+    print(
+        f"samples {len(endpoints.positions)}"
+        f" | {time.perf_counter() - start:.1f} s"
+    )
+    fits = [
+        fit_type(type_name, endpoints.of_type(type_index))
         for type_index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES)
     ]
+    for fit in fits:
+        print_fit(fit)
 
-    unit_anchors = torch.stack(fitted_anchors_per_type)
-    anchor_arrays = {
-        "unit_anchors": unit_anchors.numpy().astype(np.float32),
-        "provenance": contract.artifact_provenance("fit_anchors.py",
-                                                   staged_directory),
-    }
-    np.savez(output_path, **anchor_arrays)
-    print(f"wrote {output_path}, unit_anchors"
-          f" {tuple(unit_anchors.shape)}, one set per"
-          f" {contract.PREDICTED_OBJECT_TYPES} in that order,"
-          f" most-used anchor first")
+    unit_anchors = torch.stack([fit.anchors for fit in fits])
+    np.savez(
+        arguments.output_path,
+        unit_anchors=unit_anchors.numpy().astype(np.float32),
+        provenance=contract.artifact_provenance(
+            "fit_anchors.py", arguments.staged_directory
+        ),
+    )
+    print(
+        f"wrote {arguments.output_path},"
+        f" unit_anchors {tuple(unit_anchors.shape)},"
+        f" one set per {contract.PREDICTED_OBJECT_TYPES} in that order,"
+        f" most-used anchor first"
+    )
 
 
 if __name__ == "__main__":

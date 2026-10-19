@@ -1,12 +1,13 @@
 """Decodes one shard with either our vendored protos or Waymo's and prints it as
 JSON, so runner.py can compare the two.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any
 
 # Map feature kinds whose points form a closed polygon rather
@@ -50,67 +51,47 @@ def extract_scenario_fields(scenario: Any) -> dict[str, Any]:
     """Flattens one decoded scenario proto into plain nested dicts and lists, so
     it can be JSON-encoded and diffed field by field.
     """
-    tracks = [{
-        "id": int(track.id),
-        "object_type": int(track.object_type),
-        "states": [track_state_row(state) for state in track.states],
-    } for track in scenario.tracks]
-
+    tracks = []
+    for track in scenario.tracks:
+        states = [track_state_row(state) for state in track.states]
+        tracks.append(
+            {
+                "id": int(track.id),
+                "object_type": int(track.object_type),
+                "states": states,
+            }
+        )
     map_features = []
     for feature in scenario.map_features:
         extracted = map_feature_points(feature)
         if extracted is None:
             continue
         kind, points = extracted
-        map_features.append({
-            "id": int(feature.id),
-            "kind": kind,
-            "points": points
-        })
-
+        map_features.append(
+            {"id": int(feature.id), "kind": kind, "points": points}
+        )
+    timestamps = [float(value) for value in scenario.timestamps_seconds]
     return {
         "scenario_id": scenario.scenario_id,
         "current_time_index": int(scenario.current_time_index),
         "sdc_track_index": int(scenario.sdc_track_index),
-        "timestamps_seconds": [
-            float(value) for value in scenario.timestamps_seconds
-        ],
+        "timestamps_seconds": timestamps,
         "tracks": tracks,
         "map_features": map_features,
     }
 
 
-def extract_ours(shard_path: Path | str,
-                 sample_count: int) -> list[dict[str, Any]]:
-    """Decodes the first sample_count records of a shard with this repo's
-    vendored scenario_pb2, for comparison.
+def decode_shard(shard_path: Path, sample_count: int, protos: Any) -> list[Any]:
+    """Decodes the first sample_count records of a shard with the given
+    scenario_pb2 module and flattens each one.
     """
     import tensorflow as tf
-    from womd_protos import scenario_pb2
 
     extracted_scenarios = []
     for raw_record in tf.data.TFRecordDataset(str(shard_path)):
         if len(extracted_scenarios) >= sample_count:
             break
-        scenario = scenario_pb2.Scenario()
-        scenario.ParseFromString(raw_record.numpy())
-        extracted_scenarios.append(extract_scenario_fields(scenario))
-    return extracted_scenarios
-
-
-def extract_theirs(shard_path: Path | str,
-                   sample_count: int) -> list[dict[str, Any]]:
-    """Decodes the first sample_count records of a shard with Waymo's own
-    installed scenario_pb2, for comparison against ours.
-    """
-    import tensorflow as tf
-    from waymo_open_dataset.protos import scenario_pb2
-
-    extracted_scenarios = []
-    for raw_record in tf.data.TFRecordDataset(str(shard_path)):
-        if len(extracted_scenarios) >= sample_count:
-            break
-        scenario = scenario_pb2.Scenario()
+        scenario = protos.Scenario()
         scenario.ParseFromString(raw_record.numpy())
         extracted_scenarios.append(extract_scenario_fields(scenario))
     return extracted_scenarios
@@ -127,13 +108,13 @@ def main() -> None:
     arguments = parser.parse_args()
 
     if arguments.role == "ours":
-        extracted_scenarios = extract_ours(arguments.shard_path,
-                                           arguments.sample_count)
+        from womd_protos import scenario_pb2
     else:
-        extracted_scenarios = extract_theirs(arguments.shard_path,
-                                             arguments.sample_count)
-
-    json.dump(extracted_scenarios, sys.stdout)
+        from waymo_open_dataset.protos import scenario_pb2
+    scenarios = decode_shard(
+        arguments.shard_path, arguments.sample_count, scenario_pb2
+    )
+    json.dump(scenarios, sys.stdout)
 
 
 if __name__ == "__main__":

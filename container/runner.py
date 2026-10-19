@@ -1,24 +1,29 @@
 """Runs inside the container, feeding predictions and ground truth to Waymo's
 metrics op and checking our protos against theirs.
 """
+
 from __future__ import annotations
 
 import argparse
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, NamedTuple
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPOSITORY_ROOT))
 
-import womd.runtime_env
-import numpy as np
+import womd.runtime_env  # noqa: E402, F401
 
-from womd import contract, frame_ops, loader
+import numpy as np  # noqa: E402
+
+from womd import contract, frame_ops, loader  # noqa: E402
+from womd.frame_ops import Frame  # noqa: E402
+from womd.loader import StagedScenario  # noqa: E402
 
 # The pip package holding Waymo's metrics; its installed version is
 # printed with each run.
@@ -26,6 +31,8 @@ WAYMO_OPEN_DATASET_DISTRIBUTION_NAME = "waymo-open-dataset-tf-2-12-0"
 # Two decoders may differ by this much on a decimal field and still
 # count as agreeing.
 FLOATING_POINT_DISAGREEMENT_TOLERANCE = 1e-4
+# Where the vendored protos are compiled for the reader check.
+CONTAINER_LOCAL_PROTOS = Path("/tmp/container_local_protos")
 
 # Waymo's tutorial metrics configuration, predictions at 2 Hz scored at
 # 3, 5 and 8 seconds, at most 6 per agent.
@@ -57,75 +64,21 @@ max_predictions: 6
 """
 
 
-def track_row_world_frame_state(track_row: np.ndarray, frame_origin: np.ndarray,
-                                frame_heading: float) -> np.ndarray:
-    """One agent's scene-frame rows to the 7 world-frame columns the metrics op
-    wants, x, y, length, width, heading, vx and vy.
-    """
-    positions_world = frame_ops.positions_from_frame(
-        track_row[:, contract.AGENT_POSITION],
-        frame_origin,
-        frame_heading,
-    )
-    # A velocity rotates with the frame but has no origin to add.
-    velocities_world = frame_ops.positions_from_frame(
-        track_row[:, contract.AGENT_VELOCITY],
-        np.zeros(2),
-        frame_heading,
-    )
-    heading_scene_frame = np.arctan2(
-        track_row[:, contract.AGENT_HEADING_SINE],
-        track_row[:, contract.AGENT_HEADING_COSINE],
-    )
-    heading_world = frame_ops.wrap_to_pi(heading_scene_frame + frame_heading)
-    dimensions = track_row[:, contract.AGENT_DIMENSIONS]
-    return np.concatenate(
-        [
-            positions_world,
-            dimensions,
-            heading_world[:, np.newaxis],
-            velocities_world,
-        ],
-        axis=1,
-    )
-
-
-def scenario_world_frame_ground_truth(
-    scenario: loader.StagedScenario
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Builds world-frame ground truth state, validity, and object type for each
-    track in a scenario, for scoring against it.
-    """
-    track_rows = scenario.track_rows
-    frame_origin = scenario.frame_origin
-    frame_heading = scenario.frame_heading
-    world_frame_states = np.stack([
-        track_row_world_frame_state(track_row, frame_origin, frame_heading)
-        for track_row in track_rows
-    ]).astype(np.float32)
-    type_onehots = track_rows[:, contract.CURRENT_STEP_INDEX,
-                              contract.AGENT_TYPE]
-    object_types = type_onehots.argmax(axis=-1).astype(np.int64) + 1
-    return (
-        world_frame_states,
-        scenario.track_valid,
-        object_types,
-    )
-
-
 class SubmissionArrays(NamedTuple):
     """A submission .npz, one row per predicted target, in the world frame."""
+
     scenario_id: np.ndarray  # (targets,)
     track_id: np.ndarray  # (targets,)
     world_trajectories: np.ndarray  # (targets, 6, 16, 2) at 2 Hz
     confidences: np.ndarray  # (targets, 6)
 
 
-class MotionMetricInputs(NamedTuple):
+class MetricInputs(NamedTuple):
     """The padded scenario-by-agent tensors Waymo's motion metrics op reads,
     named as its keyword arguments. S scenarios, P predictions and A agents in
     the largest scenario, M modes, K submitted steps, 91 logged steps.
     """
+
     prediction_trajectory: np.ndarray  # (S, P, M, 1, K, 2)
     prediction_score: np.ndarray  # (S, P, M)
     ground_truth_trajectory: np.ndarray  # (S, A, 91, 7)
@@ -137,130 +90,194 @@ class MotionMetricInputs(NamedTuple):
     scenario_id: np.ndarray  # (S,)
 
 
-def prediction_rows_by_scenario(
-        scenario_ids: np.ndarray) -> dict[str, list[int]]:
+class Padding(NamedTuple):
+    """The padded tensor sizes, room for the largest scenario."""
+
+    scenarios: int
+    agents: int
+    predictions: int
+    modes: int
+    steps: int  # submitted steps per mode
+
+
+class GroundTruth(NamedTuple):
+    """Every track of one scenario in the world frame."""
+
+    states: np.ndarray  # (T, 91, 7) x, y, length, width, heading, vx, vy
+    valid: np.ndarray  # (T, 91)
+    object_types: np.ndarray  # (T,) Waymo's numbering, vehicle 1
+
+
+def world_states(rows: np.ndarray, frame: Frame) -> np.ndarray:
+    """Scene-frame agent rows (..., 13) to the 7 world-frame columns the
+    metrics op wants, x, y, length, width, heading, vx and vy.
+    """
+    positions = frame_ops.positions_from_frame(
+        rows[..., contract.AGENT_POSITION], frame
+    )
+    velocities = frame_ops.directions_from_frame(
+        rows[..., contract.AGENT_VELOCITY], frame.heading
+    )
+    sine = rows[..., contract.AGENT_HEADING_SINE]
+    cosine = rows[..., contract.AGENT_HEADING_COSINE]
+    headings = frame_ops.wrap_to_pi(np.arctan2(sine, cosine) + frame.heading)
+    dimensions = rows[..., contract.AGENT_DIMENSIONS]
+    columns = [positions, dimensions, headings[..., np.newaxis], velocities]
+    return np.concatenate(columns, axis=-1).astype(np.float32)
+
+
+def ground_truth(scenario: StagedScenario) -> GroundTruth:
+    states = world_states(scenario.track_rows, scenario.scene_frame)
+    now_types = scenario.track_rows[
+        :, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE
+    ]
+    object_types = now_types.argmax(axis=-1).astype(np.int64) + 1
+    return GroundTruth(states, scenario.track_valid, object_types)
+
+
+def rows_by_scenario(scenario_ids: np.ndarray) -> dict[str, list[int]]:
     """Groups the flat per-target prediction rows by scenario in first-seen
     order, because the metrics op wants one row per scenario.
     """
-    prediction_rows_of_scenario = {}
-    for prediction_index, scenario_id in enumerate(scenario_ids):
-        prediction_rows_of_scenario.setdefault(scenario_id,
-                                               []).append(prediction_index)
-    return prediction_rows_of_scenario
+    rows: dict[str, list[int]] = {}
+    for row, scenario_id in enumerate(scenario_ids):
+        rows.setdefault(scenario_id, []).append(row)
+    return rows
 
 
-def build_motion_metric_tensors(
-        predictions: SubmissionArrays,
-        staged_directory: Path | str) -> MotionMetricInputs:
+def empty_inputs(padding: Padding, scenario_ids: list[str]) -> MetricInputs:
+    per_prediction = (padding.scenarios, padding.predictions)
+    per_agent = (padding.scenarios, padding.agents)
+    logged = contract.TOTAL_STEPS
+    return MetricInputs(
+        prediction_trajectory=np.zeros(
+            per_prediction + (padding.modes, 1, padding.steps, 2), np.float32
+        ),
+        prediction_score=np.zeros(
+            per_prediction + (padding.modes,), np.float32
+        ),
+        ground_truth_trajectory=np.zeros(per_agent + (logged, 7), np.float32),
+        ground_truth_is_valid=np.zeros(per_agent + (logged,), bool),
+        prediction_ground_truth_indices=np.zeros(
+            per_prediction + (1,), np.int64
+        ),
+        prediction_ground_truth_indices_mask=np.zeros(
+            per_prediction + (1,), bool
+        ),
+        object_type=np.zeros(per_agent, np.int64),
+        object_id=np.zeros(per_agent, np.int64),
+        scenario_id=np.array(scenario_ids),
+    )
+
+
+class InputsBuilder:
+    """Reads each predicted scenario's staged ground truth and fills the
+    metric inputs one scenario at a time.
+    """
+
+    def __init__(self, predictions: SubmissionArrays, staged: Path) -> None:
+        self.predictions = predictions
+        rows_of = rows_by_scenario(predictions.scenario_id)
+        self.prediction_rows = list(rows_of.values())
+        self.scenarios = []
+        for scenario_id in rows_of:
+            self.scenarios.append(
+                loader.read_scenario(staged / f"{scenario_id}.npz")
+            )
+        modes, steps = predictions.world_trajectories.shape[1:3]
+        padding = Padding(
+            scenarios=len(self.scenarios),
+            agents=max(len(scenario.track_ids) for scenario in self.scenarios),
+            predictions=max(len(rows) for rows in self.prediction_rows),
+            modes=modes,
+            steps=steps,
+        )
+        self.tensors = empty_inputs(padding, list(rows_of))
+
+    def add_ground_truth(self, row: int, scenario: StagedScenario) -> None:
+        """Ground truth holds every agent of the scenario."""
+        truth = ground_truth(scenario)
+        agents = (row, slice(0, len(scenario.track_ids)))
+        self.tensors.ground_truth_trajectory[agents] = truth.states
+        self.tensors.ground_truth_is_valid[agents] = truth.valid
+        self.tensors.object_type[agents] = truth.object_types
+        self.tensors.object_id[agents] = scenario.track_ids
+
+    def add_predictions(self, row: int, scenario: StagedScenario) -> None:
+        """Each prediction points at its agent by index, not track id."""
+        predictions = self.predictions
+        tensors = self.tensors
+        for slot_index, prediction_row in enumerate(self.prediction_rows[row]):
+            track_id = predictions.track_id[prediction_row]
+            matches = np.flatnonzero(scenario.track_ids == track_id)
+            if len(matches) != 1:
+                raise ValueError(
+                    f"track {track_id} appears {len(matches)} times"
+                    f" in {scenario.scenario_id}"
+                )
+            slot = (row, slot_index)
+            tensors.prediction_trajectory[slot][:, 0] = (
+                predictions.world_trajectories[prediction_row]
+            )
+            tensors.prediction_score[slot] = predictions.confidences[
+                prediction_row
+            ]
+            tensors.prediction_ground_truth_indices[slot] = matches[0]
+            tensors.prediction_ground_truth_indices_mask[slot] = True
+
+    def build(self) -> MetricInputs:
+        for row, scenario in enumerate(self.scenarios):
+            self.add_ground_truth(row, scenario)
+            self.add_predictions(row, scenario)
+        return self.tensors
+
+
+def metric_inputs(predictions: SubmissionArrays, staged: Path) -> MetricInputs:
     """Reshapes flat per-target predictions and staged ground truth into the
     padded scenario-by-agent tensors the metrics op expects.
     """
-    track_ids = predictions.track_id
-    world_trajectories = predictions.world_trajectories
-    confidences = predictions.confidences
-    prediction_rows_of_scenario = prediction_rows_by_scenario(
-        predictions.scenario_id)
-    ordered_scenario_ids = list(prediction_rows_of_scenario)
-    scenarios = [
-        loader.read_scenario(Path(staged_directory) / f"{scenario_id}.npz")
-        for scenario_id in ordered_scenario_ids
-    ]
-
-    # The padded sizes give every scenario room for the most agents and
-    # the most predictions any scenario has.
-    scenario_count = len(ordered_scenario_ids)
-    max_agents = max(len(scenario.track_ids) for scenario in scenarios)
-    max_predictions = max(
-        len(rows) for rows in prediction_rows_of_scenario.values())
-    mode_count, submitted_steps = world_trajectories.shape[1:3]
-    per_prediction = (scenario_count, max_predictions)
-    per_agent = (scenario_count, max_agents)
-    step_count = contract.TOTAL_STEPS
-
-    tensors = MotionMetricInputs(
-        prediction_trajectory=np.zeros(
-            per_prediction + (mode_count, 1, submitted_steps, 2), np.float32),
-        prediction_score=np.zeros(per_prediction + (mode_count,), np.float32),
-        ground_truth_trajectory=np.zeros(per_agent + (step_count, 7),
-                                         np.float32),
-        ground_truth_is_valid=np.zeros(per_agent + (step_count,), bool),
-        prediction_ground_truth_indices=np.zeros(per_prediction + (1,),
-                                                 np.int64),
-        prediction_ground_truth_indices_mask=np.zeros(per_prediction + (1,),
-                                                      bool),
-        object_type=np.zeros(per_agent, np.int64),
-        object_id=np.zeros(per_agent, np.int64),
-        scenario_id=np.array(ordered_scenario_ids),
-    )
-
-    for scenario_index, scenario_id in enumerate(ordered_scenario_ids):
-        scenario = scenarios[scenario_index]
-        scenario_track_ids = scenario.track_ids
-        agent_count = len(scenario_track_ids)
-
-        # Ground truth holds every agent of the scenario.
-        world_frame_states, track_valid, object_types = (
-            scenario_world_frame_ground_truth(scenario))
-        agents = (scenario_index, slice(0, agent_count))
-        tensors.ground_truth_trajectory[agents] = world_frame_states
-        tensors.ground_truth_is_valid[agents] = track_valid
-        tensors.object_type[agents] = object_types
-        tensors.object_id[agents] = scenario_track_ids
-
-        # Each prediction points at its agent by index, not track id.
-        for slot_index, prediction_index in enumerate(
-                prediction_rows_of_scenario[scenario_id]):
-            track_id = track_ids[prediction_index]
-            matching_track_indices = np.flatnonzero(
-                scenario_track_ids == track_id)
-            assert len(matching_track_indices) == 1, (
-                f"track {track_id} appears"
-                f" {len(matching_track_indices)} times in scenario"
-                f" {scenario_id}")
-            slot = (scenario_index, slot_index)
-            tensors.prediction_trajectory[slot][:, 0] = (
-                world_trajectories[prediction_index])
-            tensors.prediction_score[slot] = confidences[prediction_index]
-            tensors.prediction_ground_truth_indices[slot] = (
-                matching_track_indices[0])
-            tensors.prediction_ground_truth_indices_mask[slot] = True
-
-    return tensors
+    return InputsBuilder(predictions, staged).build()
 
 
 def load_predictions(predictions_path: Path) -> SubmissionArrays:
     """Loads a submission .npz and refuses one this code did not produce."""
     with np.load(predictions_path) as predictions_file:
-        contract.check_artifact_provenance(
-            (predictions_file["provenance"]
-             if "provenance" in predictions_file else None),
+        stamp = (
+            predictions_file["provenance"]
+            if "provenance" in predictions_file
+            else None
+        )
+        contract.check_provenance(
+            stamp,
             predictions_path,
             "Regenerate the predictions with submit.py.",
         )
-        return SubmissionArrays(
-            **
-            {name: predictions_file[name] for name in SubmissionArrays._fields})
+        arrays = {
+            name: predictions_file[name] for name in SubmissionArrays._fields
+        }
+    return SubmissionArrays(**arrays)
 
 
-def print_score_table(breakdown_names: list[str],
-                      metric_columns: tuple[np.ndarray, ...]) -> None:
+def print_score_table(names: list[str], columns: Sequence[np.ndarray]) -> None:
     """Prints one row per breakdown with minADE, minFDE, miss rate, overlap
     rate and mAP, in the order Waymo's op returns them.
     """
-    min_ade, min_fde, miss_rate, overlap_rate, mean_average_precision = (
-        metric_columns)
-    print(f"{'breakdown':32s} {'minADE':>10s} {'minFDE':>10s} {'missRate':>10s}"
-          f" {'overlapRate':>12s} {'mAP':>10s}")
-    for index, name in enumerate(breakdown_names):
-        print(f"{name:32s} {min_ade[index]:10.4f} {min_fde[index]:10.4f}"
-              f" {miss_rate[index]:10.4f} {overlap_rate[index]:12.4f}"
-              f" {mean_average_precision[index]:10.4f}")
+    min_ade, min_fde, miss_rate, overlap_rate, mean_average_precision = columns
+    print(
+        f"{'breakdown':32s} {'minADE':>10s} {'minFDE':>10s} {'missRate':>10s}"
+        f" {'overlapRate':>12s} {'mAP':>10s}"
+    )
+    for index, name in enumerate(names):
+        print(
+            f"{name:32s} {min_ade[index]:10.4f} {min_fde[index]:10.4f}"
+            f" {miss_rate[index]:10.4f} {overlap_rate[index]:12.4f}"
+            f" {mean_average_precision[index]:10.4f}"
+        )
 
 
-def run_score(predictions_path: Path, staged_directory: Path) -> None:
-    """Scores a submission .npz with Waymo's motion metrics op.
-
-    The only place waymo_open_dataset is imported; runs inside the container.
+def run_score(predictions_path: Path, staged: Path) -> None:
+    """Scores a submission .npz with Waymo's motion metrics op. The only place
+    waymo_open_dataset is imported; runs inside the container.
     """
     import tensorflow as tf
     from google.protobuf import text_format
@@ -269,33 +286,33 @@ def run_score(predictions_path: Path, staged_directory: Path) -> None:
     from waymo_open_dataset.protos import motion_metrics_pb2
 
     predictions = load_predictions(predictions_path)
-    tensors = build_motion_metric_tensors(predictions, staged_directory)
-
+    tensors = metric_inputs(predictions, staged)
     config = motion_metrics_pb2.MotionMetricsConfig()
     text_format.Parse(WAYMO_TUTORIAL_MOTION_METRICS_CONFIG_TEXT, config)
-    breakdown_names = config_util_py.get_breakdown_names_from_motion_config(
-        config)
+    names = config_util_py.get_breakdown_names_from_motion_config(config)
+    serialised = config.SerializeToString()
 
     tf.compat.v1.disable_eager_execution()
     graph = tf.Graph()
     with graph.as_default():
-        motion_metric_ops = py_metrics_ops.motion_metrics(
-            config=config.SerializeToString(),
-            **tensors._asdict(),
+        metric_ops = py_metrics_ops.motion_metrics(
+            config=serialised, **tensors._asdict()
         )
     with tf.compat.v1.Session(graph=graph) as session:
-        metric_columns = session.run(motion_metric_ops)
+        columns = session.run(metric_ops)
 
     target_count = int(tensors.prediction_ground_truth_indices_mask.sum())
     scenario_count = tensors.object_type.shape[0]
-    print(f"{target_count} designated targets across"
-          f" {scenario_count} scenarios scored from {predictions_path}")
-    print_score_table(breakdown_names, metric_columns)
+    print(
+        f"{target_count} designated targets across {scenario_count}"
+        f" scenarios scored from {predictions_path}"
+    )
+    print_score_table(names, columns)
 
 
 def base_environment() -> dict[str, str]:
-    """Copies the current environment with PYTHONPATH stripped, as a base for
-    building a child process environment from.
+    """The current environment with PYTHONPATH stripped, as a base for a
+    child process environment.
     """
     return {
         key: value for key, value in os.environ.items() if key != "PYTHONPATH"
@@ -307,124 +324,130 @@ def generate_container_local_protos(generated_root: Path) -> None:
     the two sets can be imported and compared separately.
     """
     generated_root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "protoc",
-            f"--proto_path={REPOSITORY_ROOT / 'proto'}",
-            f"--python_out={generated_root}",
-            str(REPOSITORY_ROOT / "proto/womd_protos/scenario.proto"),
-            str(REPOSITORY_ROOT / "proto/womd_protos/map.proto"),
-        ],
-        check=True,
-    )
+    command = [
+        "protoc",
+        f"--proto_path={REPOSITORY_ROOT / 'proto'}",
+        f"--python_out={generated_root}",
+        str(REPOSITORY_ROOT / "proto/womd_protos/scenario.proto"),
+        str(REPOSITORY_ROOT / "proto/womd_protos/map.proto"),
+    ]
+    subprocess.run(command, check=True)
     (generated_root / "womd_protos").mkdir(parents=True, exist_ok=True)
     (generated_root / "womd_protos" / "__init__.py").touch()
 
 
-def fields_disagree(ours_value: Any, theirs_value: Any) -> bool:
+def fields_disagree(ours: Any, theirs: Any) -> bool:
     """Compares two decoded field values, using a tolerance for floats and exact
     equality otherwise.
     """
-    if isinstance(ours_value, float) or isinstance(theirs_value, float):
-        return (abs(ours_value - theirs_value)
-                > FLOATING_POINT_DISAGREEMENT_TOLERANCE)
-    return ours_value != theirs_value
+    if isinstance(ours, float) or isinstance(theirs, float):
+        return abs(ours - theirs) > FLOATING_POINT_DISAGREEMENT_TOLERANCE
+    return ours != theirs
 
 
-def compare_scenario_fields(scenario_index: int,
-                            ours: Any,
-                            theirs: Any,
-                            path: str = "") -> int:
-    """Recursively compares two decoded scenarios field by field, printing each
-    disagreement and returning the count found.
+class FieldComparison:
+    """Compares two decodings of one scenario field by field, printing each
+    disagreement.
     """
-    if isinstance(ours, dict):
-        assert set(ours.keys()) == set(theirs.keys()), (
-            f"scenario {scenario_index}{path}: key sets differ,"
-            f" ours={sorted(ours.keys())} theirs={sorted(theirs.keys())}")
-        return sum(
-            compare_scenario_fields(
-                scenario_index,
-                ours[key],
-                theirs[key],
-                f"{path}.{key}",
-            ) for key in ours)
-    if isinstance(ours, list):
-        assert len(ours) == len(theirs), (
-            f"scenario {scenario_index}{path}: length differs,"
-            f" ours={len(ours)} theirs={len(theirs)}")
-        return sum(
-            compare_scenario_fields(
-                scenario_index,
-                ours_item,
-                theirs_item,
-                f"{path}[{index}]",
-            )
-            for index, (ours_item, theirs_item) in enumerate(zip(ours, theirs)))
-    if fields_disagree(ours, theirs):
-        print(f"DISAGREEMENT scenario {scenario_index}{path}:"
-              f" ours={ours!r} theirs={theirs!r}")
-        return 1
-    return 0
+
+    def __init__(self, scenario_index: int) -> None:
+        self.scenario_index = scenario_index
+
+    def disagreements(self, ours: Any, theirs: Any, path: str) -> int:
+        """Recursively counts the disagreements under one field path."""
+        where = f"scenario {self.scenario_index}{path}"
+        if isinstance(ours, dict):
+            if set(ours) != set(theirs):
+                raise ValueError(
+                    f"{where}: key sets differ,"
+                    f" ours={sorted(ours)} theirs={sorted(theirs)}"
+                )
+            count = 0
+            for key in ours:
+                count += self.disagreements(
+                    ours[key], theirs[key], f"{path}.{key}"
+                )
+            return count
+        if isinstance(ours, list):
+            if len(ours) != len(theirs):
+                raise ValueError(
+                    f"{where}: length differs,"
+                    f" ours={len(ours)} theirs={len(theirs)}"
+                )
+            count = 0
+            for index, (mine, other) in enumerate(zip(ours, theirs)):
+                count += self.disagreements(mine, other, f"{path}[{index}]")
+            return count
+        if fields_disagree(ours, theirs):
+            print(f"DISAGREEMENT {where}: ours={ours!r} theirs={theirs!r}")
+            return 1
+        return 0
 
 
-def run_probe(role: str, shard_path: Path, sample_count: int,
-              environment: dict[str, str]) -> list[dict[str, Any]]:
+class ReaderProbe:
     """Runs reader_probe.py in its own process under one set of protos and
     returns the scenarios it decoded.
     """
-    probe_script = Path(__file__).resolve().with_name("reader_probe.py")
-    completed = subprocess.run(
-        [
+
+    def __init__(self, shard_path: Path, sample_count: int) -> None:
+        self.shard_path = shard_path
+        self.sample_count = sample_count
+        self.script = Path(__file__).resolve().with_name("reader_probe.py")
+
+    def run(self, role: str, environment: dict[str, str]) -> list[Any]:
+        command = [
             sys.executable,
-            str(probe_script),
+            str(self.script),
             "--role",
             role,
             "--shard-path",
-            str(shard_path),
+            str(self.shard_path),
             "--sample-count",
-            str(sample_count),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=environment,
-    )
-    return json.loads(completed.stdout)
+            str(self.sample_count),
+        ]
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=True, env=environment
+        )
+        return json.loads(completed.stdout)
 
 
 def run_check_reader(shard_path: Path, sample_count: int) -> None:
     """Runs reader_probe.py under both proto sets and diffs the decoded
     scenarios field by field, exiting 1 on disagreement.
     """
-    generated_root = Path("/tmp/container_local_protos")
-    generate_container_local_protos(generated_root)
-
+    generate_container_local_protos(CONTAINER_LOCAL_PROTOS)
+    probe = ReaderProbe(shard_path, sample_count)
     # Ours runs with the freshly generated protos first on the path;
     # theirs runs with only Waymo's installed package.
-    ours_environment = {
-        **base_environment(),
-        "PYTHONPATH": f"{generated_root}:{REPOSITORY_ROOT}",
-    }
-    ours_scenarios = run_probe("ours", shard_path, sample_count,
-                               ours_environment)
-    theirs_scenarios = run_probe("theirs", shard_path, sample_count,
-                                 base_environment())
-    assert len(ours_scenarios) == len(theirs_scenarios), (
-        f"ours parsed {len(ours_scenarios)} scenarios, theirs"
-        f" parsed {len(theirs_scenarios)}")
-
-    disagreement_count = sum(
-        compare_scenario_fields(scenario_index, ours, theirs)
-        for scenario_index, (
-            ours, theirs) in enumerate(zip(ours_scenarios, theirs_scenarios)))
+    ours_environment = base_environment()
+    ours_environment["PYTHONPATH"] = (
+        f"{CONTAINER_LOCAL_PROTOS}:{REPOSITORY_ROOT}"
+    )
+    ours_scenarios = probe.run("ours", ours_environment)
+    theirs_scenarios = probe.run("theirs", base_environment())
+    if len(ours_scenarios) != len(theirs_scenarios):
+        raise ValueError(
+            f"ours parsed {len(ours_scenarios)} scenarios,"
+            f" theirs parsed {len(theirs_scenarios)}"
+        )
+    disagreement_count = 0
+    for index, (ours, theirs) in enumerate(
+        zip(ours_scenarios, theirs_scenarios)
+    ):
+        disagreement_count += FieldComparison(index).disagreements(
+            ours, theirs, ""
+        )
     if disagreement_count == 0:
-        print(f"{len(ours_scenarios)} scenarios decoded identically:"
-              f" our protos agree with Waymo's on every field")
-    else:
-        print(f"{disagreement_count} field disagreements across"
-              f" {len(ours_scenarios)} scenarios")
-        sys.exit(1)
+        print(
+            f"{len(ours_scenarios)} scenarios decoded identically:"
+            " our protos agree with Waymo's on every field"
+        )
+        return
+    print(
+        f"{disagreement_count} field disagreements"
+        f" across {len(ours_scenarios)} scenarios"
+    )
+    sys.exit(1)
 
 
 def main() -> None:
@@ -433,24 +456,21 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-
     score_parser = subparsers.add_parser("score")
     score_parser.add_argument("predictions_path", type=Path)
     score_parser.add_argument("staged_directory", type=Path)
-
     check_reader_parser = subparsers.add_parser("check-reader")
     check_reader_parser.add_argument("shard_path", type=Path)
     check_reader_parser.add_argument("sample_count", type=int)
-
     arguments = parser.parse_args()
 
     installed_version = importlib.metadata.version(
-        WAYMO_OPEN_DATASET_DISTRIBUTION_NAME)
+        WAYMO_OPEN_DATASET_DISTRIBUTION_NAME
+    )
     print(f"{WAYMO_OPEN_DATASET_DISTRIBUTION_NAME}=={installed_version}")
-
     if arguments.command == "score":
         run_score(arguments.predictions_path, arguments.staged_directory)
-    elif arguments.command == "check-reader":
+    else:
         run_check_reader(arguments.shard_path, arguments.sample_count)
 
 

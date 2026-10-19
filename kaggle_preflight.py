@@ -1,9 +1,11 @@
 """Checks run before a Kaggle session, that the mounted code matches this
 working copy and that no credential file is present.
 """
+
 from __future__ import annotations
 
-import womd.runtime_env
+import womd.runtime_env  # noqa: F401
+
 import sys
 from pathlib import Path
 
@@ -15,10 +17,14 @@ def assert_working_copy_current(mounted_contract_path: Path | str) -> None:
     copy's staging code version.
     """
     mounted_text = Path(mounted_contract_path).read_text()
-    if (f'STAGING_CODE_VERSION = "{contract.STAGING_CODE_VERSION}"'
-            not in mounted_text):
-        raise SystemExit(f"working copy version {contract.STAGING_CODE_VERSION}"
-                         f" not found in {mounted_contract_path}")
+    if (
+        f'STAGING_CODE_VERSION = "{contract.STAGING_CODE_VERSION}"'
+        not in mounted_text
+    ):
+        raise SystemExit(
+            f"working copy version {contract.STAGING_CODE_VERSION}"
+            f" not found in {mounted_contract_path}"
+        )
 
 
 def assert_no_credentials(working_directory: Path | str) -> None:
@@ -30,7 +36,8 @@ def assert_no_credentials(working_directory: Path | str) -> None:
     for json_path in Path(working_directory).rglob("*.json"):
         json_text = json_path.read_text(errors="ignore")
         if json_path.name == "gcloud.json" or any(
-                marker in json_text for marker in credential_markers):
+            marker in json_text for marker in credential_markers
+        ):
             credential_paths.append(json_path)
     if credential_paths:
         raise SystemExit(

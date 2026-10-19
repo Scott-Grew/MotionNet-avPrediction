@@ -1,7 +1,9 @@
 """Tests for staging, covering file naming, duplicate scenario ids and the
 pinned layout of a staged file.
 """
+
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -40,21 +42,18 @@ def build_fixture_scenario(scenario_id):
     scenario.scenario_id = scenario_id
     scenario.current_time_index = contract.CURRENT_STEP_INDEX
     scenario.sdc_track_index = 0
-    add_track(scenario,
-              track_id=100,
-              object_type=scenario_pb2.Track.TYPE_VEHICLE,
-              base_x=0.0,
-              base_y=0.0)
-    add_track(scenario,
-              track_id=200,
-              object_type=scenario_pb2.Track.TYPE_PEDESTRIAN,
-              base_x=5.0,
-              base_y=5.0)
-    add_track(scenario,
-              track_id=300,
-              object_type=scenario_pb2.Track.TYPE_OTHER,
-              base_x=-5.0,
-              base_y=2.0)
+    vehicle = scenario_pb2.Track.TYPE_VEHICLE
+    pedestrian = scenario_pb2.Track.TYPE_PEDESTRIAN
+    other = scenario_pb2.Track.TYPE_OTHER
+    add_track(
+        scenario, track_id=100, object_type=vehicle, base_x=0.0, base_y=0.0
+    )
+    add_track(
+        scenario, track_id=200, object_type=pedestrian, base_x=5.0, base_y=5.0
+    )
+    add_track(
+        scenario, track_id=300, object_type=other, base_x=-5.0, base_y=2.0
+    )
     scenario.tracks_to_predict.add().track_index = 1
     scenario.objects_of_interest.append(300)
 
@@ -122,13 +121,14 @@ def stage_fixture(tmp_path):
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
-    written_paths, _ = stage.stage_shards([shard_path], output_directory)
-    return np.load(written_paths[0])
+    report = stage.Stager(output_directory, skip_existing=False).shards(
+        [shard_path]
+    )
+    return np.load(report.written[0])
 
 
 def pinned_dtype(array):
-    """The dtype as the pin file records it; every string width counts as str.
-    """
+    """The dtype as the pin file records it; any string width counts as str."""
     if array.dtype.kind == "U":
         return "str"
     return str(array.dtype)
@@ -136,51 +136,47 @@ def pinned_dtype(array):
 
 def staged_structure(scenario_file):
     """The shape and dtype of every array in a staged file."""
-    return {
-        key: {
-            "shape": list(scenario_file[key].shape),
-            "dtype": pinned_dtype(scenario_file[key]),
-        } for key in sorted(scenario_file.files)
-    }
+    structure = {}
+    for key in sorted(scenario_file.files):
+        array = scenario_file[key]
+        structure[key] = {
+            "shape": list(array.shape),
+            "dtype": pinned_dtype(array),
+        }
+    return structure
 
 
 def write_staging_pin():
     """Rewrites the pin file from the current staging code. Run by hand after a
     deliberate layout change.
     """
-    import tempfile
-
     with tempfile.TemporaryDirectory() as temporary_directory:
         structure = staged_structure(stage_fixture(Path(temporary_directory)))
     STAGING_PIN_PATH.write_text(json.dumps(structure, indent=2) + "\n")
 
 
-def test_staging_names_files_by_scenario_id(tmp_path,):
-    """Each scenario becomes one file named by its scenario id, across shards.
-    """
+def test_staging_names_files_by_scenario_id(tmp_path):
+    """Each scenario becomes one file named by its id, across shards."""
     first_shard = tmp_path / "training.tfrecord-00000-of-01000"
     second_shard = tmp_path / "training.tfrecord-00001-of-01000"
     write_shard(
         first_shard,
-        [
-            build_fixture_scenario("aaa111"),
-            build_fixture_scenario("bbb222"),
-        ],
+        [build_fixture_scenario("aaa111"), build_fixture_scenario("bbb222")],
     )
     write_shard(second_shard, [build_fixture_scenario("ccc333")])
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
 
-    written_paths, spacing_deviations = stage.stage_shards(
-        [first_shard, second_shard], output_directory)
+    stager = stage.Stager(output_directory, skip_existing=False)
+    report = stager.shards([first_shard, second_shard])
 
-    assert sorted(path.name for path in written_paths) == [
+    assert sorted(path.name for path in report.written) == [
         "aaa111.npz",
         "bbb222.npz",
         "ccc333.npz",
     ]
-    assert all(path.exists() for path in written_paths)
-    assert len(spacing_deviations) == len(written_paths)
+    assert all(path.exists() for path in report.written)
+    assert len(report.spacing_deviations) == len(report.written)
 
 
 def test_duplicate_scenario_ids_are_refused(tmp_path):
@@ -194,8 +190,9 @@ def test_duplicate_scenario_ids_are_refused(tmp_path):
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
 
-    with pytest.raises(AssertionError):
-        stage.stage_shards([first_shard, second_shard], output_directory)
+    stager = stage.Stager(output_directory, skip_existing=False)
+    with pytest.raises(FileExistsError):
+        stager.shards([first_shard, second_shard])
 
 
 def test_staged_structure_matches_pin(tmp_path):

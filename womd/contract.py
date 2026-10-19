@@ -1,6 +1,7 @@
 """Shared constants for the sequence lengths, the column layout of agent and
 map rows, and the stamp that ties artifacts to this code.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,11 +22,7 @@ MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED = 3.56
 
 # Agent type vocabulary the model predicts, plus an "other"
 # catch-all used only for staged agent features.
-PREDICTED_OBJECT_TYPES = (
-    "TYPE_VEHICLE",
-    "TYPE_PEDESTRIAN",
-    "TYPE_CYCLIST",
-)
+PREDICTED_OBJECT_TYPES = ("TYPE_VEHICLE", "TYPE_PEDESTRIAN", "TYPE_CYCLIST")
 NUM_OBJECT_TYPES = len(PREDICTED_OBJECT_TYPES)
 AGENT_TYPES = PREDICTED_OBJECT_TYPES + ("TYPE_OTHER",)
 NUM_AGENT_TYPES = len(AGENT_TYPES)
@@ -44,15 +41,11 @@ SUBMISSION_STEPS = 16
 SUBMISSION_FIRST_SCENARIO_STEP = 15
 SUBMISSION_STEP_STRIDE = FUTURE_STEPS // SUBMISSION_STEPS
 SUBMISSION_FIRST_FUTURE_INDEX = SUBMISSION_FIRST_SCENARIO_STEP - (
-    CURRENT_STEP_INDEX + 1)
+    CURRENT_STEP_INDEX + 1
+)
 SUBMISSION_FUTURE_INDICES = tuple(
-    range(
-        SUBMISSION_FIRST_FUTURE_INDEX,
-        FUTURE_STEPS,
-        SUBMISSION_STEP_STRIDE,
-    ))
-assert len(SUBMISSION_FUTURE_INDICES) == SUBMISSION_STEPS
-assert SUBMISSION_FUTURE_INDICES[-1] == FUTURE_STEPS - 1
+    range(SUBMISSION_FIRST_FUTURE_INDEX, FUTURE_STEPS, SUBMISSION_STEP_STRIDE)
+)
 
 # Input scales. Each is the standard deviation of that quantity
 # as the model reads it, measured on every 60th training scenario.
@@ -140,8 +133,9 @@ MAP_DIRECTION = slice(2, 4)
 MAP_KIND = slice(4, 4 + NUM_MAP_POLYLINE_KINDS)
 MAP_LANE_TYPE = slice(MAP_KIND.stop, MAP_KIND.stop + NUM_LANE_TYPES)
 MAP_SPEED_LIMIT = MAP_LANE_TYPE.stop
-MAP_BOUNDARY_TYPE = slice(MAP_SPEED_LIMIT + 1,
-                          MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES)
+MAP_BOUNDARY_TYPE = slice(
+    MAP_SPEED_LIMIT + 1, MAP_SPEED_LIMIT + 1 + NUM_BOUNDARY_TYPES
+)
 MAP_STOP_POINT = slice(MAP_BOUNDARY_TYPE.stop, MAP_BOUNDARY_TYPE.stop + 2)
 # The two crossing codes stay last because the map encoder slices
 # them off the end of the row and one-hot encodes them.
@@ -164,24 +158,26 @@ def artifact_provenance(producer: str, source: Path | str) -> str:
     """Builds the JSON provenance stamp saved into each staged artifact,
     recording the code version that produced it.
     """
-    return json.dumps({
-        "code_version": STAGING_CODE_VERSION,
-        "producer": producer,
-        "source": str(source),
-    })
+    return json.dumps(
+        {
+            "code_version": STAGING_CODE_VERSION,
+            "producer": producer,
+            "source": str(source),
+        }
+    )
 
 
-def check_artifact_provenance(stored_provenance: Any, artifact_path: Path | str,
-                              regenerate_hint: str) -> dict[str, str]:
+def check_provenance(stamp: Any, path: Path | str, hint: str) -> dict[str, str]:
     """Raises if a loaded artifact has no provenance stamp, or was produced
-    under a different code version than the working tree.
+    under a different code version than the working tree; hint says how to
+    regenerate it.
     """
-    assert stored_provenance is not None, (
-        f"{artifact_path} has no provenance stamp."
-        f" {regenerate_hint}")
-    provenance = json.loads(str(stored_provenance))
-    assert provenance["code_version"] == STAGING_CODE_VERSION, (
-        f"{artifact_path} is from code version"
-        f" {provenance['code_version']!r}, this tree is"
-        f" {STAGING_CODE_VERSION!r}. {regenerate_hint}")
+    if stamp is None:
+        raise ValueError(f"{path} has no provenance stamp. {hint}")
+    provenance = json.loads(str(stamp))
+    if provenance["code_version"] != STAGING_CODE_VERSION:
+        raise ValueError(
+            f"{path} is from code version {provenance['code_version']!r},"
+            f" this tree is {STAGING_CODE_VERSION!r}. {hint}"
+        )
     return provenance

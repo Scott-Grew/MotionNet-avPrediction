@@ -1,11 +1,13 @@
 """Tests for the map rows and the scene-frame resampling in womd/store.py."""
+
 import numpy as np
 
 from womd import contract, store
+from womd.frame_ops import Frame
 from womd_protos import map_pb2
 
-WORLD_ORIGIN = np.zeros(2)
-WORLD_HEADING = 0.0
+WORLD_FRAME = Frame(np.zeros(2), 0.0)
+NO_SIGNALS = store.TrafficSignals({}, {})
 
 
 def polyline_feature(kind, points, feature_id=1):
@@ -53,19 +55,16 @@ def test_map_rows_layout_for_all_seven_kinds():
     ]
 
     lane_signal_history = np.zeros(
-        (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES))
+        (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
+    )
     lane_signal_history[:, 6] = 1.0
-    signal_histories = {7: lane_signal_history}
-    signal_stop_points = {7: np.array([9.0, 1.0])}
+    signals = store.TrafficSignals(
+        {7: lane_signal_history}, {7: np.array([9.0, 1.0])}
+    )
+    stager = store.MapStager(WORLD_FRAME, signals)
 
     for kind_index, feature in enumerate(features):
-        rows = store.map_feature_rows(
-            feature,
-            WORLD_ORIGIN,
-            WORLD_HEADING,
-            signal_histories,
-            signal_stop_points,
-        )
+        rows = stager.rows(feature)
         kind = contract.MAP_POLYLINE_KINDS[kind_index]
 
         assert rows is not None, kind
@@ -75,27 +74,28 @@ def test_map_rows_layout_for_all_seven_kinds():
         assert np.all(kind_block.sum(axis=1) == 1.0)
         assert np.all(kind_block[:, kind_index] == 1.0)
 
-        signal_history = store.map_feature_signal_history(
-            feature, signal_histories)
-        detail_block = rows[:, contract.MAP_KIND.stop:]
+        signal_history = stager.signal_history(feature)
+        detail_block = rows[:, contract.MAP_KIND.stop :]
+        hot_columns = (
+            np.flatnonzero(detail_block.any(axis=0)) + contract.MAP_KIND.stop
+        )
         if kind == "lane":
             assert np.all(signal_history == lane_signal_history)
             assert np.all(rows[:, contract.MAP_LANE_TYPE.start + 2] == 1.0)
             assert np.all(rows[:, contract.MAP_SPEED_LIMIT] == 45.0)
             assert np.all(rows[:, contract.MAP_BOUNDARY_TYPE] == 0.0)
             assert np.all(
-                rows[:, contract.MAP_STOP_POINT] == signal_stop_points[7])
+                rows[:, contract.MAP_STOP_POINT] == signals.stop_points[7]
+            )
         elif kind == "road_line":
-            hot_columns = (np.flatnonzero(detail_block.any(axis=0)) +
-                           contract.MAP_KIND.stop)
             assert list(hot_columns) == [contract.MAP_BOUNDARY_TYPE.start + 2]
         elif kind == "road_edge":
-            hot_columns = (np.flatnonzero(detail_block.any(axis=0)) +
-                           contract.MAP_KIND.stop)
-            assert list(hot_columns) == [
-                contract.MAP_BOUNDARY_TYPE.start +
-                len(contract.ROAD_LINE_TYPES) + 1
-            ]
+            edge_column = (
+                contract.MAP_BOUNDARY_TYPE.start
+                + len(contract.ROAD_LINE_TYPES)
+                + 1
+            )
+            assert list(hot_columns) == [edge_column]
         else:
             assert np.all(signal_history == 0.0)
             assert np.all(detail_block == 0.0)
@@ -108,25 +108,22 @@ def test_fill_bridges_measured_worst_case_shapes():
     """A 159.8 m two-point road edge and a 62 m corners-only crosswalk are both
     filled so no gap exceeds the dot spacing.
     """
-    endpoint_pair_edge = polyline_feature("road_edge", [(0.0, 0.0),
-                                                        (159.8, 0.0)])
-    edge_points, edge_directions, _, _ = store.map_feature_to_scene_frame(
-        endpoint_pair_edge, WORLD_ORIGIN, WORLD_HEADING)
-    assert (len(edge_points) == int(
-        np.ceil(159.8 / contract.MAP_POINT_SPACING_METRES)) + 1)
-    edge_gaps = np.linalg.norm(np.diff(edge_points, axis=0), axis=1)
-    assert np.all(edge_gaps <= contract.MAP_POINT_SPACING_METRES + 1e-9)
-    assert np.allclose(np.linalg.norm(edge_directions, axis=1), 1.0)
-
-    corners_only_crosswalk = polygon_feature(
-        "crosswalk",
-        [(0.0, 0.0), (62.0, 0.0), (62.0, 62.0), (0.0, 62.0)],
+    spacing = contract.MAP_POINT_SPACING_METRES
+    endpoint_pair_edge = polyline_feature(
+        "road_edge", [(0.0, 0.0), (159.8, 0.0)]
     )
-    ring_points, _, _, _ = store.map_feature_to_scene_frame(
-        corners_only_crosswalk, WORLD_ORIGIN, WORLD_HEADING)
-    ring_gaps = np.linalg.norm(np.diff(ring_points, axis=0), axis=1)
-    assert np.all(ring_gaps <= contract.MAP_POINT_SPACING_METRES + 1e-9)
-    assert np.allclose(ring_points[0], ring_points[-1])
+    edge = store.feature_in_scene(endpoint_pair_edge, WORLD_FRAME)
+    assert len(edge.points) == int(np.ceil(159.8 / spacing)) + 1
+    edge_gaps = np.linalg.norm(np.diff(edge.points, axis=0), axis=1)
+    assert np.all(edge_gaps <= spacing + 1e-9)
+    assert np.allclose(np.linalg.norm(edge.directions, axis=1), 1.0)
+
+    corners = [(0.0, 0.0), (62.0, 0.0), (62.0, 62.0), (0.0, 62.0)]
+    corners_only_crosswalk = polygon_feature("crosswalk", corners)
+    ring = store.feature_in_scene(corners_only_crosswalk, WORLD_FRAME)
+    ring_gaps = np.linalg.norm(np.diff(ring.points, axis=0), axis=1)
+    assert np.all(ring_gaps <= spacing + 1e-9)
+    assert np.allclose(ring.points[0], ring.points[-1])
 
 
 def test_crop_keeps_polyline_crossing_the_boundary():
@@ -134,13 +131,11 @@ def test_crop_keeps_polyline_crossing_the_boundary():
     drops the rest.
     """
     crossing_edge = polyline_feature("road_edge", [(-300.0, 1.0), (300.0, 1.0)])
-    scene_points, scene_directions, _, _ = store.map_feature_to_scene_frame(
-        crossing_edge, WORLD_ORIGIN, WORLD_HEADING)
-    assert len(scene_points) > 600.0 / contract.MAP_POINT_SPACING_METRES * 0.9
-    assert len(scene_points) == len(scene_directions)
-    assert np.all(
-        np.linalg.norm(scene_points, axis=1) <=
-        contract.STAGING_CROP_RADIUS_METRES)
+    scene = store.feature_in_scene(crossing_edge, WORLD_FRAME)
+    assert len(scene.points) > 600.0 / contract.MAP_POINT_SPACING_METRES * 0.9
+    assert len(scene.points) == len(scene.directions)
+    distances = np.linalg.norm(scene.points, axis=1)
+    assert np.all(distances <= contract.STAGING_CROP_RADIUS_METRES)
 
 
 def test_crossing_codes_survive_resampling():
@@ -158,7 +153,7 @@ def test_crossing_codes_survive_resampling():
     left_boundary.boundary_feature_id = 31
     left_boundary.boundary_type = 3
 
-    rows = store.map_feature_rows(lane, WORLD_ORIGIN, WORLD_HEADING, {}, {})
+    rows = store.MapStager(WORLD_FRAME, NO_SIGNALS).rows(lane)
     left_codes = rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING]
 
     assert len(rows) == int(60.0 / contract.MAP_POINT_SPACING_METRES) + 1
