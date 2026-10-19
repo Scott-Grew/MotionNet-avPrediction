@@ -22,16 +22,7 @@ Track = scenario_pb2.Track
 MapFeature = map_pb2.MapFeature
 
 
-class FeaturePoints(NamedTuple):
-    """The world-frame points of one map feature and the kind it is."""
-
-    points: np.ndarray  # (N, 2)
-    kind_index: int
-
-
 class SceneFeature(NamedTuple):
-    """One map feature resampled to dots in the scene frame."""
-
     points: np.ndarray  # (D, 2)
     directions: np.ndarray  # (D, 2) unit vectors
     crossing_codes: np.ndarray  # (D, 2) left and right boundary codes
@@ -125,9 +116,9 @@ def track_valid(track: Track) -> np.ndarray:
     return np.array([state.valid for state in track.states])
 
 
-def feature_points(feature: MapFeature) -> FeaturePoints | None:
-    """One map feature's raw world-frame points and its kind index, or None if
-    the feature has no usable geometry.
+def feature_points(feature: MapFeature) -> np.ndarray | None:
+    """One map feature's raw world-frame points (N, 2), or None if the
+    feature has no usable geometry.
     """
     kind_name = feature.WhichOneof("feature_data")
     if kind_name is None:
@@ -144,10 +135,7 @@ def feature_points(feature: MapFeature) -> FeaturePoints | None:
         raw_points = getattr(feature, kind_name).polyline
     if len(raw_points) == 0:
         return None
-    world_points = np.array([[point.x, point.y] for point in raw_points])
-    return FeaturePoints(
-        world_points, contract.MAP_POLYLINE_KINDS.index(kind_name)
-    )
+    return np.array([[point.x, point.y] for point in raw_points])
 
 
 def arc_lengths(points: np.ndarray) -> np.ndarray:
@@ -221,11 +209,11 @@ def feature_in_scene(feature: MapFeature, frame: Frame) -> SceneFeature | None:
     """Resamples a map feature to one-metre dots, derives directions and
     crossing codes, and keeps the dots inside the staging radius.
     """
-    geometry = feature_points(feature)
-    if geometry is None:
+    points = feature_points(feature)
+    if points is None:
         return None
-    lengths = arc_lengths(geometry.points)
-    spaced = resample_polyline(geometry.points)
+    lengths = arc_lengths(points)
+    spaced = resample_polyline(points)
     directions = polyline_directions(spaced)
     codes = crossing_codes(feature, lengths)
     scene_points = frame_ops.positions_to_frame(spaced, frame)
@@ -238,14 +226,11 @@ def feature_in_scene(feature: MapFeature, frame: Frame) -> SceneFeature | None:
         scene_points[inside],
         scene_directions[inside],
         codes[inside],
-        geometry.kind_index,
+        contract.MAP_POLYLINE_KINDS.index(feature.WhichOneof("feature_data")),
     )
 
 
 def traffic_signals(scenario: scenario_pb2.Scenario) -> TrafficSignals:
-    """Each signalled lane's one-hot state per history step and its stop
-    point.
-    """
     histories: dict[int, np.ndarray] = {}
     stop_points: dict[int, np.ndarray] = {}
     history_states = scenario.dynamic_map_states[: contract.HISTORY_STEPS]
@@ -365,7 +350,6 @@ def worst_spacing_deviation(scenario: scenario_pb2.Scenario) -> float:
 
 
 def staged_file(scenario: scenario_pb2.Scenario) -> StagedFile:
-    """One scenario's tracks and map, in its scene frame."""
     if scenario.current_time_index != contract.CURRENT_STEP_INDEX:
         raise ValueError(
             f"current_time_index {scenario.current_time_index},"

@@ -19,26 +19,16 @@ import torch
 from torch import Tensor, nn
 from torch.utils.tensorboard import SummaryWriter
 
-from womd import loss, pipeline
+from womd import contract, loss, pipeline
 from womd.checkpoint import (
     GradScaler,
-    Progress,
-    TrainingObjects,
-    checkpoint_of,
     load_anchor_file,
     load_checkpoint,
     previous_path,
     save_checkpoint,
 )
 from womd.loader import SceneBatch
-from womd.metrics import (
-    LOG_EVERY_BATCHES,
-    EpochProgress,
-    EpochSummary,
-    StepOutcome,
-    TrainingStep,
-    epoch_scalars,
-)
+from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars
 from womd.model import MotionPredictor
 from womd.pipeline import BatchSettings
 
@@ -49,7 +39,6 @@ WEIGHT_DECAY = 0.01
 SECONDS_PER_HOUR = 3600
 
 Batches = Iterable[SceneBatch]
-Scalars = dict[str, float]
 
 
 class EpochPlan(NamedTuple):
@@ -129,19 +118,6 @@ def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
     ]
 
 
-def remaining_epochs(completed: int, requested: int) -> range:
-    """The epochs still to train; a resumed run restarts at the first epoch
-    its checkpoint has not finished.
-    """
-    return range(completed, requested)
-
-
-def training_step(predictor: nn.Module, batch: SceneBatch) -> TrainingStep:
-    """Runs the predictor on a batch and returns its losses and predictions."""
-    predicted = predictor(batch)
-    return TrainingStep(loss.loss_terms(predicted, batch.targets), predicted)
-
-
 def training_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -184,12 +160,11 @@ class TrainingRun:
         self.device = training_device()
         torch.manual_seed(arguments.seed)
         anchors = load_anchor_file(arguments.anchors)
-        predictor = MotionPredictor(anchors).to(self.device)
-        groups = parameter_groups(predictor)
-        optimizer = torch.optim.AdamW(groups, lr=arguments.learning_rate)
+        self.predictor = MotionPredictor(anchors).to(self.device)
+        groups = parameter_groups(self.predictor)
+        self.optimizer = torch.optim.AdamW(groups, lr=arguments.learning_rate)
         scaling = arguments.mixed_precision and self.device.type == "cuda"
-        scaler = GradScaler(enabled=scaling)
-        self.trained = TrainingObjects(predictor, optimizer, scaler)
+        self.scaler = GradScaler(enabled=scaling)
         self.completed_epochs, stored_plan = self.resume()
 
         self.paths = sorted(arguments.staged_directory.glob("*.npz"))
@@ -217,11 +192,11 @@ class TrainingRun:
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
-        self.trained.predictor.load_state_dict(checkpoint["model_state"])
-        self.trained.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        self.predictor.load_state_dict(checkpoint["model_state"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         if "gradient_scaler_state" in checkpoint:
             scaler_state = checkpoint["gradient_scaler_state"]
-            self.trained.scaler.load_state_dict(scaler_state)
+            self.scaler.load_state_dict(scaler_state)
         completed = checkpoint["completed_epochs"]
         print(f"resuming {path}: {completed} epochs complete", flush=True)
         stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
@@ -276,63 +251,70 @@ class TrainingRun:
         return Schedule(peak, arguments.warmup_steps, decay_start, decay_end)
 
     def save(self, completed_epochs: int) -> None:
-        plan = self.plan._asdict()
-        progress = Progress(self.arguments.seed, completed_epochs, plan)
-        state = checkpoint_of(self.trained, progress)
+        model_state = self.predictor.state_dict()
+        state = {
+            "model_state": model_state,
+            "optimizer_state": self.optimizer.state_dict(),
+            "gradient_scaler_state": self.scaler.state_dict(),
+            "completed_epochs": completed_epochs,
+            "seed": self.arguments.seed,
+            "code_version": contract.STAGING_CODE_VERSION,
+            "epoch_plan": self.plan._asdict(),
+        }
         save_checkpoint(self.arguments.checkpoint_path, state)
 
-    def optimise(self, total: Tensor, rate: float) -> StepOutcome:
+    def optimise(self, total: Tensor, rate: float) -> tuple[bool, bool]:
         """Sets this step's rate, then backward pass, gradient clip and
-        optimiser step.
+        optimiser step. Returns whether the gradient was clipped and whether
+        the scaler skipped the step over non-finite gradients.
         """
-        trained = self.trained
         clip = self.arguments.gradient_clip_norm
-        for group in trained.optimizer.param_groups:
+        for group in self.optimizer.param_groups:
             group["lr"] = rate
-        trained.optimizer.zero_grad()
-        trained.scaler.scale(total).backward()
-        trained.scaler.unscale_(trained.optimizer)
-        parameters = trained.predictor.parameters()
+        self.optimizer.zero_grad()
+        self.scaler.scale(total).backward()
+        self.scaler.unscale_(self.optimizer)
+        parameters = self.predictor.parameters()
         gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
-        trained.scaler.step(trained.optimizer)
+        self.scaler.step(self.optimizer)
         # The scaler lowers its scale only when it skipped a step over
         # non-finite gradients, which is how skips are detected.
-        scale_before = trained.scaler.get_scale()
-        trained.scaler.update()
-        skipped = trained.scaler.get_scale() < scale_before
-        return StepOutcome(float(gradient_norm) > clip, skipped)
+        scale_before = self.scaler.get_scale()
+        self.scaler.update()
+        skipped = self.scaler.get_scale() < scale_before
+        return float(gradient_norm) > clip, skipped
 
-    def train_epoch(self, batches: Batches, epoch_index: int) -> EpochSummary:
+    def train_epoch(self, batches: Batches, epoch_index: int) -> Scalars:
         """One pass over the data: forward and loss, the optimiser step and
         the monitor for each batch, then a log line every LOG_EVERY_BATCHES
         and a checkpoint every --checkpoint-every-seconds.
         """
         progress = EpochProgress(self.device)
         steps_before = epoch_index * self.plan.steps_per_epoch
-        mixed_precision = self.trained.scaler.is_enabled()
+        mixed_precision = self.scaler.is_enabled()
         last_checkpoint = time.perf_counter()
         for batch in batches:
             batch = batch.each(lambda array: array.to(self.device))
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
-                step = training_step(self.trained.predictor, batch)
+                predicted = self.predictor(batch)
+                losses = loss.loss_terms(predicted, batch.targets)
             global_step = steps_before + progress.batch_count
             rate = self.schedule.at(global_step)
-            outcome = self.optimise(step.losses.total, rate)
-            loss_is_finite = progress.record(step, outcome)
-            progress.monitor_batch(step, batch.targets)
+            clipped, skipped = self.optimise(losses.total, rate)
+            loss_is_finite = progress.record(losses, clipped, skipped)
+            progress.monitor_batch(predicted, batch.targets)
 
             if progress.batch_count % LOG_EVERY_BATCHES == 0:
                 heading = f"  batch {progress.batch_count}"
                 scalars = progress.log_scalars(rate)
                 self.reporter.report(heading, scalars, global_step + 1)
 
-            # Timed checkpoint, skipped while the loss is non-finite.
             seconds = time.perf_counter() - last_checkpoint
             if seconds >= self.arguments.checkpoint_every_seconds:
                 if loss_is_finite:
                     self.save(epoch_index)
                 last_checkpoint = time.perf_counter()
-        return progress.summary()
+        return progress.epoch_scalars()
 
     def stop_message(self, prefix: str, elapsed: float, completed: int) -> str:
         arguments = self.arguments
@@ -349,7 +331,7 @@ class TrainingRun:
         after each finished epoch.
         """
         arguments = self.arguments
-        remaining = remaining_epochs(self.completed_epochs, arguments.epochs)
+        remaining = range(self.completed_epochs, arguments.epochs)
         budget = arguments.stop_after_seconds
         start = time.perf_counter()
         last_epoch_seconds = 0.0
@@ -365,18 +347,18 @@ class TrainingRun:
             epoch_start = time.perf_counter()
             settings = self.batch_settings(epoch_index)
             batches = pipeline.batches(self.paths, settings)
-            summary = self.train_epoch(batches, epoch_index)
+            scalars = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
             heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
-            scalars = epoch_scalars(summary)
             self.reporter.report(heading, scalars, epoch_index + 1)
 
-            if math.isfinite(summary.losses.total):
+            total = scalars["epoch/loss_total"]
+            if math.isfinite(total):
                 self.save(epoch_index + 1)
             else:
                 print(
-                    f"epoch {epoch_index + 1} mean total loss"
-                    f" {summary.losses.total}, checkpoint left as it was"
+                    f"epoch {epoch_index + 1} mean total loss {total},"
+                    f" checkpoint left as it was"
                 )
 
             elapsed = time.perf_counter() - start

@@ -7,3 +7,4 @@ grpcio-tools==1.62.3
 pytest==9.0.3
 onnx==1.17.0
 onnxruntime==1.23.2
+foxglove-sdk==0.27.0

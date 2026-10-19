@@ -50,9 +50,11 @@ free Kaggle GPU. Not comparable to the public leaderboard.
 4. At prediction time the 54 are ranked by confidence, near-duplicates
    are dropped, and the six highest are kept. (`womd/pruning.py`,
    `submit.py`)
+5. The whole path from a scene to its six kept paths exports as one
+   ONNX graph, checked against PyTorch. (`export_onnx.py`)
 
 The exact inputs the model reads are drawn, column by column, at the
-bottom of `womd/loader.py`.
+bottom of `womd/contract.py`.
 
 ## Architecture
 
@@ -71,8 +73,14 @@ make stage     # turn raw WOMD shards into one .npz per scene
 make anchors   # fit the 54 anchors per road-user type
 make train     # train, resuming from the checkpoint if one exists
 make predict   # write the model's predictions for the staged scenes
-make score     # score the checkpoint with Waymo's metrics, in Docker
+make score     # score the checkpoint on the staged scenes, in Docker
+make export    # export to ONNX, check it against PyTorch, time both
+make live      # play staged scenes with live predictions
 ```
+
+To watch, open Lichtblick, import `lichtblick_layout.json` from the
+Layouts tab, run `make live`, then choose Open connection, Foxglove
+WebSocket and `ws://127.0.0.1:8765`.
 
 ## References
 

@@ -13,7 +13,7 @@ from torch import Tensor, nn
 
 from womd import contract
 from womd.loader import MapArrays, SceneBatch
-from womd.view import target_view
+from womd.view import token_poses, visible_tokens
 
 # Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
@@ -33,6 +33,9 @@ QUERY_INITIALISATION_SCALE = 0.02
 # floor the likelihood rewards ever-narrower Gaussians.
 MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
+
+# Tokens with a mask of which are real, (..., N, hidden) and (..., N).
+Tokens = tuple[Tensor, Tensor]
 
 # torch's own pre-norm transformer layers, with no dropout.
 TRANSFORMER_LAYER_SETTINGS = {
@@ -64,13 +67,6 @@ class Memory(NamedTuple):
 
     tokens: Tensor  # (targets, 1 + agents + chunks, hidden)
     present: Tensor  # (targets, 1 + agents + chunks)
-
-
-class Pooled(NamedTuple):
-    """One token per map chunk slot, and whether any dot filled the slot."""
-
-    tokens: Tensor  # (batch, chunks, hidden)
-    present: Tensor  # (batch, chunks)
 
 
 def agent_feature_divisors() -> Tensor:
@@ -158,9 +154,9 @@ class MapDotEncoder(nn.Module):
         return self.network(features)
 
 
-def pool_chunks(dots: Tensor, scene_map: MapArrays) -> Pooled:
+def pool_chunks(dots: Tensor, scene_map: MapArrays) -> Tokens:
     """Max-pools each scene's dot tokens (S, D, hidden) into its chunk tokens
-    (S, C, hidden); a chunk with no dots is absent.
+    (S, C, hidden), and marks which chunks any dot reached (S, C).
     """
     scene_count, dot_count, hidden = dots.shape
     chunk_count = scene_map.chunk_pose.shape[1]
@@ -178,7 +174,7 @@ def pool_chunks(dots: Tensor, scene_map: MapArrays) -> Pooled:
     tokens = tokens.view(scene_count, chunk_count, hidden)
     present = tokens[..., 0] > float("-inf")
     tokens = torch.where(present[..., None], tokens, torch.zeros_like(tokens))
-    return Pooled(tokens, present)
+    return tokens, present
 
 
 def initialise_attention(attention: nn.MultiheadAttention) -> None:
@@ -231,7 +227,7 @@ class SceneEncoder(nn.Module):
             scene_attention_layer() for _ in range(SCENE_ATTENTION_ROUNDS)
         )
 
-    def scene_tokens(self, batch: SceneBatch) -> tuple[Tensor, Tensor]:
+    def scene_tokens(self, batch: SceneBatch) -> Tokens:
         """Tokens (scenes, agents + chunks, hidden), in that order, after
         self-attention, and a mask of which tokens are real.
         """
@@ -244,13 +240,13 @@ class SceneEncoder(nn.Module):
         agent_tokens = agent_motion + self.signal_projection(agent_signals)
 
         dot_embeddings = self.map_encoder(scene_map.rows)
-        pooled = pool_chunks(dot_embeddings, scene_map)
+        chunk_tokens, chunk_present = pool_chunks(dot_embeddings, scene_map)
         chunk_signals = scene_map.chunk_signal_history.flatten(start_dim=-2)
-        map_tokens = pooled.tokens + self.signal_projection(chunk_signals)
+        map_tokens = chunk_tokens + self.signal_projection(chunk_signals)
 
         tokens = torch.cat([agent_tokens, map_tokens], dim=1)
         agent_present = scene.agent_history_mask.any(dim=-1)
-        present = torch.cat([agent_present, pooled.present], dim=1)
+        present = torch.cat([agent_present, chunk_present], dim=1)
         for layer in self.layers:
             tokens = layer(tokens, src_key_padding_mask=~present)
         return tokens, present
@@ -269,18 +265,16 @@ class SceneEncoder(nn.Module):
         own_token = (
             own_motion + self.signal_projection(own_signals)
         ).unsqueeze(1)
-        own_present = torch.ones(
-            own_token.shape[:2], dtype=torch.bool, device=own_token.device
-        )
+        own_present = torch.ones_like(own_token[..., 0], dtype=torch.bool)
 
         # A scene with several targets is repeated once per target, each copy
         # seen from that target's frame and masked to its crop.
-        view = target_view(batch)
-        pose_embedding = self.pose_projection(view.pose / self.pose_divisors)
+        poses = token_poses(batch)
+        pose_embedding = self.pose_projection(poses / self.pose_divisors)
         scene_tokens = tokens.index_select(0, targets.scene_index)
         target_tokens = scene_tokens + pose_embedding
         scene_present = present.index_select(0, targets.scene_index)
-        view_present = scene_present & view.visible
+        view_present = scene_present & visible_tokens(batch)
         memory_tokens = torch.cat([own_token, target_tokens], dim=1)
         memory_present = torch.cat([own_present, view_present], dim=1)
         return Memory(memory_tokens, memory_present)
@@ -396,8 +390,6 @@ class ModeDecoder(nn.Module):
 
 
 class MotionPredictor(nn.Module):
-    """Top-level model, the scene encoder's memory feeding the mode decoder."""
-
     def __init__(self, unit_anchors: Tensor) -> None:
         super().__init__()
         self.scene_encoder = SceneEncoder()

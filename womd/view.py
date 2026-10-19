@@ -6,8 +6,6 @@ part of the exported ONNX graph too.
 
 from __future__ import annotations
 
-from typing import NamedTuple
-
 import torch
 from torch import Tensor
 
@@ -22,43 +20,20 @@ STRETCH_GAIN = 0.5
 HEADING = slice(contract.AGENT_HEADING_COSINE, contract.AGENT_HEADING_SINE + 1)
 
 
-class TargetFrames(NamedTuple):
-    """Each target's own frame at the current step, in the scene frame."""
-
-    origin: Tensor  # (B, 2) metres
-    cosine: Tensor  # (B,) of the heading
-    sine: Tensor  # (B,)
-    speed: Tensor  # (B,) metres per second
-
-
-class TargetView(NamedTuple):
-    """Each target's view of its scene's tokens, agents then map chunks."""
-
-    pose: Tensor  # (B, A + C, 4) x, y, cos, sin in the target's frame
-    visible: Tensor  # (B, A + C) inside the crop and not the target itself
-
-
-def target_frames(batch: SceneBatch) -> TargetFrames:
-    """Each target's frame and speed, as the loader wrote them."""
-    targets = batch.targets
-    pose = targets.frame_pose
-    return TargetFrames(pose[:, :2], pose[:, 2], pose[:, 3], targets.speed)
-
-
-def rotate_into(vectors: Tensor, frames: TargetFrames) -> Tensor:
+def rotate_into(vectors: Tensor, frame_pose: Tensor) -> Tensor:
     """Vectors (B, N, 2) in the scene frame, rotated into each target's frame
-    by x' = x cos h + y sin h and y' = y cos h - x sin h for heading h.
+    (B, 4) by x' = x cos h + y sin h and y' = y cos h - x sin h for heading h.
     """
-    cosine = frames.cosine[:, None]
-    sine = frames.sine[:, None]
+    cosine = frame_pose[:, 2, None]
+    sine = frame_pose[:, 3, None]
     x = vectors[..., 0]
     y = vectors[..., 1]
     return torch.stack([x * cosine + y * sine, y * cosine - x * sine], dim=-1)
 
 
-def positions_into(points: Tensor, frames: TargetFrames) -> Tensor:
-    centred = points - frames.origin[:, None, :]
-    return rotate_into(centred, frames)
+def positions_into(points: Tensor, frame_pose: Tensor) -> Tensor:
+    centred = points - frame_pose[:, None, :2]
+    return rotate_into(centred, frame_pose)
 
 
 def inside_crop(points: Tensor, stretch: Tensor) -> Tensor:
@@ -96,12 +71,13 @@ def agent_poses(scene: SceneArrays) -> Tensor:
     return torch.cat([positions, rows[..., HEADING]], dim=-1)
 
 
-def token_poses(batch: SceneBatch, frames: TargetFrames) -> Tensor:
+def token_poses(batch: SceneBatch) -> Tensor:
     """Every token of each target's scene, re-expressed in its frame."""
+    targets = batch.targets
     scene_poses = torch.cat([agent_poses(batch.scene), batch.map.chunk_pose], 1)
-    poses = scene_poses.index_select(0, batch.targets.scene_index)
-    positions = positions_into(poses[..., :2], frames)
-    directions = rotate_into(poses[..., 2:], frames)
+    poses = scene_poses.index_select(0, targets.scene_index)
+    positions = positions_into(poses[..., :2], targets.frame_pose)
+    directions = rotate_into(poses[..., 2:], targets.frame_pose)
     return torch.cat([positions, directions], dim=-1)
 
 
@@ -115,28 +91,30 @@ def agents_visible(batch: SceneBatch) -> Tensor:
     return present & ~is_self
 
 
-def chunks_visible(batch: SceneBatch, frames: TargetFrames) -> Tensor:
+def chunks_visible(batch: SceneBatch) -> Tensor:
     """A map chunk is visible to a target when any of its dots falls inside
     the target's crop; each target is checked against its own scene's dots.
     """
     scene_map = batch.map
-    scene_index = batch.targets.scene_index
+    targets = batch.targets
+    scene_index = targets.scene_index
     scene_dots = scene_map.rows[:, :, contract.MAP_POSITION]
     dot_positions = scene_dots.index_select(0, scene_index)
-    local = positions_into(dot_positions, frames)
-    stretch = 1.0 + STRETCH_GAIN * frames.speed[:, None]
+    local = positions_into(dot_positions, targets.frame_pose)
+    stretch = 1.0 + STRETCH_GAIN * targets.speed[:, None]
     dot_present = scene_map.dot_present.index_select(0, scene_index)
     inside = inside_crop(local, stretch) & dot_present
-    chunk_count = scene_map.chunk_pose.shape[1]
-    counts = local.new_zeros(len(scene_index), chunk_count)
+    chunk_x = scene_map.chunk_pose[..., 0].index_select(0, scene_index)
+    counts = torch.zeros_like(chunk_x)
     dot_chunk = scene_map.dot_chunk.index_select(0, scene_index)
     counts = counts.scatter_add(1, dot_chunk, inside.to(counts.dtype))
     return counts > 0
 
 
-def target_view(batch: SceneBatch) -> TargetView:
-    frames = target_frames(batch)
-    pose = token_poses(batch, frames)
+def visible_tokens(batch: SceneBatch) -> Tensor:
+    """Which of each target's scene tokens, agents then map chunks, it may
+    attend to (B, A + C).
+    """
     agents = agents_visible(batch)
-    chunks = chunks_visible(batch, frames)
-    return TargetView(pose, torch.cat([agents, chunks], dim=1))
+    chunks = chunks_visible(batch)
+    return torch.cat([agents, chunks], dim=1)

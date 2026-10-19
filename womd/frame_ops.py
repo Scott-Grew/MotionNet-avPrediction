@@ -19,7 +19,6 @@ class Frame(NamedTuple):
 
 
 def rotation_matrix(heading: float, dtype: type = np.float64) -> np.ndarray:
-    """2D rotation matrix for the given heading angle, in radians."""
     cosine = np.cos(heading)
     sine = np.sin(heading)
     return np.array([[cosine, -sine], [sine, cosine]], dtype=dtype)
@@ -35,9 +34,6 @@ def positions_to_frame(positions: np.ndarray, frame: Frame) -> np.ndarray:
 
 
 def positions_from_frame(positions: np.ndarray, frame: Frame) -> np.ndarray:
-    """Moves points out of a frame, back into the one its origin and heading
-    were measured in, inverting positions_to_frame.
-    """
     frame_positions = np.asarray(positions, dtype=np.float64)
     rotated = frame_positions @ rotation_matrix(frame.heading).T
     return rotated + np.asarray(frame.origin, dtype=np.float64)
@@ -52,7 +48,6 @@ def directions_to_frame(directions: np.ndarray, heading: float) -> np.ndarray:
 
 
 def directions_from_frame(directions: np.ndarray, heading: float) -> np.ndarray:
-    """Rotates direction vectors out of a frame, undoing directions_to_frame."""
     frame_directions = np.asarray(directions, dtype=np.float64)
     return frame_directions @ rotation_matrix(heading).T
 

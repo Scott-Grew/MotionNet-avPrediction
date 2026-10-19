@@ -18,8 +18,6 @@ from womd.loader import SceneBatch
 
 
 class BatchSettings(NamedTuple):
-    """How training batches are drawn from the staged scenarios."""
-
     batch_size: int  # predicted agents per batch
     worker_count: int
     prefetch_batches: int
@@ -28,7 +26,6 @@ class BatchSettings(NamedTuple):
 
 
 def torch_batch(batch: SceneBatch) -> SceneBatch:
-    """The same batch with every numpy array turned into a torch tensor."""
     return batch.each(torch.from_numpy)
 
 
@@ -55,29 +52,27 @@ class SceneBatchStream(IterableDataset):
         worker_paths = worker_share(self.paths, worker_index, worker_count)
         generator = np.random.default_rng(self.settings.seed + worker_index)
         batch_size = self.settings.batch_size
-        samples = []
+        scenes = []
         free_slots = batch_size
         for scenario_index in generator.permutation(len(worker_paths)):
             scenario = loader.read_scenario(worker_paths[scenario_index])
-            view = loader.SceneView(scenario)
             designated_only = self.settings.designated_only
             eligible = loader.eligible_tracks(scenario, designated_only)
-            waiting = generator.permutation(eligible).tolist()
-            while waiting:
+            waiting = generator.permutation(eligible)
+            while len(waiting):
                 taken = waiting[:free_slots]
                 waiting = waiting[free_slots:]
-                samples.append(view.sample(taken))
+                scenes.append(loader.one_scene(scenario, taken))
                 free_slots -= len(taken)
                 if free_slots == 0:
-                    yield loader.scene_batch(samples)
-                    samples = []
+                    yield loader.joined_batch(scenes)
+                    scenes = []
                     free_slots = batch_size
-        if samples:
-            yield loader.scene_batch(samples)
+        if scenes:
+            yield loader.joined_batch(scenes)
 
 
 def worker_share(paths: list[Path], index: int, count: int) -> list[Path]:
-    """The scenarios DataLoader worker index of count reads."""
     return paths[index::count]
 
 

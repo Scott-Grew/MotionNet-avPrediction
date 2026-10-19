@@ -151,7 +151,6 @@ NUM_BOUNDARY_CROSSING_CODES = len(ROAD_LINE_TYPES) + 1
 # state for each history step.
 POLYLINE_SIGNAL_DIM = HISTORY_STEPS * NUM_TRAFFIC_SIGNAL_STATES
 
-# The two sides a lane boundary can be on.
 LANE_SIDES = ("left", "right")
 
 # ------------------------------------------------------------------

@@ -7,7 +7,7 @@ SHARDS ?= data/validation_raw/validation.tfrecord-00000-of-00150
 STAGED ?= data/staged
 STAGED_TRAINING ?= data/staged_training
 ANCHORS ?= data/training_anchors_54_sklearn.npz
-CHECKPOINT ?= data/checkpoint.pt
+CHECKPOINT ?= data/run37/checkpoint.pt
 PREDICTIONS ?= data/predictions.npz
 BASELINE_PREDICTIONS ?= data/constant_velocity_predictions.npz
 SCORE_DIRECTORY ?= data/score
@@ -26,14 +26,12 @@ STOP_AFTER_SECONDS ?= 42000
 
 PROTO_CHECK_SCENARIOS ?= 100
 
-EXPORT_DEVICE ?= cpu
 EXPORT_SCENARIOS ?= 287
-EXPORT_BUCKETS ?= 4
 EXPORT_THREADS ?= 4
 
 .DEFAULT_GOAL := help
 .PHONY: help install protos test check stage anchors train predict \
-	baseline score check-protos export
+	baseline score check-protos export live
 
 help: ## list the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | \
@@ -106,5 +104,7 @@ check-protos: ## compare our protos with Waymo's, in Docker
 export: ## export to ONNX, check it against torch, time both
 	$(PYTHON) export_onnx.py $(STAGED) $(ONNX) \
 		--checkpoint $(CHECKPOINT) --scenarios $(EXPORT_SCENARIOS) \
-		--buckets $(EXPORT_BUCKETS) --threads $(EXPORT_THREADS) \
-		--device $(EXPORT_DEVICE)
+		--threads $(EXPORT_THREADS)
+
+live: ## play staged scenes with live predictions on ws://127.0.0.1:8765
+	$(PYTHON) live.py $(CHECKPOINT) $(STAGED)

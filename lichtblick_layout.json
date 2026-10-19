@@ -1,0 +1,17 @@
+{
+  "configById": {
+    "3D!live": {
+      "followTf": "scene",
+      "followMode": "follow-pose",
+      "topics": {
+        "/map": { "visible": true },
+        "/agents": { "visible": true },
+        "/futures": { "visible": true }
+      }
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": "3D!live"
+}

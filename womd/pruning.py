@@ -134,8 +134,6 @@ def kept_confidences(paths: Tensor, logits: Tensor, kept: Tensor) -> Tensor:
 
 
 class SubmittedModes(NamedTuple):
-    """The 6 kept modes at the 16 steps Waymo scores, and their confidences."""
-
     trajectories: Tensor  # (batch, 6, 16, 2) metres, agent frame
     confidences: Tensor  # (batch, 6) summing to 1
 

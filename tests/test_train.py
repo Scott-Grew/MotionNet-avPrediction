@@ -14,7 +14,7 @@ import torch
 from reference_implementations import unit_anchor_offsets_per_type
 
 import train
-from womd import checkpoint, contract, model
+from womd import checkpoint, contract, loss, model
 from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
 from womd.model import MotionPredictor
 
@@ -72,14 +72,6 @@ def synthetic_batch():
     )
 
 
-def linear_training_objects():
-    """A one-weight model with its optimiser and scaler, for checkpoints."""
-    predictor = torch.nn.Linear(1, 1)
-    optimizer = torch.optim.AdamW(predictor.parameters())
-    scaler = train.GradScaler(enabled=False)
-    return checkpoint.TrainingObjects(predictor, optimizer, scaler)
-
-
 def test_warmup_rises_then_holds():
     """The rate climbs through warm-up, holds at the chosen rate, and reaches
     zero on the last step.
@@ -107,39 +99,19 @@ def test_rate_holds_then_falls_to_zero():
     assert rates[199] == 0.0
 
 
-def test_resuming_never_skips_a_completed_epoch():
-    """A resumed run starts at the first epoch its checkpoint has not done."""
-    trained = linear_training_objects()
-    two_done = checkpoint.Progress(seed=0, completed_epochs=2, epoch_plan=None)
-    three_done = checkpoint.Progress(
-        seed=0, completed_epochs=3, epoch_plan=None
-    )
-    interrupted = checkpoint.checkpoint_of(trained, two_done)
-    finished = checkpoint.checkpoint_of(trained, three_done)
-    assert list(train.remaining_epochs(interrupted["completed_epochs"], 5)) == [
-        2,
-        3,
-        4,
-    ]
-    assert list(train.remaining_epochs(finished["completed_epochs"], 5)) == [
-        3,
-        4,
-    ]
-    assert list(train.remaining_epochs(1, 1)) == []
-
-
 def test_checkpoint_round_trips(tmp_path):
     """A checkpoint with a tampered version is rejected."""
-    trained = linear_training_objects()
-    progress = checkpoint.Progress(seed=0, completed_epochs=1, epoch_plan=None)
-    state = checkpoint.checkpoint_of(trained, progress)
+    model_state = torch.nn.Linear(1, 1).state_dict()
+    state = {
+        "model_state": model_state,
+        "code_version": contract.STAGING_CODE_VERSION,
+    }
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(state, checkpoint_path)
     reloaded_state = checkpoint.load_checkpoint(checkpoint_path)
     assert reloaded_state["code_version"] == contract.STAGING_CODE_VERSION
     assert torch.equal(
-        reloaded_state["model_state"]["weight"],
-        trained.predictor.state_dict()["weight"],
+        reloaded_state["model_state"]["weight"], model_state["weight"]
     )
     tampered_state = dict(state)
     tampered_state["code_version"] = "not-a-real-version"
@@ -156,8 +128,8 @@ def test_one_training_step_runs_end_to_end():
     optimizer = torch.optim.AdamW(
         train.parameter_groups(predictor), lr=train.LEARNING_RATE
     )
-    step = train.training_step(predictor, synthetic_batch())
-    total = step.losses.total
+    batch = synthetic_batch()
+    total = loss.loss_terms(predictor(batch), batch.targets).total
     optimizer.zero_grad()
     total.backward()
     optimizer.step()

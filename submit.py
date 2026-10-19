@@ -12,7 +12,6 @@ import argparse
 import functools
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -22,31 +21,14 @@ from torch import Tensor
 from womd import baseline, contract, frame_ops, loader, pipeline, pruning
 from womd.checkpoint import load_predictor
 from womd.frame_ops import Frame
-from womd.loader import SceneBatch, SceneSample
+from womd.loader import SceneBatch
 from womd.model import MotionPredictor
+from womd.pruning import SubmittedModes
 
 # A prediction function takes a batch and returns every target's modes,
 # trajectories (B, modes, 80, 2) and confidence logits (B, modes).
 Modes = tuple[Tensor, Tensor]
 Predict = Callable[[SceneBatch], Modes]
-
-
-class Predictions(NamedTuple):
-    """One scene's kept futures, (targets, 6, 16, 2) agent-frame positions
-    and (targets, 6) confidences.
-    """
-
-    trajectories: ndarray
-    confidences: ndarray
-
-
-class SubmissionRows(NamedTuple):
-    """Every designated target's futures, as the submission file stores them."""
-
-    scenario_ids: list[str]
-    track_ids: list[int]
-    world_trajectories: list[ndarray]  # each (6, 16, 2)
-    confidences: list[ndarray]  # each (6,)
 
 
 def model_modes(predictor: MotionPredictor, batch: SceneBatch) -> Modes:
@@ -59,14 +41,13 @@ def constant_velocity_modes(batch: SceneBatch) -> Modes:
     return baseline.constant_velocity(batch.targets.agent_history)
 
 
-def predict_scene(predict: Predict, sample: SceneSample) -> Predictions:
-    """One scene's modes at 10 Hz become Waymo's 6 kept modes at 2 Hz."""
-    batch = pipeline.torch_batch(loader.scene_batch([sample]))
+def predict_scene(predict: Predict, batch: SceneBatch) -> SubmittedModes:
+    """One scene's modes at 10 Hz become Waymo's 6 kept modes at 2 Hz, in
+    each target's own frame.
+    """
     with torch.no_grad():
         trajectories, logits = predict(batch)
-    submitted = pruning.submitted_modes(trajectories, logits)
-    kept = submitted.trajectories.numpy()
-    return Predictions(kept, submitted.confidences.numpy())
+    return pruning.submitted_modes(trajectories, logits)
 
 
 def to_world(positions: ndarray, agent: Frame, scene: Frame) -> ndarray:
@@ -75,40 +56,35 @@ def to_world(positions: ndarray, agent: Frame, scene: Frame) -> ndarray:
     return frame_ops.positions_from_frame(scene_positions, scene)
 
 
-def submission_rows(predict: Predict, staged: Path) -> SubmissionRows:
+def submission(predict: Predict, staged: Path) -> contract.Submission:
     """Predicts the designated targets one scene at a time and converts each
-    to the world frame.
+    target's 6 futures to the world frame.
     """
-    rows = SubmissionRows([], [], [], [])
+    scenario_ids = []
+    track_ids = []
+    world_trajectories = []
+    confidences = []
     for path in sorted(staged.glob("*.npz")):
-        scenario, sample = loader.designated_scene(path)
-        predicted = predict_scene(predict, sample)
-        kept = zip(sample.targets, *predicted, strict=True)
-        for target, paths, confidences in kept:
-            world = to_world(paths, target.frame, scenario.scene_frame)
-            rows.scenario_ids.append(scenario.scenario_id)
-            rows.track_ids.append(target.track_id)
-            rows.world_trajectories.append(world)
-            rows.confidences.append(confidences)
-    return rows
-
-
-def write_submission(rows: SubmissionRows, staged: Path, output: Path) -> None:
-    """Writes the compressed submission .npz with provenance."""
-    trajectories = np.stack(rows.world_trajectories)
-    expected = (contract.NUM_PREDICTED_MODES, contract.SUBMISSION_STEPS, 2)
-    if trajectories.shape[1:] != expected:
-        raise ValueError(
-            f"submission trajectories have shape {trajectories.shape}"
-        )
-    submission = contract.Submission(
-        scenario_id=np.array(rows.scenario_ids),
-        track_id=np.array(rows.track_ids, dtype=np.int64),
-        world_trajectories=trajectories,
-        confidences=np.stack(rows.confidences).astype(np.float64),
+        scenario = loader.read_scenario(path)
+        tracks = loader.designated_tracks(scenario)
+        batch = pipeline.torch_batch(loader.one_scene(scenario, tracks))
+        kept = predict_scene(predict, batch)
+        kept_paths = kept.trajectories.numpy()
+        kept_rows = zip(tracks, kept_paths, kept.confidences.numpy())
+        for track_index, paths, scores in kept_rows:
+            frame = loader.agent_frame(scenario.track_rows[track_index])
+            world = to_world(paths, frame, scenario.scene_frame)
+            scenario_ids.append(scenario.scenario_id)
+            track_ids.append(scenario.track_ids[track_index])
+            world_trajectories.append(world)
+            confidences.append(scores)
+    return contract.Submission(
+        scenario_id=np.array(scenario_ids),
+        track_id=np.array(track_ids, dtype=np.int64),
+        world_trajectories=np.stack(world_trajectories),
+        confidences=np.stack(confidences).astype(np.float64),
         provenance=contract.artifact_provenance("submit.py", staged),
     )
-    submission.save(output)
 
 
 def main() -> None:
@@ -133,11 +109,11 @@ def main() -> None:
         predictor = load_predictor(checkpoint_path)
         predict = functools.partial(model_modes, predictor)
 
-    rows = submission_rows(predict, staged)
-    write_submission(rows, staged, output)
+    predicted = submission(predict, staged)
+    predicted.save(output)
     size = output.stat().st_size
     print(
-        f"{len(rows.track_ids)} designated targets written to {output}"
+        f"{len(predicted.track_id)} designated targets written to {output}"
         f" ({size} bytes)"
     )
 

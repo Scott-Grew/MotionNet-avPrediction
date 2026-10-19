@@ -257,18 +257,18 @@ def test_chunk_pooling_isolates_groups():
     dot_present = torch.tensor([[True] * 5, [True, True, True, True, False]])
     scene_map = pooling_map(dot_chunk, dot_present, chunk_count=3)
 
-    pooled = model.pool_chunks(dot_embeddings, scene_map)
-    assert pooled.tokens.shape == (2, 3, 8)
-    assert pooled.present.tolist() == [[True, True, False], [True, True, False]]
-    assert torch.all(pooled.tokens[:, 2] == 0.0)
+    tokens, present = model.pool_chunks(dot_embeddings, scene_map)
+    assert tokens.shape == (2, 3, 8)
+    assert present.tolist() == [[True, True, False], [True, True, False]]
+    assert torch.all(tokens[:, 2] == 0.0)
 
     poisoned = dot_embeddings.clone()
     poisoned[0, :3] = 999.0
     poisoned[1, 4] = 999.0
-    poisoned_pooled = model.pool_chunks(poisoned, scene_map)
-    assert torch.equal(poisoned_pooled.tokens[0, 1:], pooled.tokens[0, 1:])
-    assert torch.equal(poisoned_pooled.tokens[1], pooled.tokens[1])
-    assert not torch.equal(poisoned_pooled.tokens[0, 0], pooled.tokens[0, 0])
+    poisoned_tokens, _ = model.pool_chunks(poisoned, scene_map)
+    assert torch.equal(poisoned_tokens[0, 1:], tokens[0, 1:])
+    assert torch.equal(poisoned_tokens[1], tokens[1])
+    assert not torch.equal(poisoned_tokens[0, 0], tokens[0, 0])
 
 
 def test_crop_stretches_ahead_with_speed():
@@ -409,15 +409,13 @@ def test_anchor_fitting_recovers_separated_clusters():
     )
     endpoints = endpoints.reshape(-1, 2)
 
-    fit = fit_anchors.fit_type("vehicle", endpoints)
-    fitted = fit.anchors
+    fitted, counts = fit_anchors.fit_type("vehicle", endpoints)
 
-    assert fit.stopped_by_convergence
     assert fitted.shape == (model.QUERY_COUNT, 2)
     nearest_cluster = torch.cdist(fitted, cluster_centres).argmin(dim=1)
     assert sorted(nearest_cluster.tolist()) == list(range(model.QUERY_COUNT))
     assert torch.allclose(fitted, cluster_centres[nearest_cluster], atol=0.01)
-    assert int(fit.counts.min()) > 0
+    assert int(counts.min()) > 0
 
 
 def test_batched_pruning_matches_the_loop():
@@ -513,13 +511,14 @@ def test_submission_returns_to_the_world_frame():
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
 
     scenario = loader.read_scenario(scenario_paths[0])
-    track_index = int(loader.eligible_tracks(scenario, designated_only=True)[0])
-    scene_sample = loader.scene_sample(scenario, [track_index])
-    sample = scene_sample.targets[0]
-    agent_frame_future = sample.future_positions
+    tracks = loader.eligible_tracks(scenario, designated_only=True)[:1]
+    track_index = tracks[0]
+    targets = loader.one_scene(scenario, tracks).targets
+    agent_frame_future = targets.future_positions[0]
+    frame = loader.agent_frame(scenario.track_rows[track_index])
 
     world_future = submit.to_world(
-        agent_frame_future, sample.frame, scenario.scene_frame
+        agent_frame_future, frame, scenario.scene_frame
     )
     world_coordinate_resolution = (
         np.finfo(np.float32).eps * np.abs(world_future).max()
@@ -529,7 +528,7 @@ def test_submission_returns_to_the_world_frame():
         world_future, scenario.scene_frame
     )
     back_to_agent_frame = frame_ops.positions_to_frame(
-        back_to_scene_frame, sample.frame
+        back_to_scene_frame, frame
     )
     assert np.allclose(
         back_to_agent_frame,
@@ -808,17 +807,18 @@ def test_agents_carry_their_lane_signal_history():
     go_column = contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")
     signalled_history[:8, stop_column] = 1.0
     signalled_history[8:, go_column] = 1.0
-    three_agent_scene = loader.scene_sample(
-        two_lane_signal_scenario(3, signalled_history), [0]
+    first_track = np.array([0])
+    three_agent_scene = loader.one_scene(
+        two_lane_signal_scenario(3, signalled_history), first_track
     )
-    two_agent_scene = loader.scene_sample(
-        two_lane_signal_scenario(2, signalled_history), [0]
+    two_agent_scene = loader.one_scene(
+        two_lane_signal_scenario(2, signalled_history), first_track
     )
     assert np.array_equal(
-        three_agent_scene.targets[0].agent_signal_history, signalled_history
+        three_agent_scene.targets.agent_signal_history[0], signalled_history
     )
-    assert np.all(three_agent_scene.scene_agent_signal_history[1:] == 0.0)
-    batch = loader.scene_batch([three_agent_scene, two_agent_scene])
+    assert np.all(three_agent_scene.scene.agent_signal_history[0, 1:] == 0.0)
+    batch = loader.joined_batch([three_agent_scene, two_agent_scene])
     assert batch.scene.agent_signal_history.shape == (2, 3) + signal_shape
     assert np.all(batch.scene.agent_signal_history[1, 2] == 0.0)
     tensor_batch = pipeline.torch_batch(batch)
@@ -849,15 +849,15 @@ def test_target_prediction_ignores_batch_company():
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
-    alone_sample = loader.scene_sample(three_track_scenario, [1])
-    together_samples = [
-        loader.scene_sample(two_track_scenario, [0]),
-        loader.scene_sample(three_track_scenario, [0, 1, 2]),
+    alone_scene = loader.one_scene(three_track_scenario, np.array([1]))
+    together_scenes = [
+        loader.one_scene(two_track_scenario, np.array([0])),
+        loader.one_scene(three_track_scenario, np.array([0, 1, 2])),
     ]
     with torch.no_grad():
-        alone_batch = pipeline.torch_batch(loader.scene_batch([alone_sample]))
+        alone_batch = pipeline.torch_batch(alone_scene)
         together_batch = pipeline.torch_batch(
-            loader.scene_batch(together_samples)
+            loader.joined_batch(together_scenes)
         )
         alone = predictor(alone_batch).trajectories
         together = predictor(together_batch).trajectories
@@ -1111,9 +1111,10 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
         train.parameter_groups(predictor), lr=train.LEARNING_RATE
     )
     batch = next(iter(pipeline.batches(scenario_paths, TWO_STAGED_SCENARIOS)))
-    step = train.training_step(predictor, batch)
-    assert torch.stack(list(step.losses)).isfinite().all()
-    step.losses.total.backward()
+    predicted = predictor(batch)
+    losses = loss.loss_terms(predicted, batch.targets)
+    assert torch.stack(list(losses)).isfinite().all()
+    losses.total.backward()
     starved = [
         name
         for name, parameter in predictor.named_parameters()
@@ -1121,11 +1122,12 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
     ]
     assert not starved, starved
     optimizer.step()
-    accumulator = metrics.MetricAccumulator()
-    detached = ModePredictions(*(tensor.detach() for tensor in step.predicted))
-    accumulator.update(detached, batch.targets)
-    assert math.isfinite(accumulator.min_ade())
-    assert math.isfinite(accumulator.min_fde())
+    progress = metrics.EpochProgress(torch.device("cpu"))
+    detached = ModePredictions(*(tensor.detach() for tensor in predicted))
+    progress.add_kept_mode_errors(detached, batch.targets)
+    scalars = progress.epoch_scalars()
+    assert math.isfinite(scalars["epoch/ade_80step"])
+    assert math.isfinite(scalars["epoch/fde_80step"])
     checkpoint_path = tmp_path / "predictor.pt"
     torch.save(predictor.state_dict(), checkpoint_path)
     reloaded_state = torch.load(checkpoint_path)

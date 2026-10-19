@@ -121,10 +121,9 @@ def stage_fixture(tmp_path):
     write_shard(shard_path, [build_fixture_scenario("pin00001")])
     output_directory = tmp_path / "staged"
     output_directory.mkdir()
-    report = stage.Stager(output_directory, skip_existing=False).shards(
-        [shard_path]
-    )
-    return np.load(report.written[0])
+    stager = stage.Stager(output_directory, skip_existing=False)
+    stager.shard(shard_path)
+    return np.load(stager.written[0])
 
 
 def pinned_dtype(array):
@@ -168,15 +167,16 @@ def test_staging_names_files_by_scenario_id(tmp_path):
     output_directory.mkdir()
 
     stager = stage.Stager(output_directory, skip_existing=False)
-    report = stager.shards([first_shard, second_shard])
+    stager.shard(first_shard)
+    stager.shard(second_shard)
 
-    assert sorted(path.name for path in report.written) == [
+    assert sorted(path.name for path in stager.written) == [
         "aaa111.npz",
         "bbb222.npz",
         "ccc333.npz",
     ]
-    assert all(path.exists() for path in report.written)
-    assert len(report.spacing_deviations) == len(report.written)
+    assert all(path.exists() for path in stager.written)
+    assert len(stager.spacing_deviations) == len(stager.written)
 
 
 def test_duplicate_scenario_ids_are_refused(tmp_path):
@@ -191,8 +191,9 @@ def test_duplicate_scenario_ids_are_refused(tmp_path):
     output_directory.mkdir()
 
     stager = stage.Stager(output_directory, skip_existing=False)
+    stager.shard(first_shard)
     with pytest.raises(FileExistsError):
-        stager.shards([first_shard, second_shard])
+        stager.shard(second_shard)
 
 
 def test_staged_structure_matches_pin(tmp_path):
