@@ -5,12 +5,12 @@ one metre apart and traffic-light histories, all in the scene frame.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
 
 from womd import contract, frame_ops
+from womd.contract import SIGNAL_HISTORY_SHAPE, StagedFile
 from womd.frame_ops import Frame
 from womd_protos import map_pb2, scenario_pb2
 
@@ -20,10 +20,6 @@ MAP_POLYGON_KINDS = ("crosswalk", "speed_bump", "driveway")
 
 Track = scenario_pb2.Track
 MapFeature = map_pb2.MapFeature
-SIGNAL_HISTORY_SHAPE = (
-    contract.HISTORY_STEPS,
-    contract.NUM_TRAFFIC_SIGNAL_STATES,
-)
 
 
 class FeaturePoints(NamedTuple):
@@ -368,16 +364,16 @@ def worst_spacing_deviation(scenario: scenario_pb2.Scenario) -> float:
     return float(np.max(np.abs(gaps - contract.TIMESTEP_SECONDS)))
 
 
-def staged_arrays(scenario: scenario_pb2.Scenario) -> dict[str, np.ndarray]:
-    """The arrays of one staged file, drawn at the end of this file."""
+def staged_file(scenario: scenario_pb2.Scenario) -> StagedFile:
+    """One scenario's tracks and map, in its scene frame."""
     if scenario.current_time_index != contract.CURRENT_STEP_INDEX:
         raise ValueError(
             f"current_time_index {scenario.current_time_index},"
             f" {scenario.scenario_id}"
         )
     frame = scene_frame(scenario)
-    sdc_index = scenario.sdc_track_index
     tracks = scenario.tracks
+    sdc_index = scenario.sdc_track_index
     designated = {
         required.track_index for required in scenario.tracks_to_predict
     }
@@ -387,63 +383,26 @@ def staged_arrays(scenario: scenario_pb2.Scenario) -> dict[str, np.ndarray]:
         rows.append(track_rows(track, frame, is_sdc=index == sdc_index))
     stager = MapStager(frame, traffic_signals(scenario))
     scene_map = stager.staged(scenario.map_features)
-    return {
-        "track_rows": np.stack(rows).astype(np.float32),
-        "track_valid": np.stack([track_valid(track) for track in tracks]),
-        "track_ids": np.array([track.id for track in tracks], dtype=np.int64),
-        "is_designated_target": np.array(
-            [index in designated for index in range(len(tracks))]
+    histories = scene_map.polyline_signal_histories
+    return StagedFile(
+        track_rows=np.stack(rows).astype(np.float32),
+        track_valid=np.stack([track_valid(track) for track in tracks]),
+        track_ids=np.array([track.id for track in tracks], dtype=np.int64),
+        is_designated_target=np.array(
+            [i in designated for i in range(len(tracks))]
         ),
-        "is_object_of_interest": np.array(
+        is_object_of_interest=np.array(
             [track.id in interest_ids for track in tracks]
         ),
-        "map_rows": scene_map.map_rows.astype(np.float32),
-        "feature_lengths": scene_map.feature_lengths,
-        "feature_ids": scene_map.feature_ids,
-        "feature_is_interpolating": scene_map.feature_is_interpolating,
-        "polyline_signal_histories": scene_map.polyline_signal_histories.astype(
-            np.float32
-        ),
-        "frame_origin": frame.origin.astype(np.float32),
-        "frame_heading": np.float32(frame.heading),
-        "scenario_id": scenario.scenario_id,
-        "provenance": contract.artifact_provenance(
+        map_rows=scene_map.map_rows.astype(np.float32),
+        feature_lengths=scene_map.feature_lengths,
+        feature_ids=scene_map.feature_ids,
+        feature_is_interpolating=scene_map.feature_is_interpolating,
+        polyline_signal_histories=histories.astype(np.float32),
+        frame_origin=frame.origin.astype(np.float32),
+        frame_heading=np.float32(frame.heading),
+        scenario_id=scenario.scenario_id,
+        provenance=contract.artifact_provenance(
             "stage.py", scenario.scenario_id
         ),
-    }
-
-
-def write_scenario(scenario: scenario_pb2.Scenario, output_path: Path) -> float:
-    """Writes one scenario's staged .npz and returns its worst timestamp
-    spacing deviation.
-    """
-    arrays = staged_arrays(scenario)
-    partial_path = output_path.with_suffix(output_path.suffix + ".partial")
-    with open(partial_path, "wb") as partial_file:
-        np.savez_compressed(partial_file, **arrays)
-    # Renaming from a .partial path makes the write atomic, so a killed
-    # process never leaves a half-written file in place.
-    partial_path.replace(output_path)
-    return worst_spacing_deviation(scenario)
-
-
-# ------------------------------------------------------------------
-# ONE STAGED .npz, in the scene frame. T tracks, F map features,
-# D map dots, 91 steps (11 history + 80 future).
-#
-#   track_rows                 (T, 91, 13)  float32  agent rows
-#   track_valid                (T, 91)      bool     step observed
-#   track_ids                  (T,)         int64
-#   is_designated_target       (T,)         bool     Waymo scores it
-#   is_object_of_interest      (T,)         bool
-#   map_rows                   (D, 32)      float32  dots, by feature
-#   feature_lengths            (F,)         int64    dots per feature
-#   feature_ids                (F,)         int64
-#   feature_is_interpolating   (F,)         bool
-#   polyline_signal_histories  (F, 11, 9)   float32  traffic light
-#   frame_origin               (2,)         float32  scene in world
-#   frame_heading              ()           float32
-#   scenario_id, provenance    ()           str
-#
-# The 13 and 32 columns are drawn at the end of womd/loader.py.
-# ------------------------------------------------------------------
+    )

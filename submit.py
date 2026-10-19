@@ -139,14 +139,14 @@ def write_submission(rows: SubmissionRows, staged: Path, output: Path) -> None:
         raise ValueError(
             f"submission trajectories have shape {trajectories.shape}"
         )
-    np.savez_compressed(
-        output,
+    submission = contract.Submission(
         scenario_id=np.array(rows.scenario_ids),
         track_id=np.array(rows.track_ids, dtype=np.int64),
         world_trajectories=trajectories,
         confidences=np.stack(rows.confidences).astype(np.float64),
         provenance=contract.artifact_provenance("submit.py", staged),
     )
+    submission.save(output)
 
 
 def main() -> None:

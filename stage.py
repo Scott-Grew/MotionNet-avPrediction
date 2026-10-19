@@ -63,9 +63,9 @@ class Stager:
                     )
                 report.skipped.append(output_path)
                 continue
-            report.spacing_deviations.append(
-                store.write_scenario(scenario, output_path)
-            )
+            store.staged_file(scenario).save(output_path)
+            deviation = store.worst_spacing_deviation(scenario)
+            report.spacing_deviations.append(deviation)
             report.written.append(output_path)
         return report
 

@@ -238,9 +238,10 @@ def parse_arguments() -> argparse.Namespace:
 
 
 class TrainingRun:
-    """One launch of train.py: the model, its optimiser and scaler, the
-    processes it runs on, and the loop over the remaining epochs. run() fixes
-    the settings once the epoch plan is known.
+    """One launch of train.py, set up in full before the first batch: the
+    processes, the model with its optimiser and scaler restored from any
+    checkpoint, this process's share of the scenarios, the epoch plan and the
+    run settings. run() is the epoch loop.
     """
 
     def __init__(self, arguments: argparse.Namespace) -> None:
@@ -252,17 +253,35 @@ class TrainingRun:
                 f" over {self.processes.count} processes"
             )
         torch.manual_seed(arguments.seed)
-        predictor = MotionPredictor(load_anchor_file(arguments.anchors)).to(
-            self.device
-        )
-        optimizer = torch.optim.AdamW(
-            parameter_groups(predictor), lr=arguments.learning_rate
-        )
-        scaler = GradScaler(
-            enabled=arguments.mixed_precision and self.device.type == "cuda"
-        )
+        anchors = load_anchor_file(arguments.anchors)
+        predictor = MotionPredictor(anchors).to(self.device)
+        groups = parameter_groups(predictor)
+        optimizer = torch.optim.AdamW(groups, lr=arguments.learning_rate)
+        scaling = arguments.mixed_precision and self.device.type == "cuda"
+        scaler = GradScaler(enabled=scaling)
         self.trained = TrainingObjects(predictor, optimizer, scaler)
-        self.completed_epochs, self.stored_plan = self.resume()
+        self.completed_epochs, stored_plan = self.resume()
+
+        every_path = sorted(arguments.staged_directory.glob("*.npz"))
+        self.paths = every_path[self.processes.rank :: self.processes.count]
+        if not self.paths:
+            raise FileNotFoundError(
+                f"no .npz scenarios in {arguments.staged_directory}"
+            )
+        self.settings = self.run_settings(self.plan_epochs(stored_plan))
+        if self.processes.count > 1:
+            self.wrap_for_processes()
+
+    def wrap_for_processes(self) -> None:
+        """Wraps the model so gradients are averaged across processes; done
+        after resume so the checkpoint loads into the bare model.
+        """
+        device_ids = None
+        if self.device.type == "cuda":
+            device_ids = [self.processes.local_rank]
+        predictor = self.trained.predictor
+        wrapped = DistributedDataParallel(predictor, device_ids=device_ids)
+        self.trained = self.trained._replace(predictor=wrapped)
 
     def announce(self, message: str) -> None:
         if self.processes.is_main:
@@ -298,9 +317,8 @@ class TrainingRun:
         self.trained.predictor.load_state_dict(checkpoint["model_state"])
         self.trained.optimizer.load_state_dict(checkpoint["optimizer_state"])
         if "gradient_scaler_state" in checkpoint:
-            self.trained.scaler.load_state_dict(
-                checkpoint["gradient_scaler_state"]
-            )
+            scaler_state = checkpoint["gradient_scaler_state"]
+            self.trained.scaler.load_state_dict(scaler_state)
         completed = checkpoint["completed_epochs"]
         self.announce(f"resuming {path}: {completed} epochs complete")
         stored = checkpoint.get("epoch_plan")
@@ -316,7 +334,7 @@ class TrainingRun:
             designated_only=not arguments.all_eligible_agents,
         )
 
-    def plan_epochs(self, paths: list[Path]) -> EpochPlan:
+    def plan_epochs(self, stored: EpochPlan | None) -> EpochPlan:
         """The optimiser steps in one epoch, which the learning-rate schedule is
         measured in. Counting opens every staged file, so the count is saved in
         the checkpoint and reused while the scenarios and the launch layout are
@@ -324,18 +342,17 @@ class TrainingRun:
         """
         settings = self.batch_settings(0)
         layout = EpochPlan(
-            scenario_count=len(paths) * self.processes.count,
+            scenario_count=len(self.paths) * self.processes.count,
             process_count=self.processes.count,
             worker_count=settings.worker_count,
             per_process_batch_size=settings.batch_size,
             designated_only=settings.designated_only,
             steps_per_epoch=0,
         )
-        stored = self.stored_plan
         if stored is not None and stored._replace(steps_per_epoch=0) == layout:
             self.announce("optimiser step count read from the checkpoint")
             return stored
-        count = steps_per_epoch(paths, settings)
+        count = steps_per_epoch(self.paths, settings)
         if self.processes.count > 1:
             # Every process uses the longest share's step count, so the
             # schedule is the same everywhere.
@@ -476,6 +493,7 @@ class TrainingRun:
         after each finished epoch.
         """
         arguments = self.arguments
+        settings = self.settings
         remaining = remaining_epochs(self.completed_epochs, arguments.epochs)
         if not remaining:
             self.announce(
@@ -483,27 +501,7 @@ class TrainingRun:
                 f" holds {self.completed_epochs} epochs"
             )
             return
-        every_path = sorted(arguments.staged_directory.glob("*.npz"))
-        paths = every_path[self.processes.rank :: self.processes.count]
-        if not paths:
-            raise FileNotFoundError(
-                f"no .npz scenarios in {arguments.staged_directory}"
-            )
-        self.settings = self.run_settings(self.plan_epochs(paths))
-        settings = self.settings
-        predictor = self.trained.predictor
-        if self.processes.count > 1:
-            device_ids = (
-                [self.processes.local_rank]
-                if self.device.type == "cuda"
-                else None
-            )
-            predictor = DistributedDataParallel(
-                predictor, device_ids=device_ids
-            )
-            self.trained = self.trained._replace(predictor=predictor)
         budget = arguments.stop_after_seconds
-
         start = time.perf_counter()
         last_epoch_seconds = 0.0
         for epoch_index in remaining:
@@ -511,25 +509,24 @@ class TrainingRun:
             # since Kaggle ends a session without warning.
             elapsed = time.perf_counter() - start
             would_overrun = elapsed + last_epoch_seconds > budget
-            before = self.stop_message(
-                f"STOPPING BEFORE EPOCH {epoch_index + 1}", elapsed, epoch_index
-            )
+            heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
+            before = self.stop_message(heading, elapsed, epoch_index)
             if self.stopped(would_overrun, before):
                 return
 
             epoch_start = time.perf_counter()
-            batches = pipeline.batches(paths, self.batch_settings(epoch_index))
+            batch_settings = self.batch_settings(epoch_index)
+            batches = pipeline.batches(self.paths, batch_settings)
             uneven_shares = contextlib.nullcontext()
             if self.processes.count > 1:
-                uneven_shares = Join([predictor])
+                uneven_shares = Join([self.trained.predictor])
             with uneven_shares:
                 summary = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
             if settings.reporter is not None:
                 heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
-                settings.reporter.report(
-                    heading, epoch_scalars(summary), epoch_index + 1
-                )
+                scalars = epoch_scalars(summary)
+                settings.reporter.report(heading, scalars, epoch_index + 1)
                 settings.reporter.flush()
 
             if not math.isfinite(summary.losses.total):

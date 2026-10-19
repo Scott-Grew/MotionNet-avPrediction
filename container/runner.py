@@ -22,6 +22,7 @@ import womd.runtime_env  # noqa: E402, F401
 import numpy as np  # noqa: E402
 
 from womd import contract, frame_ops, loader  # noqa: E402
+from womd.contract import Submission  # noqa: E402
 from womd.frame_ops import Frame  # noqa: E402
 from womd.loader import StagedScenario  # noqa: E402
 
@@ -62,15 +63,6 @@ step_configurations {
 }
 max_predictions: 6
 """
-
-
-class SubmissionArrays(NamedTuple):
-    """A submission .npz, one row per predicted target, in the world frame."""
-
-    scenario_id: np.ndarray  # (targets,)
-    track_id: np.ndarray  # (targets,)
-    world_trajectories: np.ndarray  # (targets, 6, 16, 2) at 2 Hz
-    confidences: np.ndarray  # (targets, 6)
 
 
 class MetricInputs(NamedTuple):
@@ -175,7 +167,7 @@ class InputsBuilder:
     metric inputs one scenario at a time.
     """
 
-    def __init__(self, predictions: SubmissionArrays, staged: Path) -> None:
+    def __init__(self, predictions: Submission, staged: Path) -> None:
         self.predictions = predictions
         rows_of = rows_by_scenario(predictions.scenario_id)
         self.prediction_rows = list(rows_of.values())
@@ -232,30 +224,11 @@ class InputsBuilder:
         return self.tensors
 
 
-def metric_inputs(predictions: SubmissionArrays, staged: Path) -> MetricInputs:
+def metric_inputs(predictions: Submission, staged: Path) -> MetricInputs:
     """Reshapes flat per-target predictions and staged ground truth into the
     padded scenario-by-agent tensors the metrics op expects.
     """
     return InputsBuilder(predictions, staged).build()
-
-
-def load_predictions(predictions_path: Path) -> SubmissionArrays:
-    """Loads a submission .npz and refuses one this code did not produce."""
-    with np.load(predictions_path) as predictions_file:
-        stamp = (
-            predictions_file["provenance"]
-            if "provenance" in predictions_file
-            else None
-        )
-        contract.check_provenance(
-            stamp,
-            predictions_path,
-            "Regenerate the predictions with submit.py.",
-        )
-        arrays = {
-            name: predictions_file[name] for name in SubmissionArrays._fields
-        }
-    return SubmissionArrays(**arrays)
 
 
 def print_score_table(names: list[str], columns: Sequence[np.ndarray]) -> None:
@@ -285,7 +258,7 @@ def run_score(predictions_path: Path, staged: Path) -> None:
     from waymo_open_dataset.metrics.python import config_util_py
     from waymo_open_dataset.protos import motion_metrics_pb2
 
-    predictions = load_predictions(predictions_path)
+    predictions = Submission.load(predictions_path)
     tensors = metric_inputs(predictions, staged)
     config = motion_metrics_pb2.MotionMetricsConfig()
     text_format.Parse(WAYMO_TUTORIAL_MOTION_METRICS_CONFIG_TEXT, config)

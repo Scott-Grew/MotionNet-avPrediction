@@ -14,12 +14,14 @@ from torch import Tensor
 
 from womd import contract
 from womd.loader import SceneBatch, TargetArrays
-from womd.loss import LossTerms
+from womd.loss import LossTerms, mean_over_valid_steps
 from womd.model import QUERY_COUNT, ModePredictions
 from womd.pruning import prune_modes
 
 # A progress line is printed once per this many batches.
 LOG_EVERY_BATCHES = 20
+
+Scalars = dict[str, float]
 
 
 class TrainingStep(NamedTuple):
@@ -55,9 +57,8 @@ class LossValues(NamedTuple):
     classification: float
 
     def plus(self, other: LossValues) -> LossValues:
-        return LossValues(
-            *(mine + theirs for mine, theirs in zip(self, other, strict=True))
-        )
+        pairs = zip(self, other, strict=True)
+        return LossValues(*(mine + theirs for mine, theirs in pairs))
 
     def over(self, count: int) -> LossValues:
         return LossValues(*(value / max(count, 1) for value in self))
@@ -89,15 +90,10 @@ def mean_or_nan(total: Tensor | float, count: Tensor | int) -> float:
 
 
 def mode_distances(trajectories: Tensor, targets: TargetArrays) -> Tensor:
-    """Average per-step distance to the ground truth over valid future steps,
-    separately for each mode.
-    """
-    step_distances = (
-        trajectories - targets.future_positions.unsqueeze(1)
-    ).norm(dim=-1)
-    validity = targets.future_mask.unsqueeze(1).to(step_distances.dtype)
-    valid_step_count = validity.sum(dim=-1).clamp_min(1.0)
-    return (step_distances * validity).sum(dim=-1) / valid_step_count
+    """Each mode's mean distance to the logged future over its valid steps."""
+    logged = targets.future_positions.unsqueeze(1)
+    step_distances = (trajectories - logged).norm(dim=-1)
+    return mean_over_valid_steps(step_distances, targets.future_mask)
 
 
 class MetricAccumulator:
@@ -118,12 +114,10 @@ class MetricAccumulator:
         """Prunes to the kept modes, then folds this batch's minADE, minFDE and
         mode-pruning counts into the running totals.
         """
-        pruned = prune_modes(
-            predicted.trajectories, predicted.confidence_logits
-        )
-        distances = (
-            pruned.trajectories - targets.future_positions.unsqueeze(1)
-        ).norm(dim=-1)
+        logits = predicted.confidence_logits
+        pruned = prune_modes(predicted.trajectories, logits)
+        logged = targets.future_positions.unsqueeze(1)
+        distances = (pruned.trajectories - logged).norm(dim=-1)
         average_distances = mode_distances(pruned.trajectories, targets)
 
         has_valid_step = targets.future_mask.any(dim=-1)
@@ -136,11 +130,10 @@ class MetricAccumulator:
         self.fde_sum += (best_final * final_valid).sum()
         self.fde_count += final_valid.sum()
 
+        backfilled = pruned.kept_count < contract.NUM_PREDICTED_MODES
         self.kept_mode_sum += pruned.kept_count.sum()
-        self.backfilled_count += (
-            pruned.kept_count < contract.NUM_PREDICTED_MODES
-        ).sum()
-        self.sample_count += predicted.confidence_logits.shape[0]
+        self.backfilled_count += backfilled.sum()
+        self.sample_count += logits.shape[0]
 
     def results(self) -> MonitorResults:
         return MonitorResults(
@@ -151,39 +144,57 @@ class MetricAccumulator:
         )
 
 
+class Tally:
+    """Losses summed per batch and the pruned monitor, over one stretch of
+    batches; the epoch keeps one and each logging window another.
+    """
+
+    def __init__(self) -> None:
+        self.batch_count = 0
+        self.loss_sums = LossValues(0.0, 0.0, 0.0)
+        self.monitor = MetricAccumulator()
+
+    def add(self, losses: LossValues) -> None:
+        self.batch_count += 1
+        self.loss_sums = self.loss_sums.plus(losses)
+
+    def mean_losses(self) -> LossValues:
+        return self.loss_sums.over(self.batch_count)
+
+
 class EpochProgress:
-    """Running totals for one epoch, the losses, the training monitor,
-    optimiser health and timing, overall and per logging window.
+    """Running totals for one epoch: losses and the monitor for the epoch and
+    for the current logging window, optimiser health, and timing.
     """
 
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self.accumulator = MetricAccumulator()
-        self.window_accumulator = MetricAccumulator()
-        self.loss_sums = LossValues(0.0, 0.0, 0.0)
-        self.window_loss_sums = LossValues(0.0, 0.0, 0.0)
+        self.epoch = Tally()
+        self.window = Tally()
         self.seconds = PhaseSeconds()
-        self.batch_count = 0
         self.sample_count = 0
         self.non_finite_count = 0
         self.skipped_count = 0
         self.clipped_count = 0
-        self.window_winner_counts = torch.zeros(
+        self.winner_counts = torch.zeros(
             QUERY_COUNT, dtype=torch.long, device=device
         )
+
+    @property
+    def batch_count(self) -> int:
+        return self.epoch.batch_count
 
     def record_step(self, step: TrainingStep, outcome: StepOutcome) -> bool:
         """Folds one step's losses and optimiser health into the totals, and
         returns whether the total loss was finite.
         """
         losses = LossValues(*(float(term.detach()) for term in step.losses))
-        self.loss_sums = self.loss_sums.plus(losses)
-        self.window_loss_sums = self.window_loss_sums.plus(losses)
+        self.epoch.add(losses)
+        self.window.add(losses)
         total_is_finite = math.isfinite(losses.total)
         self.non_finite_count += int(not total_is_finite)
         self.clipped_count += int(outcome.clipped)
         self.skipped_count += int(outcome.skipped)
-        self.batch_count += 1
         return total_is_finite
 
     def record_monitor(self, step: TrainingStep, batch: SceneBatch) -> None:
@@ -191,47 +202,47 @@ class EpochProgress:
         win; the pruned minADE and minFDE run on one batch in
         LOG_EVERY_BATCHES, because pruning is the monitor's slow part.
         """
-        self.sample_count += batch.targets.agent_history.shape[0]
-        predicted = ModePredictions(
-            *(tensor.detach().float() for tensor in step.predicted)
-        )
+        targets = batch.targets
+        self.sample_count += targets.agent_history.shape[0]
+        detached = (tensor.detach().float() for tensor in step.predicted)
+        predicted = ModePredictions(*detached)
         with torch.no_grad():
-            winners = mode_distances(
-                predicted.trajectories, batch.targets
-            ).argmin(dim=1)
-            self.window_winner_counts.scatter_add_(
+            distances = mode_distances(predicted.trajectories, targets)
+            winners = distances.argmin(dim=1)
+            self.winner_counts.scatter_add_(
                 0, winners, torch.ones_like(winners)
             )
             if self.batch_count % LOG_EVERY_BATCHES != 0:
                 return
-            self.accumulator.update(predicted, batch.targets)
-            self.window_accumulator.update(predicted, batch.targets)
+            self.epoch.monitor.update(predicted, targets)
+            self.window.monitor.update(predicted, targets)
 
-    def window_scalars(self, learning_rate: float) -> dict[str, float]:
-        """The table reported every LOG_EVERY_BATCHES, the losses, the training
+    def peak_gigabytes(self) -> float:
+        if self.device.type != "cuda":
+            return 0.0
+        return torch.cuda.max_memory_allocated() / 1e9
+
+    def window_scalars(self, learning_rate: float) -> Scalars:
+        """The table reported every LOG_EVERY_BATCHES: the losses, the training
         monitor, optimiser health and where the time went.
         """
-        monitor = self.accumulator.results()
-        window_monitor = self.window_accumulator.results()
-        never_win_count = int((self.window_winner_counts == 0).sum())
-        peak_gigabytes = 0.0
-        if self.device.type == "cuda":
-            peak_gigabytes = torch.cuda.max_memory_allocated() / 1e9
-        averages = self.loss_sums.over(self.batch_count)
+        losses = self.epoch.mean_losses()
+        monitor = self.epoch.monitor.results()
+        window = self.window.monitor.results()
+        never_win_count = int((self.winner_counts == 0).sum())
         seconds = self.seconds
         elapsed = seconds.elapsed()
         return {
-            "loss/total": averages.total,
-            "loss/regression": averages.regression,
-            "loss/classification": averages.classification,
-            "loss_window/total": self.window_loss_sums.total
-            / LOG_EVERY_BATCHES,
+            "loss/total": losses.total,
+            "loss/regression": losses.regression,
+            "loss/classification": losses.classification,
+            "loss_window/total": self.window.mean_losses().total,
             "monitor/ade_80step": monitor.min_ade,
             "monitor/fde_80step": monitor.min_fde,
-            "monitor_window/ade_80step": window_monitor.min_ade,
-            "monitor_window/fde_80step": window_monitor.min_fde,
-            "monitor_window/kept_modes": window_monitor.mean_kept_modes,
-            "monitor_window/backfill_rate": window_monitor.backfill_rate,
+            "monitor_window/ade_80step": window.min_ade,
+            "monitor_window/fde_80step": window.min_fde,
+            "monitor_window/kept_modes": window.mean_kept_modes,
+            "monitor_window/backfill_rate": window.backfill_rate,
             "monitor_window/never_win_anchors": never_win_count,
             "health/non_finite_losses": self.non_finite_count,
             "health/skipped_steps": self.skipped_count,
@@ -241,23 +252,20 @@ class EpochProgress:
             "time_share/data_wait": seconds.data_wait / elapsed,
             "time_share/step": seconds.step / elapsed,
             "time_share/monitor": seconds.monitor / elapsed,
-            "memory/peak_gigabytes": peak_gigabytes,
+            "memory/peak_gigabytes": self.peak_gigabytes(),
         }
 
     def start_new_window(self) -> None:
-        self.window_accumulator = MetricAccumulator()
-        self.window_loss_sums = LossValues(0.0, 0.0, 0.0)
-        self.window_winner_counts.zero_()
+        self.window = Tally()
+        self.winner_counts.zero_()
 
     def summary(self) -> EpochSummary:
-        return EpochSummary(
-            losses=self.loss_sums.over(self.batch_count),
-            monitor=self.accumulator.results(),
-            seconds=self.seconds,
-        )
+        losses = self.epoch.mean_losses()
+        monitor = self.epoch.monitor.results()
+        return EpochSummary(losses, monitor, self.seconds)
 
 
-def epoch_scalars(summary: EpochSummary) -> dict[str, float]:
+def epoch_scalars(summary: EpochSummary) -> Scalars:
     """The epoch report's table, keyed by the names its charts use."""
     losses, monitor, seconds = summary
     return {

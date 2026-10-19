@@ -6,15 +6,20 @@ file.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple, Union
+from typing import Any, List, NamedTuple, Union
 
 import numpy as np
 from numpy import ndarray
 
 from womd import contract, frame_ops
+from womd.contract import SIGNAL_HISTORY_SHAPE, StagedFile
 from womd.frame_ops import Frame
+
+# typing.List, since the scorer container's Python 3.8 cannot
+# subscript list at import time.
+Arrays = List[ndarray]
 
 # The map an agent sees is cropped around it. A faster agent
 # covers more road in 8 s, so the crop stretches ahead with speed.
@@ -26,10 +31,6 @@ FUTURE = slice(contract.CURRENT_STEP_INDEX + 1, None)
 HEADING = slice(contract.AGENT_HEADING_COSINE, contract.AGENT_HEADING_SINE + 1)
 LANE_KIND_COLUMN = contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index(
     "lane"
-)
-SIGNAL_HISTORY_SHAPE = (
-    contract.HISTORY_STEPS,
-    contract.NUM_TRAFFIC_SIGNAL_STATES,
 )
 
 
@@ -160,43 +161,29 @@ def lane_signal_histories(scenario: StagedScenario) -> ndarray:
     return histories
 
 
-def staged_scenario(staged: Mapping[str, ndarray]) -> StagedScenario:
-    """Builds a StagedScenario from the arrays of a staged file, deriving
-    which feature each map dot belongs to.
+def staged_scenario(staged: StagedFile) -> StagedScenario:
+    """The staged arrays the model reads, with the feature each map dot
+    belongs to derived from the feature lengths.
     """
-    feature_lengths = staged["feature_lengths"]
+    feature_lengths = staged.feature_lengths
     dot_polyline = np.repeat(np.arange(len(feature_lengths)), feature_lengths)
+    scene_frame = Frame(staged.frame_origin, float(staged.frame_heading))
     return StagedScenario(
-        scenario_id=str(staged["scenario_id"]),
-        scene_frame=Frame(
-            staged["frame_origin"], float(staged["frame_heading"])
-        ),
-        track_ids=staged["track_ids"],
-        track_rows=staged["track_rows"],
-        track_valid=staged["track_valid"],
-        is_designated_target=staged["is_designated_target"],
-        map_rows=staged["map_rows"],
+        scenario_id=str(staged.scenario_id),
+        scene_frame=scene_frame,
+        track_ids=staged.track_ids,
+        track_rows=staged.track_rows,
+        track_valid=staged.track_valid,
+        is_designated_target=staged.is_designated_target,
+        map_rows=staged.map_rows,
         feature_lengths=feature_lengths,
-        polyline_signal_histories=staged["polyline_signal_histories"],
+        polyline_signal_histories=staged.polyline_signal_histories,
         map_dot_polyline_index=dot_polyline,
     )
 
 
 def read_scenario(path: Path | str) -> StagedScenario:
-    """Loads one staged .npz scenario and checks its provenance stamp."""
-    with np.load(path) as scenario_file:
-        staged = {name: scenario_file[name] for name in scenario_file.files}
-    if "provenance" in staged:
-        hint = "Restage the directory with stage.py."
-        contract.check_provenance(staged["provenance"], path, hint)
-    dot_count = int(staged["feature_lengths"].sum())
-    row_count = len(staged["map_rows"])
-    if dot_count != row_count:
-        raise ValueError(
-            f"{path}: feature_lengths sum to {dot_count}"
-            f" over {row_count} map rows"
-        )
-    return staged_scenario(staged)
+    return staged_scenario(StagedFile.load(path))
 
 
 def chunk_dots(dot_polyline: ndarray) -> tuple[ndarray, ndarray]:
@@ -387,7 +374,7 @@ def scene_sample(scenario: StagedScenario, indices: list[int]) -> SceneSample:
     return SceneView(scenario).sample(indices)
 
 
-def pad_and_stack(arrays: list[ndarray], length: int, dtype: type) -> ndarray:
+def pad_and_stack(arrays: Arrays, length: int, dtype: type) -> ndarray:
     """Stacks arrays whose first axis varies, zero-padding each to length."""
     padded = np.zeros((len(arrays), length) + arrays[0].shape[1:], dtype=dtype)
     for row, array in zip(padded, arrays):
@@ -469,42 +456,34 @@ class BatchBuilder:
 
     def __init__(self, samples: list[SceneSample]) -> None:
         self.samples = samples
-        self.targets = [
-            target for sample in samples for target in sample.targets
-        ]
+        self.targets = []
+        self.scene_of_target = []
+        for index, sample in enumerate(samples):
+            self.targets.extend(sample.targets)
+            self.scene_of_target.extend([index] * len(sample.targets))
         self.agents = max(len(sample.scene_agent_history) for sample in samples)
         self.chunks = max(
             len(sample.map_chunk_signal_history) for sample in samples
         )
 
-    def scene_field(self, name: str, width: int, dtype: type) -> ndarray:
-        arrays = [getattr(sample, name) for sample in self.samples]
-        return pad_and_stack(arrays, width, dtype)
-
-    def target_field(self, name: str) -> ndarray:
-        return np.stack([getattr(target, name) for target in self.targets])
-
-    def token_field(self, names: tuple[str, str], dtype: type) -> ndarray:
-        """One per-token entry across every target, in token order, the padded
-        scene agents and then the padded map chunks.
+    def tokens(self, agents: Arrays, chunks: Arrays, dtype: type) -> ndarray:
+        """Per-token arrays in token order, the padded scene agents and then
+        the padded map chunks.
         """
-        agent_name, chunk_name = names
-        agent_arrays = [getattr(target, agent_name) for target in self.targets]
-        chunk_arrays = [getattr(target, chunk_name) for target in self.targets]
-        agent_part = pad_and_stack(agent_arrays, self.agents, dtype)
-        chunk_part = pad_and_stack(chunk_arrays, self.chunks, dtype)
+        agent_part = pad_and_stack(agents, self.agents, dtype)
+        chunk_part = pad_and_stack(chunks, self.chunks, dtype)
         return np.concatenate([agent_part, chunk_part], axis=1)
 
     def scene_arrays(self) -> SceneArrays:
+        samples = self.samples
+        histories = [sample.scene_agent_history for sample in samples]
+        masks = [sample.scene_agent_history_mask for sample in samples]
+        signals = [sample.scene_agent_signal_history for sample in samples]
         return SceneArrays(
-            agent_history=self.scene_field(
-                "scene_agent_history", self.agents, np.float32
-            ),
-            agent_history_mask=self.scene_field(
-                "scene_agent_history_mask", self.agents, bool
-            ),
-            agent_signal_history=self.scene_field(
-                "scene_agent_signal_history", self.agents, np.float32
+            agent_history=pad_and_stack(histories, self.agents, np.float32),
+            agent_history_mask=pad_and_stack(masks, self.agents, bool),
+            agent_signal_history=pad_and_stack(
+                signals, self.agents, np.float32
             ),
         )
 
@@ -515,35 +494,41 @@ class BatchBuilder:
         for index, sample in enumerate(self.samples):
             dot_slots.append(sample.map_chunk_index + index * self.chunks)
         rows = [sample.map_rows for sample in self.samples]
+        signals = [sample.map_chunk_signal_history for sample in self.samples]
         return MapArrays(
             rows=np.concatenate(rows, dtype=np.float32),
             dot_chunk_slot=np.concatenate(dot_slots, dtype=np.int64),
-            chunk_signal_history=self.scene_field(
-                "map_chunk_signal_history", self.chunks, np.float32
+            chunk_signal_history=pad_and_stack(
+                signals, self.chunks, np.float32
             ),
         )
 
     def target_arrays(self) -> TargetArrays:
-        scene_of_target = []
-        for index, sample in enumerate(self.samples):
-            scene_of_target.extend([index] * len(sample.targets))
-        visible_names = ("agent_token_visible", "chunk_token_visible")
-        pose_names = ("agent_token_pose", "chunk_token_pose")
+        targets = self.targets
+        agent_visible = [target.agent_token_visible for target in targets]
+        chunk_visible = [target.chunk_token_visible for target in targets]
+        agent_poses = [target.agent_token_pose for target in targets]
+        chunk_poses = [target.chunk_token_pose for target in targets]
+        histories = [target.agent_history for target in targets]
+        masks = [target.agent_history_mask for target in targets]
+        signals = [target.agent_signal_history for target in targets]
+        futures = [target.future_positions for target in targets]
+        future_masks = [target.future_mask for target in targets]
         return TargetArrays(
-            scene_index=np.array(scene_of_target, dtype=np.int64),
-            agent_history=self.target_field("agent_history"),
-            agent_history_mask=self.target_field("agent_history_mask"),
-            agent_signal_history=self.target_field("agent_signal_history"),
-            token_visible=self.token_field(visible_names, bool),
-            token_pose=self.token_field(pose_names, np.float32),
-            future_positions=self.target_field("future_positions"),
-            future_mask=self.target_field("future_mask"),
+            scene_index=np.array(self.scene_of_target, dtype=np.int64),
+            agent_history=np.stack(histories),
+            agent_history_mask=np.stack(masks),
+            agent_signal_history=np.stack(signals),
+            token_visible=self.tokens(agent_visible, chunk_visible, bool),
+            token_pose=self.tokens(agent_poses, chunk_poses, np.float32),
+            future_positions=np.stack(futures),
+            future_mask=np.stack(future_masks),
         )
 
     def build(self) -> SceneBatch:
-        return SceneBatch(
-            self.scene_arrays(), self.map_arrays(), self.target_arrays()
-        )
+        scene = self.scene_arrays()
+        scene_map = self.map_arrays()
+        return SceneBatch(scene, scene_map, self.target_arrays())
 
 
 def scene_batch(samples: list[SceneSample]) -> SceneBatch:

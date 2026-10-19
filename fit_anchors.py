@@ -76,42 +76,55 @@ def extract_endpoints(paths: list[Path]) -> Endpoints:
     )
 
 
-def cached_endpoints(staged_directory: Path) -> Endpoints:
-    """Extracting endpoints reads the whole staged directory, so the result is
-    cached beside it and reused while its provenance matches this code.
+def cache_path_of(staged_directory: Path) -> Path:
+    """Endpoints are cached beside the staged directory they came from."""
+    name = f"{staged_directory.name}_endpoints_cache.npz"
+    return staged_directory.parent / name
+
+
+def read_cache(cache_path: Path) -> Endpoints | None:
+    """The cached endpoints, or None when there is no cache or it was written
+    by another code version.
     """
-    cache_path = (
-        staged_directory.parent / f"{staged_directory.name}_endpoints_cache.npz"
-    )
-    if cache_path.exists():
-        with np.load(cache_path) as cache:
-            stamp = cache["provenance"] if "provenance" in cache else None
-            try:
-                contract.check_provenance(
-                    stamp, cache_path, "Re-extracting endpoints now."
-                )
-            except ValueError as refusal:
-                print(refusal)
-            else:
-                print(f"endpoints read from {cache_path}")
-                return Endpoints(
-                    torch.from_numpy(cache["endpoints"]),
-                    torch.from_numpy(cache["predicted_type_index"]),
-                    torch.from_numpy(cache["reachable_distance_metres"]),
-                )
-    endpoints = extract_endpoints(sorted(staged_directory.glob("*.npz")))
+    if not cache_path.exists():
+        return None
+    with np.load(cache_path) as cache:
+        stamp = cache["provenance"] if "provenance" in cache else None
+        try:
+            contract.check_provenance(stamp, cache_path, "Re-extracting.")
+        except ValueError as refusal:
+            print(refusal)
+            return None
+        positions = torch.from_numpy(cache["endpoints"])
+        type_index = torch.from_numpy(cache["predicted_type_index"])
+        reachable = torch.from_numpy(cache["reachable_distance_metres"])
+    print(f"endpoints read from {cache_path}")
+    return Endpoints(positions, type_index, reachable)
+
+
+def write_cache(cache_path: Path, endpoints: Endpoints, source: Path) -> None:
+    reachable = endpoints.reachable_metres.numpy()
     np.savez(
         cache_path,
         endpoints=endpoints.positions.numpy().astype(np.float32),
         predicted_type_index=endpoints.type_index.numpy().astype(np.int64),
-        reachable_distance_metres=endpoints.reachable_metres.numpy().astype(
-            np.float32
-        ),
-        provenance=contract.artifact_provenance(
-            "fit_anchors.py", staged_directory
-        ),
+        reachable_distance_metres=reachable.astype(np.float32),
+        provenance=contract.artifact_provenance("fit_anchors.py", source),
     )
     print(f"endpoints cached to {cache_path}")
+
+
+def cached_endpoints(staged_directory: Path) -> Endpoints:
+    """Extracting endpoints reads the whole staged directory, so the result is
+    cached and reused while its provenance matches this code.
+    """
+    cache_path = cache_path_of(staged_directory)
+    cached = read_cache(cache_path)
+    if cached is not None:
+        return cached
+    paths = sorted(staged_directory.glob("*.npz"))
+    endpoints = extract_endpoints(paths)
+    write_cache(cache_path, endpoints, staged_directory)
     return endpoints
 
 

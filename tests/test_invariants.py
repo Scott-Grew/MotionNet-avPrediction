@@ -682,7 +682,7 @@ def test_scorer_tensors_group_by_scenario(tmp_path):
         contract.SUBMISSION_STEPS,
         2,
     )
-    predictions = runner.SubmissionArrays(
+    predictions = contract.Submission(
         scenario_id=np.array(prediction_scenario_ids),
         track_id=np.array(prediction_track_ids, dtype=np.int64),
         world_trajectories=np.random.default_rng(0).normal(
@@ -691,6 +691,7 @@ def test_scorer_tensors_group_by_scenario(tmp_path):
         confidences=np.full(
             (target_count, contract.NUM_PREDICTED_MODES), 1.0 / 6.0
         ),
+        provenance=contract.artifact_provenance("test", "scorer-tensors"),
     )
 
     tensors = runner.metric_inputs(predictions, tmp_path)
@@ -794,21 +795,22 @@ def two_lane_signal_scenario(track_count, signalled_history):
     if track_count > 2:
         track_rows[2, :, contract.AGENT_POSITION] = np.array([7.0, 0.0])
         track_valid[2, contract.CURRENT_STEP_INDEX] = False
-    scenario = {
-        "map_rows": np.concatenate([signalled_lane, unsignalled_lane]),
-        "feature_lengths": np.array([11, 11], dtype=np.int64),
-        "feature_ids": np.array([101, 102], dtype=np.int64),
-        "polyline_signal_histories": polyline_signal_histories,
-        "track_rows": track_rows,
-        "track_valid": track_valid,
-        "scenario_id": np.array("two-lane"),
-        "frame_origin": np.zeros(2, dtype=np.float32),
-        "frame_heading": np.float32(0.0),
-        "track_ids": np.arange(track_count),
-        "is_designated_target": np.ones(track_count, dtype=bool),
-        "is_object_of_interest": np.zeros(track_count, dtype=bool),
-    }
-    return loader.staged_scenario(scenario)
+    staged = contract.StagedFile(
+        track_rows=track_rows,
+        track_valid=track_valid,
+        track_ids=np.arange(track_count),
+        is_designated_target=np.ones(track_count, dtype=bool),
+        is_object_of_interest=np.zeros(track_count, dtype=bool),
+        map_rows=np.concatenate([signalled_lane, unsignalled_lane]),
+        feature_lengths=np.array([11, 11], dtype=np.int64),
+        feature_ids=np.array([101, 102], dtype=np.int64),
+        feature_is_interpolating=np.zeros(2, dtype=bool),
+        polyline_signal_histories=polyline_signal_histories,
+        frame_origin=np.zeros(2, dtype=np.float32),
+        frame_heading=np.float32(0.0),
+        scenario_id=np.array("two-lane"),
+    )
+    return loader.staged_scenario(staged)
 
 
 def test_agents_carry_their_lane_signal_history():
