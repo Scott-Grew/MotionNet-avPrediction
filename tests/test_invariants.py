@@ -137,15 +137,6 @@ def future_targets(future_positions, future_mask):
     return TargetArrays(*blanks, future_positions, future_mask)
 
 
-def predictions_of(trajectories, confidence_logits):
-    """A ModePredictions carrying only what the monitor reads."""
-    blank_sigma = torch.zeros_like(trajectories)
-    blank_anchors = torch.zeros(*confidence_logits.shape, 2)
-    return ModePredictions(
-        trajectories, blank_sigma, confidence_logits, blank_anchors
-    )
-
-
 def test_agent_frame_transform_inverts():
     """Into an agent's frame and back out returns the same world positions."""
     random_generator = np.random.default_rng(3)
@@ -529,43 +520,6 @@ def test_submission_returns_to_the_world_frame():
     )
 
 
-def test_backfill_monitor_detects_a_repeated_future():
-    """Six distinct futures read as no backfill; one future repeated six times
-    reads as full backfill.
-    """
-    torch.manual_seed(101)
-    sample_count = 2
-    confidence_logits = torch.randn(sample_count, model.QUERY_COUNT)
-    future_positions = torch.zeros(sample_count, contract.FUTURE_STEPS, 2)
-    future_mask = torch.ones(
-        sample_count, contract.FUTURE_STEPS, dtype=torch.bool
-    )
-    targets = future_targets(future_positions, future_mask)
-
-    separated = torch.zeros(
-        sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
-    )
-    mode_numbers = torch.arange(1, model.QUERY_COUNT + 1, dtype=torch.float32)
-    separated[:, :, -1, 0] = 2.0 * pruning.PRUNE_DISTANCE_METRES * mode_numbers
-    collapsed = torch.zeros_like(separated)
-
-    separated_accumulator = metrics.MetricAccumulator()
-    separated_accumulator.update(
-        predictions_of(separated, confidence_logits), targets
-    )
-    collapsed_accumulator = metrics.MetricAccumulator()
-    collapsed_accumulator.update(
-        predictions_of(collapsed, confidence_logits), targets
-    )
-
-    assert separated_accumulator.results().mean_kept_modes == float(
-        contract.NUM_PREDICTED_MODES
-    )
-    assert separated_accumulator.results().backfill_rate == 0.0
-    assert collapsed_accumulator.results().mean_kept_modes == 1.0
-    assert collapsed_accumulator.results().backfill_rate == 1.0
-
-
 def test_constant_velocity_null_keeps_the_logged_speed():
     """A straight-moving agent is carried at exactly its logged velocity."""
     logged_velocity = torch.tensor([[11.0, -4.0], [0.0, 0.0]])
@@ -762,8 +716,10 @@ def test_input_order_does_not_change_predictions():
         ),
     )
     with torch.no_grad():
-        base_trajectories, base_logits = predictor(batch)
-        permuted_trajectories, permuted_logits = predictor(permuted)
+        base = predictor(batch)
+        permuted_output = predictor(permuted)
+    base_trajectories, _, base_logits, _ = base
+    permuted_trajectories, _, permuted_logits, _ = permuted_output
     assert torch.allclose(base_trajectories, permuted_trajectories, atol=1e-4)
     assert torch.allclose(base_logits, permuted_logits, atol=1e-5)
 
@@ -870,12 +826,12 @@ def test_target_prediction_ignores_batch_company():
         loader.scene_sample(three_track_scenario, [0, 1, 2]),
     ]
     with torch.no_grad():
-        alone, _ = predictor(
-            pipeline.torch_batch(loader.scene_batch([alone_sample]))
+        alone_batch = pipeline.torch_batch(loader.scene_batch([alone_sample]))
+        together_batch = pipeline.torch_batch(
+            loader.scene_batch(together_samples)
         )
-        together, _ = predictor(
-            pipeline.torch_batch(loader.scene_batch(together_samples))
-        )
+        alone = predictor(alone_batch).trajectories
+        together = predictor(together_batch).trajectories
     assert torch.allclose(alone[0], together[2], atol=1e-4)
 
 
@@ -900,7 +856,7 @@ def test_zero_head_output_lands_on_the_anchor():
     )
     batch = synthetic_scene_batch(size)
     with torch.no_grad():
-        predicted = predictor.predict(batch)
+        predicted = predictor(batch)
     assert torch.allclose(
         predicted.trajectories[:, :, -1], unit_anchors, atol=1e-4
     )
@@ -1056,7 +1012,7 @@ def test_every_model_output_moves_the_loss():
     )
     batch = synthetic_scene_batch(size)
     with torch.no_grad():
-        emitted = predictor.predict(batch)
+        emitted = predictor(batch)
     perturbations = {
         "trajectories": lambda value: value + 1.0,
         "log_standard_deviation": lambda value: value + 1.0,
@@ -1090,7 +1046,7 @@ def test_no_step_uncertainty_starts_saturated():
     )
     batch = synthetic_scene_batch(size)
     with torch.no_grad():
-        predicted = predictor.predict(batch)
+        predicted = predictor(batch)
     assert predicted.trajectories.isfinite().all()
     assert predicted.confidence_logits.isfinite().all()
     log_sigma = predicted.log_standard_deviation
@@ -1139,7 +1095,8 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
     accumulator = metrics.MetricAccumulator()
     detached = ModePredictions(*(tensor.detach() for tensor in step.predicted))
     accumulator.update(detached, batch.targets)
-    assert all(math.isfinite(value) for value in accumulator.results())
+    assert math.isfinite(accumulator.min_ade())
+    assert math.isfinite(accumulator.min_fde())
     checkpoint_path = tmp_path / "predictor.pt"
     torch.save(predictor.state_dict(), checkpoint_path)
     reloaded_state = torch.load(checkpoint_path)

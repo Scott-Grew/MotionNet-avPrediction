@@ -1,7 +1,7 @@
 """Step 3 of 5.
 
-Trains the model on staged scenarios; resumable, with a time budget so a session
-stops cleanly. Runs as one process, or as one process per GPU under torchrun.
+Trains the model on staged scenarios on one device; resumable, with a time
+budget so a Kaggle session stops cleanly before it is cut off.
 """
 
 from __future__ import annotations
@@ -9,19 +9,14 @@ from __future__ import annotations
 import womd.runtime_env  # noqa: F401
 
 import argparse
-import contextlib
 import math
-import os
 import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
-import torch.distributed as distributed
 from torch import Tensor, nn
-from torch.distributed.algorithms.join import Join
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from womd import loader, loss, pipeline
@@ -57,28 +52,26 @@ Batches = Iterable[SceneBatch]
 Scalars = dict[str, float]
 
 
-class Processes(NamedTuple):
-    """Where this process sits among the processes torchrun started; a plain
-    launch is one process of one.
-    """
-
-    count: int
-    rank: int
-    local_rank: int
-    is_main: bool
-
-
 class EpochPlan(NamedTuple):
-    """The optimiser steps in one epoch and the launch layout that fixes it; a
-    checkpoint stores it so a resumed run with the same layout reuses it.
+    """The optimiser steps in one epoch and the settings that fix it. Counting
+    opens every staged file, so a checkpoint stores the plan and a resumed run
+    with the same settings reuses it.
     """
 
     scenario_count: int
-    process_count: int
     worker_count: int
-    per_process_batch_size: int
+    batch_size: int
     designated_only: bool
     steps_per_epoch: int
+
+    @classmethod
+    def stored(cls, record: dict[str, Any] | None) -> EpochPlan | None:
+        """The plan a checkpoint holds, or None when it holds none or was
+        written with other fields.
+        """
+        if record is None or set(record) != set(cls._fields):
+            return None
+        return cls(**record)
 
 
 class Schedule(NamedTuple):
@@ -116,23 +109,7 @@ class Reporter:
             self.writer.add_scalar(name, value, step)
         printed = [f"{name} {value:.4g}" for name, value in scalars.items()]
         print(" | ".join([heading] + printed), flush=True)
-
-    def flush(self) -> None:
         self.writer.flush()
-
-
-class RunSettings(NamedTuple):
-    """The settings of a run that stay fixed from its first batch to its
-    last. Only the main process holds a reporter.
-    """
-
-    checkpoint_path: Path
-    checkpoint_every_seconds: float
-    seed: int
-    gradient_clip_norm: float
-    schedule: Schedule
-    reporter: Reporter | None
-    epoch_plan: EpochPlan
 
 
 def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
@@ -154,7 +131,7 @@ def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
 
 def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
     """Optimiser steps per epoch, the sum over worker streams of ceil(targets
-    / batch size), because each worker fills its own batches.
+    / batch size), because each DataLoader worker fills its own batches.
     """
     stream_count = max(settings.worker_count, 1)
     step_count = 0
@@ -179,37 +156,14 @@ def remaining_epochs(completed: int, requested: int) -> range:
 
 def training_step(predictor: nn.Module, batch: SceneBatch) -> TrainingStep:
     """Runs the predictor on a batch and returns its losses and predictions."""
-    predicted = predictor(batch, for_training=True)
+    predicted = predictor(batch)
     return TrainingStep(loss.loss_terms(predicted, batch.targets), predicted)
 
 
-def agreed_with_main_process(decision: bool, device: torch.device) -> bool:
-    """Process 0's decision, shared with every process so they all stop
-    together. Every process must make this call or the broadcast hangs.
-    """
-    if not distributed.is_initialized():
-        return decision
-    shared = torch.tensor(int(decision), device=device)
-    distributed.broadcast(shared, src=0)
-    return bool(shared.item())
-
-
-def start_processes() -> tuple[Processes, torch.device]:
-    """Reads the process layout torchrun sets in the environment, picks this
-    process's device, and joins the process group when there are several.
-    """
-    count = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    device = torch.device("cpu")
+def training_device() -> torch.device:
     if torch.cuda.is_available():
-        device = torch.device("cuda", local_rank)
-        torch.cuda.set_device(device)
-    if count > 1:
-        distributed.init_process_group(
-            "nccl" if device.type == "cuda" else "gloo"
-        )
-    return Processes(count, rank, local_rank, rank == 0), device
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -239,19 +193,13 @@ def parse_arguments() -> argparse.Namespace:
 
 class TrainingRun:
     """One launch of train.py, set up in full before the first batch: the
-    processes, the model with its optimiser and scaler restored from any
-    checkpoint, this process's share of the scenarios, the epoch plan and the
-    run settings. run() is the epoch loop.
+    model with its optimiser and scaler restored from any checkpoint, the
+    epoch plan and the learning-rate schedule. run() is the epoch loop.
     """
 
     def __init__(self, arguments: argparse.Namespace) -> None:
         self.arguments = arguments
-        self.processes, self.device = start_processes()
-        if arguments.batch_size % self.processes.count != 0:
-            raise ValueError(
-                f"--batch-size {arguments.batch_size} does not split"
-                f" over {self.processes.count} processes"
-            )
+        self.device = training_device()
         torch.manual_seed(arguments.seed)
         anchors = load_anchor_file(arguments.anchors)
         predictor = MotionPredictor(anchors).to(self.device)
@@ -262,39 +210,15 @@ class TrainingRun:
         self.trained = TrainingObjects(predictor, optimizer, scaler)
         self.completed_epochs, stored_plan = self.resume()
 
-        every_path = sorted(arguments.staged_directory.glob("*.npz"))
-        self.paths = every_path[self.processes.rank :: self.processes.count]
+        self.paths = sorted(arguments.staged_directory.glob("*.npz"))
         if not self.paths:
             raise FileNotFoundError(
                 f"no .npz scenarios in {arguments.staged_directory}"
             )
-        self.settings = self.run_settings(self.plan_epochs(stored_plan))
-        if self.processes.count > 1:
-            self.wrap_for_processes()
-
-    def wrap_for_processes(self) -> None:
-        """Wraps the model so gradients are averaged across processes; done
-        after resume so the checkpoint loads into the bare model.
-        """
-        device_ids = None
-        if self.device.type == "cuda":
-            device_ids = [self.processes.local_rank]
-        predictor = self.trained.predictor
-        wrapped = DistributedDataParallel(predictor, device_ids=device_ids)
-        self.trained = self.trained._replace(predictor=wrapped)
-
-    def announce(self, message: str) -> None:
-        if self.processes.is_main:
-            print(message, flush=True)
-
-    def stopped(self, should_stop: bool, message: str) -> bool:
-        """Whether the main process's stop decision holds, announcing message
-        when it does. Every process must make this call together.
-        """
-        if not agreed_with_main_process(should_stop, self.device):
-            return False
-        self.announce(message)
-        return True
+        self.plan = self.plan_epochs(stored_plan)
+        self.schedule = self.learning_rate_schedule()
+        tensorboard = arguments.checkpoint_path.parent / "tensorboard"
+        self.reporter = Reporter(tensorboard)
 
     def resume(self) -> tuple[int, EpochPlan | None]:
         """Loads the checkpoint when --resume is set and returns how many epochs
@@ -307,10 +231,7 @@ class TrainingRun:
         path = self.arguments.checkpoint_path
         if not path.exists() and previous_path(path).exists():
             path = previous_path(path)
-            self.announce(
-                f"{self.arguments.checkpoint_path} missing,"
-                f" resuming from {path}"
-            )
+            print(f"checkpoint missing, resuming from {path}", flush=True)
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
@@ -320,14 +241,14 @@ class TrainingRun:
             scaler_state = checkpoint["gradient_scaler_state"]
             self.trained.scaler.load_state_dict(scaler_state)
         completed = checkpoint["completed_epochs"]
-        self.announce(f"resuming {path}: {completed} epochs complete")
-        stored = checkpoint.get("epoch_plan")
-        return completed, None if stored is None else EpochPlan(**stored)
+        print(f"resuming {path}: {completed} epochs complete", flush=True)
+        stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
+        return completed, stored
 
     def batch_settings(self, epoch_index: int) -> BatchSettings:
         arguments = self.arguments
         return BatchSettings(
-            batch_size=arguments.batch_size // self.processes.count,
+            batch_size=arguments.batch_size,
             worker_count=arguments.workers,
             prefetch_batches=arguments.prefetch,
             seed=arguments.seed + epoch_index,
@@ -336,88 +257,61 @@ class TrainingRun:
 
     def plan_epochs(self, stored: EpochPlan | None) -> EpochPlan:
         """The optimiser steps in one epoch, which the learning-rate schedule is
-        measured in. Counting opens every staged file, so the count is saved in
-        the checkpoint and reused while the scenarios and the launch layout are
-        unchanged.
+        measured in, read from the checkpoint when the settings match.
         """
         settings = self.batch_settings(0)
-        layout = EpochPlan(
-            scenario_count=len(self.paths) * self.processes.count,
-            process_count=self.processes.count,
+        settings_now = EpochPlan(
+            scenario_count=len(self.paths),
             worker_count=settings.worker_count,
-            per_process_batch_size=settings.batch_size,
+            batch_size=settings.batch_size,
             designated_only=settings.designated_only,
             steps_per_epoch=0,
         )
-        if stored is not None and stored._replace(steps_per_epoch=0) == layout:
-            self.announce("optimiser step count read from the checkpoint")
+        if (
+            stored is not None
+            and stored._replace(steps_per_epoch=0) == settings_now
+        ):
+            print("optimiser step count read from the checkpoint", flush=True)
             return stored
         count = steps_per_epoch(self.paths, settings)
-        if self.processes.count > 1:
-            # Every process uses the longest share's step count, so the
-            # schedule is the same everywhere.
-            longest = torch.tensor(count, device=self.device)
-            distributed.all_reduce(longest, op=distributed.ReduceOp.MAX)
-            count = int(longest.item())
         epochs = self.arguments.epochs
-        self.announce(
+        print(
             f"{count} optimiser steps per epoch,"
-            f" {count * epochs} over {epochs} epochs"
+            f" {count * epochs} over {epochs} epochs",
+            flush=True,
         )
-        return layout._replace(steps_per_epoch=count)
+        return settings_now._replace(steps_per_epoch=count)
 
-    def run_settings(self, plan: EpochPlan) -> RunSettings:
+    def learning_rate_schedule(self) -> Schedule:
         arguments = self.arguments
+        steps = self.plan.steps_per_epoch
         decay_start = None
         decay_end = None
         if arguments.decay_from_epoch is not None:
-            decay_start = (
-                arguments.decay_from_epoch - 1
-            ) * plan.steps_per_epoch
-            decay_end = arguments.epochs * plan.steps_per_epoch
-        reporter = None
-        if self.processes.is_main:
-            reporter = Reporter(
-                arguments.checkpoint_path.parent / "tensorboard"
-            )
-        schedule = Schedule(
-            arguments.learning_rate,
-            arguments.warmup_steps,
-            decay_start,
-            decay_end,
-        )
-        return RunSettings(
-            checkpoint_path=arguments.checkpoint_path,
-            checkpoint_every_seconds=arguments.checkpoint_every_seconds,
-            seed=arguments.seed,
-            gradient_clip_norm=arguments.gradient_clip_norm,
-            schedule=schedule,
-            reporter=reporter,
-            epoch_plan=plan,
-        )
+            decay_start = (arguments.decay_from_epoch - 1) * steps
+            decay_end = arguments.epochs * steps
+        peak = arguments.learning_rate
+        return Schedule(peak, arguments.warmup_steps, decay_start, decay_end)
 
     def save(self, completed_epochs: int) -> None:
-        settings = self.settings
-        progress = Progress(
-            settings.seed, completed_epochs, settings.epoch_plan._asdict()
-        )
-        save_checkpoint(
-            settings.checkpoint_path, checkpoint_of(self.trained, progress)
-        )
+        plan = self.plan._asdict()
+        progress = Progress(self.arguments.seed, completed_epochs, plan)
+        state = checkpoint_of(self.trained, progress)
+        save_checkpoint(self.arguments.checkpoint_path, state)
 
-    def optimise(self, total: Tensor, rate: float, clip: float) -> StepOutcome:
-        """Sets this step's rate, then backward pass, gradient clip to clip and
+    def optimise(self, total: Tensor, rate: float) -> StepOutcome:
+        """Sets this step's rate, then backward pass, gradient clip and
         optimiser step.
         """
         trained = self.trained
+        clip = self.arguments.gradient_clip_norm
         for group in trained.optimizer.param_groups:
             group["lr"] = rate
         trained.optimizer.zero_grad()
         trained.scaler.scale(total).backward()
         trained.scaler.unscale_(trained.optimizer)
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            trained.predictor.parameters(), clip
-        )
+        parameters = trained.predictor.parameters()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
         trained.scaler.step(trained.optimizer)
         # The scaler lowers its scale only when it skipped a step over
         # non-finite gradients, which is how skips are detected.
@@ -427,55 +321,35 @@ class TrainingRun:
         return StepOutcome(float(gradient_norm) > clip, skipped)
 
     def train_epoch(self, batches: Batches, epoch_index: int) -> EpochSummary:
-        """One pass over the data. Each batch goes through forward and loss,
-        the optimiser step and the training monitor, then a log line and a
-        timed checkpoint. Only the main process logs and checkpoints.
+        """One pass over the data: forward and loss, the optimiser step and
+        the monitor for each batch, then a log line every LOG_EVERY_BATCHES
+        and a checkpoint every --checkpoint-every-seconds.
         """
-        settings = self.settings
         progress = EpochProgress(self.device)
-        steps_before = epoch_index * settings.epoch_plan.steps_per_epoch
-        wait_start = time.perf_counter()
-        checkpoint_start = time.perf_counter()
+        steps_before = epoch_index * self.plan.steps_per_epoch
+        mixed_precision = self.trained.scaler.is_enabled()
+        last_checkpoint = time.perf_counter()
         for batch in batches:
-            progress.seconds.data_wait += time.perf_counter() - wait_start
-            step_start = time.perf_counter()
-            batch = batch.each(
-                lambda tensor: tensor.to(self.device, non_blocking=True)
-            )
-            mixed_precision = self.trained.scaler.is_enabled()
-            with torch.amp.autocast(
-                device_type=self.device.type, enabled=mixed_precision
-            ):
+            batch = batch.each(lambda array: array.to(self.device))
+            with torch.amp.autocast(self.device.type, enabled=mixed_precision):
                 step = training_step(self.trained.predictor, batch)
             global_step = steps_before + progress.batch_count
-            rate = settings.schedule.at(global_step)
-            outcome = self.optimise(
-                step.losses.total, rate, settings.gradient_clip_norm
-            )
-            total_is_finite = progress.record_step(step, outcome)
-            progress.seconds.step += time.perf_counter() - step_start
-
-            monitor_start = time.perf_counter()
-            progress.record_monitor(step, batch)
-            progress.seconds.monitor += time.perf_counter() - monitor_start
+            rate = self.schedule.at(global_step)
+            outcome = self.optimise(step.losses.total, rate)
+            loss_is_finite = progress.record(step, outcome)
+            progress.monitor_batch(step, batch.targets)
 
             if progress.batch_count % LOG_EVERY_BATCHES == 0:
-                if settings.reporter is not None:
-                    heading = f"  batch {progress.batch_count}"
-                    scalars = progress.window_scalars(rate)
-                    settings.reporter.report(heading, scalars, global_step + 1)
-                progress.start_new_window()
+                heading = f"  batch {progress.batch_count}"
+                scalars = progress.log_scalars(rate)
+                self.reporter.report(heading, scalars, global_step + 1)
 
             # Timed checkpoint, skipped while the loss is non-finite.
-            seconds_since = time.perf_counter() - checkpoint_start
-            if (
-                self.processes.is_main
-                and seconds_since >= settings.checkpoint_every_seconds
-            ):
-                if total_is_finite:
+            seconds = time.perf_counter() - last_checkpoint
+            if seconds >= self.arguments.checkpoint_every_seconds:
+                if loss_is_finite:
                     self.save(epoch_index)
-                checkpoint_start = time.perf_counter()
-            wait_start = time.perf_counter()
+                last_checkpoint = time.perf_counter()
         return progress.summary()
 
     def stop_message(self, prefix: str, elapsed: float, completed: int) -> str:
@@ -493,14 +367,7 @@ class TrainingRun:
         after each finished epoch.
         """
         arguments = self.arguments
-        settings = self.settings
         remaining = remaining_epochs(self.completed_epochs, arguments.epochs)
-        if not remaining:
-            self.announce(
-                f"NOTHING TO TRAIN: {arguments.checkpoint_path}"
-                f" holds {self.completed_epochs} epochs"
-            )
-            return
         budget = arguments.stop_after_seconds
         start = time.perf_counter()
         last_epoch_seconds = 0.0
@@ -508,41 +375,36 @@ class TrainingRun:
             # Stop before an epoch that would not fit in the time budget,
             # since Kaggle ends a session without warning.
             elapsed = time.perf_counter() - start
-            would_overrun = elapsed + last_epoch_seconds > budget
-            heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
-            before = self.stop_message(heading, elapsed, epoch_index)
-            if self.stopped(would_overrun, before):
+            if elapsed + last_epoch_seconds > budget:
+                heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
+                print(self.stop_message(heading, elapsed, epoch_index))
                 return
 
             epoch_start = time.perf_counter()
-            batch_settings = self.batch_settings(epoch_index)
-            batches = pipeline.batches(self.paths, batch_settings)
-            uneven_shares = contextlib.nullcontext()
-            if self.processes.count > 1:
-                uneven_shares = Join([self.trained.predictor])
-            with uneven_shares:
-                summary = self.train_epoch(batches, epoch_index)
+            settings = self.batch_settings(epoch_index)
+            batches = pipeline.batches(self.paths, settings)
+            summary = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
-            if settings.reporter is not None:
-                heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
-                scalars = epoch_scalars(summary)
-                settings.reporter.report(heading, scalars, epoch_index + 1)
-                settings.reporter.flush()
+            heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
+            scalars = epoch_scalars(summary)
+            self.reporter.report(heading, scalars, epoch_index + 1)
 
-            if not math.isfinite(summary.losses.total):
-                self.announce(
+            if math.isfinite(summary.losses.total):
+                self.save(epoch_index + 1)
+            else:
+                print(
                     f"epoch {epoch_index + 1} mean total loss"
                     f" {summary.losses.total}, checkpoint left as it was"
                 )
-            elif self.processes.is_main:
-                self.save(epoch_index + 1)
 
             elapsed = time.perf_counter() - start
-            early = self.stop_message(
-                "STOPPING EARLY", elapsed, epoch_index + 1
-            )
-            if self.stopped(elapsed >= budget, early):
+            if elapsed >= budget:
+                completed = epoch_index + 1
+                print(self.stop_message("STOPPING EARLY", elapsed, completed))
                 return
+        print(
+            f"done: {arguments.checkpoint_path} holds {arguments.epochs} epochs"
+        )
 
 
 # ------------------------------------------------------------------
@@ -561,5 +423,3 @@ class TrainingRun:
 
 if __name__ == "__main__":
     TrainingRun(parse_arguments()).run()
-    if distributed.is_initialized():
-        distributed.destroy_process_group()

@@ -82,7 +82,6 @@ def run_score(arguments: argparse.Namespace) -> None:
         str(REPOSITORY_ROOT / "submit.py"),
         str(Path(arguments.checkpoint_path).resolve()),
         str(Path(arguments.staged_directory).resolve()),
-        str(Path(arguments.anchors_path).resolve()),
         str(predictions_path),
     ]
     subprocess.run(submit, check=True)
@@ -108,7 +107,6 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     score = subparsers.add_parser("score")
     score.add_argument("checkpoint_path", type=Path)
-    score.add_argument("anchors_path", type=Path)
     score.add_argument("staged_directory", type=Path)
     score.add_argument("output_directory", type=Path)
     check_reader = subparsers.add_parser("check-reader")

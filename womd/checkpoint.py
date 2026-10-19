@@ -10,14 +10,15 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel
 
 from womd import contract
-from womd.model import QUERY_COUNT
+from womd.model import QUERY_COUNT, MotionPredictor
 
 Checkpoint = dict[str, Any]
 Device = str | torch.device
 GradScaler = getattr(torch.amp, "GradScaler", torch.cuda.amp.GradScaler)
+# The anchors live inside every checkpoint as a model buffer.
+ANCHORS_KEY = "mode_decoder.unit_anchors"
 
 
 class TrainingObjects(NamedTuple):
@@ -40,10 +41,8 @@ def parameter_fingerprint(model_state: dict[str, torch.Tensor]) -> str:
     """Hashes parameter names and shapes into one fingerprint used to detect a
     checkpoint saved under a different architecture.
     """
-    description = ",".join(
-        f"{name}:{tuple(tensor.shape)}"
-        for name, tensor in sorted(model_state.items())
-    )
+    shapes = sorted(model_state.items())
+    description = ",".join(f"{name}:{tuple(t.shape)}" for name, t in shapes)
     return hashlib.sha256(description.encode()).hexdigest()
 
 
@@ -59,24 +58,33 @@ def load_checkpoint(path: Path | str, device: Device = "cpu") -> Checkpoint:
             f" {contract.STAGING_CODE_VERSION!r}"
         )
     stamped = checkpoint.get("parameter_fingerprint")
-    if stamped is not None and stamped != parameter_fingerprint(
-        checkpoint["model_state"]
-    ):
+    fingerprint = parameter_fingerprint(checkpoint["model_state"])
+    if stamped is not None and stamped != fingerprint:
         raise ValueError(f"{path}: model_state does not match its fingerprint")
     return checkpoint
 
 
+def load_predictor(path: Path | str) -> MotionPredictor:
+    """The trained model in eval mode, built from the anchors its checkpoint
+    holds, so no anchor file can disagree with the weights.
+    """
+    model_state = load_checkpoint(path)["model_state"]
+    predictor = MotionPredictor(model_state[ANCHORS_KEY])
+    predictor.load_state_dict(model_state)
+    return predictor.eval()
+
+
 def load_anchor_file(path: Path | str) -> torch.Tensor:
     """Loads the fitted per-type anchors from a .npz file and checks their
-    provenance and shape.
+    provenance and shape; training starts from them.
     """
     with np.load(path) as anchors_file:
+        stored = set(anchors_file.files)
         provenance = (
-            anchors_file["provenance"] if "provenance" in anchors_file else None
+            anchors_file["provenance"] if "provenance" in stored else None
         )
-        contract.check_provenance(
-            provenance, path, "Refit them with fit_anchors.py."
-        )
+        hint = "Refit them with fit_anchors.py."
+        contract.check_provenance(provenance, path, hint)
         unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
     expected_shape = (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2)
     if unit_anchors.shape != expected_shape:
@@ -87,20 +95,11 @@ def load_anchor_file(path: Path | str) -> torch.Tensor:
     return unit_anchors
 
 
-def unwrapped(predictor: torch.nn.Module) -> torch.nn.Module:
-    """The bare model under the multi-process wrapper, so a checkpoint holds
-    plain parameter names whatever the process count.
-    """
-    if isinstance(predictor, DistributedDataParallel):
-        return predictor.module
-    return predictor
-
-
 def checkpoint_of(trained: TrainingObjects, progress: Progress) -> Checkpoint:
     """Bundles the model, optimiser and scaler state, the run's progress and
     a parameter fingerprint.
     """
-    model_state = unwrapped(trained.predictor).state_dict()
+    model_state = trained.predictor.state_dict()
     return {
         "model_state": model_state,
         "optimizer_state": trained.optimizer.state_dict(),
@@ -122,9 +121,8 @@ def save_checkpoint(checkpoint_path: Path, state: Checkpoint) -> None:
     """Writes to a temporary file, then swaps it in, so a crash never truncates
     the checkpoint; the prior one is kept as a fallback.
     """
-    partial_path = checkpoint_path.with_suffix(
-        checkpoint_path.suffix + ".partial"
-    )
+    suffix = checkpoint_path.suffix + ".partial"
+    partial_path = checkpoint_path.with_suffix(suffix)
     torch.save(state, partial_path)
     if checkpoint_path.exists():
         checkpoint_path.replace(previous_path(checkpoint_path))

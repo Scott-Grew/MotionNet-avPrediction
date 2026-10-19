@@ -89,14 +89,14 @@ train: ## train, resuming from the checkpoint if one exists
 		--mixed-precision --resume
 
 predict: ## write the model's predictions for the staged scenarios
-	$(PYTHON) submit.py $(CHECKPOINT) $(STAGED) $(ANCHORS) $(PREDICTIONS)
+	$(PYTHON) submit.py $(CHECKPOINT) $(STAGED) $(PREDICTIONS)
 
 baseline: ## write the constant-velocity predictions
 	$(PYTHON) submit.py --constant-velocity $(STAGED) \
 		$(BASELINE_PREDICTIONS)
 
 score: ## score the checkpoint with Waymo's metrics, in Docker
-	$(PYTHON) scorer.py score $(CHECKPOINT) $(ANCHORS) $(STAGED) \
+	$(PYTHON) scorer.py score $(CHECKPOINT) $(STAGED) \
 		$(SCORE_DIRECTORY)
 
 check-protos: ## compare our protos with Waymo's, in Docker
@@ -104,7 +104,7 @@ check-protos: ## compare our protos with Waymo's, in Docker
 		$(PROTO_CHECK_SCENARIOS)
 
 export: ## export to ONNX, check it against torch, time both
-	$(PYTHON) export_onnx.py $(STAGED) $(ONNX) --anchors $(ANCHORS) \
+	$(PYTHON) export_onnx.py $(STAGED) $(ONNX) \
 		--checkpoint $(CHECKPOINT) --scenarios $(EXPORT_SCENARIOS) \
 		--buckets $(EXPORT_BUCKETS) --threads $(EXPORT_THREADS) \
 		--device $(EXPORT_DEVICE)

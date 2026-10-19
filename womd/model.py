@@ -73,7 +73,6 @@ class Pooled(NamedTuple):
 
 
 Shape = tuple[int, int]
-Output = ModePredictions | tuple[Tensor, Tensor]
 
 
 def agent_feature_divisors() -> Tensor:
@@ -422,23 +421,13 @@ class MotionPredictor(nn.Module):
     def unit_anchors(self) -> Tensor:
         return self.mode_decoder.unit_anchors
 
-    def predict(self, batch: SceneBatch) -> ModePredictions:
-        """The full scene encoder and mode decoder pass for one batch, with
-        anchors chosen by each agent's predicted type.
+    def forward(self, batch: SceneBatch) -> ModePredictions:
+        """The scene encoder and mode decoder for one batch, with anchors
+        chosen by each agent's predicted type.
         """
         memory = self.scene_encoder(batch)
         type_index = predicted_type_index(batch.targets.agent_history)
         return self.mode_decoder(memory, type_index)
-
-    def forward(self, batch: SceneBatch, for_training: bool = False) -> Output:
-        """Everything predict() does for training, or just the trajectories
-        and confidence logits for inference and export. Training calls this
-        rather than predict() so a multi-process wrapper sees the call.
-        """
-        predictions = self.predict(batch)
-        if for_training:
-            return predictions
-        return predictions.trajectories, predictions.confidence_logits
 
 
 # ------------------------------------------------------------------

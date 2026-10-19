@@ -18,7 +18,7 @@ import torch
 from numpy import ndarray
 
 from womd import baseline, contract, frame_ops, loader, pipeline, pruning
-from womd.checkpoint import load_anchor_file, load_checkpoint
+from womd.checkpoint import load_predictor
 from womd.frame_ops import Frame
 from womd.loader import SceneSample, StagedScenario
 from womd.model import MotionPredictor
@@ -83,7 +83,9 @@ def predict_scene(predictor: Predictor, sample: SceneSample) -> Predictions:
                 batch.targets.agent_history
             )
         else:
-            trajectories, logits = predictor(batch)
+            predicted = predictor(batch)
+            trajectories = predicted.trajectories
+            logits = predicted.confidence_logits
     pruned = pruning.prune_modes(trajectories, logits)
     confidences = pruning.kept_confidences(
         trajectories, logits, pruned.trajectories
@@ -96,16 +98,6 @@ def to_world(positions: ndarray, agent: Frame, scene: Frame) -> ndarray:
     """Agent-frame positions out to the world, through the scene frame."""
     scene_positions = frame_ops.positions_from_frame(positions, agent)
     return frame_ops.positions_from_frame(scene_positions, scene)
-
-
-def load_predictor(checkpoint: Path, anchors: Path) -> MotionPredictor:
-    """The model built from its anchor file with trained weights, in eval
-    mode.
-    """
-    predictor = MotionPredictor(load_anchor_file(anchors))
-    loaded = load_checkpoint(checkpoint)
-    predictor.load_state_dict(loaded["model_state"])
-    return predictor.eval()
 
 
 def submission_rows(predictor: Predictor, staged: Path) -> SubmissionRows:
@@ -165,12 +157,10 @@ def main() -> None:
         staged, output = arguments.paths
         predictor = None
     else:
-        if len(arguments.paths) != 4:
-            raise SystemExit(
-                "usage: submit.py CHECKPOINT STAGED ANCHORS OUTPUT"
-            )
-        checkpoint_path, staged, anchors_path, output = arguments.paths
-        predictor = load_predictor(checkpoint_path, anchors_path)
+        if len(arguments.paths) != 3:
+            raise SystemExit("usage: submit.py CHECKPOINT STAGED OUTPUT")
+        checkpoint_path, staged, output = arguments.paths
+        predictor = load_predictor(checkpoint_path)
 
     rows = submission_rows(predictor, staged)
     write_submission(rows, staged, output)

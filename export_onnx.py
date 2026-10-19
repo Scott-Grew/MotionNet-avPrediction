@@ -21,9 +21,8 @@ import torch
 from torch import Tensor, nn
 
 from womd import loader, pipeline
-from womd.checkpoint import load_anchor_file, load_checkpoint
+from womd.checkpoint import load_predictor
 from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
-from womd.model import MotionPredictor
 
 # The graph inputs, one per batch array the model reads, as (group, field)
 # in the order the exported graph takes them.
@@ -112,7 +111,8 @@ class PositionalInputs(nn.Module):
         self.predictor = predictor
 
     def forward(self, *tensors: Tensor) -> tuple[Tensor, Tensor]:
-        return self.predictor(batch_from_graph_inputs(tensors))
+        predicted = self.predictor(batch_from_graph_inputs(tensors))
+        return predicted.trajectories, predicted.confidence_logits
 
 
 def pad_axis(tensor: Tensor, axis: int, length: int) -> Tensor:
@@ -252,8 +252,8 @@ class Exporter:
         """How far padding moves the real targets' trajectories, in metres."""
         target_count = len(batch.targets.agent_history)
         with torch.no_grad():
-            unpadded, _ = self.predictor(batch)
-            padded, _ = self.predictor(fixed)
+            unpadded = self.predictor(batch).trajectories
+            padded = self.predictor(fixed).trajectories
         return float((unpadded - padded[:target_count]).abs().max())
 
     def export(self, batch: SceneBatch, onnx_path: Path) -> Session:
@@ -338,21 +338,12 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("staged_directory", type=Path)
     parser.add_argument("onnx_path", type=Path)
-    parser.add_argument("--anchors", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--scenarios", type=int, required=True)
     parser.add_argument("--buckets", type=int, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--device", choices=["cpu", "cuda"], required=True)
     return parser.parse_args()
-
-
-def load_predictor(arguments: argparse.Namespace) -> MotionPredictor:
-    predictor = MotionPredictor(load_anchor_file(arguments.anchors))
-    if arguments.checkpoint is not None:
-        checkpoint = load_checkpoint(arguments.checkpoint)
-        predictor.load_state_dict(checkpoint["model_state"])
-    return predictor.eval()
 
 
 def print_summary(reports: list[BucketReport], runtime: Runtime) -> None:
@@ -376,7 +367,7 @@ def main() -> None:
     arguments = parse_arguments()
     torch.set_num_threads(arguments.threads)
     runtime = Runtime(torch.device(arguments.device), arguments.threads)
-    predictor = load_predictor(arguments)
+    predictor = load_predictor(arguments.checkpoint)
     paths = sorted(arguments.staged_directory.glob("*.npz"))
     unsorted = scene_batches(paths[: arguments.scenarios])
     batches = sorted(unsorted, key=token_count)
