@@ -185,9 +185,8 @@ def check_provenance(stamp: Any, path: Path | str, hint: str) -> dict[str, str]:
 class StagedFile(NamedTuple):
     """One staged scenario as stage.py writes it, every array in the scene
     frame. T tracks, F map features, D map dots, 91 steps. Files staged by
-    older code, data/staged among them, carry five extra lane-topology arrays
-    and no provenance stamp; load reads only these fields and checks the stamp
-    when present.
+    older code carry five extra lane-topology arrays and no provenance stamp;
+    load reads only these fields and checks the stamp when present.
     """
 
     track_rows: np.ndarray  # (T, 91, 13) float32, agent rows
