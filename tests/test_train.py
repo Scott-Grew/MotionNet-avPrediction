@@ -27,20 +27,22 @@ KERNEL_PATH = (
 )
 
 
-def build_synthetic_map_rows(dot_count):
+def build_synthetic_map_rows(scene_count, dot_count):
     """Random map rows whose two boundary-crossing columns hold valid codes."""
-    map_rows = torch.randn(dot_count, contract.MAP_FEATURE_DIM)
-    codes = torch.randint(
-        0, contract.NUM_BOUNDARY_CROSSING_CODES, (dot_count, 2)
-    )
-    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
+    map_rows = torch.randn(scene_count, dot_count, contract.MAP_FEATURE_DIM)
+    code_shape = (scene_count, dot_count, 2)
+    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, code_shape)
+    map_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
     return map_rows
 
 
 def synthetic_batch():
-    """A random two-target batch with three scene agents and four map chunks."""
+    """Two scenes of three agents and ten map dots in two chunks, with one
+    target each, agent 0 of its scene.
+    """
     history = contract.HISTORY_STEPS
     signals = contract.NUM_TRAFFIC_SIGNAL_STATES
+    dot_chunk = (torch.arange(10) // 5).expand(2, -1).clone()
     return SceneBatch(
         scene=SceneArrays(
             agent_history=torch.randn(
@@ -50,17 +52,18 @@ def synthetic_batch():
             agent_signal_history=torch.zeros(2, 3, history, signals),
         ),
         map=MapArrays(
-            rows=build_synthetic_map_rows(20),
-            dot_chunk_slot=torch.arange(20) // 5,
-            chunk_signal_history=torch.zeros(2, 4, history, signals),
+            rows=build_synthetic_map_rows(2, 10),
+            dot_present=torch.ones(2, 10, dtype=torch.bool),
+            dot_chunk=dot_chunk,
+            chunk_pose=torch.randn(2, 2, 4),
+            chunk_signal_history=torch.zeros(2, 2, history, signals),
         ),
         targets=TargetArrays(
             scene_index=torch.arange(2),
+            track_index=torch.zeros(2, dtype=torch.long),
             agent_history=torch.randn(2, history, contract.AGENT_FEATURE_DIM),
             agent_history_mask=torch.ones(2, history, dtype=torch.bool),
             agent_signal_history=torch.zeros(2, history, signals),
-            token_visible=torch.ones(2, 3 + 4, dtype=torch.bool),
-            token_pose=torch.randn(2, 3 + 4, 4),
             future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
             future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
         ),

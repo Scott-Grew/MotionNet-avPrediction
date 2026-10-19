@@ -12,7 +12,8 @@ import torch
 from torch import Tensor, nn
 
 from womd import contract
-from womd.loader import SceneBatch
+from womd.loader import MapArrays, SceneBatch
+from womd.view import target_view
 
 # Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
@@ -70,9 +71,6 @@ class Pooled(NamedTuple):
 
     tokens: Tensor  # (batch, chunks, hidden)
     present: Tensor  # (batch, chunks)
-
-
-Shape = tuple[int, int]
 
 
 def agent_feature_divisors() -> Tensor:
@@ -150,46 +148,37 @@ class MapDotEncoder(nn.Module):
         self.network = two_layer_mlp(plain_columns + one_hot_columns)
 
     def forward(self, map_rows: Tensor) -> Tensor:
-        """Map rows (dots, features) in, (dots, hidden) out; the dots of all
-        samples in the batch share the one leading axis.
-        """
+        """Map rows (..., 32) in, one (..., hidden) token per dot out."""
+        crossing = contract.MAP_LEFT_BOUNDARY_CROSSING
         scaled = map_rows / self.feature_divisors
-        plain = scaled[:, : contract.MAP_LEFT_BOUNDARY_CROSSING]
-        crossing_codes = map_rows[
-            :, contract.MAP_LEFT_BOUNDARY_CROSSING :
-        ].long()
+        plain = scaled[..., :crossing]
+        crossing_codes = map_rows[..., crossing:].long()
         one_hot = self.crossing_code_rows[crossing_codes].flatten(start_dim=-2)
-        return self.network(
-            torch.cat([plain, one_hot.to(scaled.dtype)], dim=-1)
-        )
+        features = torch.cat([plain, one_hot.to(scaled.dtype)], dim=-1)
+        return self.network(features)
 
 
-def pool_chunks(dots: Tensor, slot: Tensor, shape: Shape) -> Pooled:
-    """Max-pools dot embeddings (dots, hidden) into chunk tokens (batch,
-    chunks, hidden) by each dot's slot; a slot with no dots is absent.
+def pool_chunks(dots: Tensor, scene_map: MapArrays) -> Pooled:
+    """Max-pools each scene's dot tokens (S, D, hidden) into its chunk tokens
+    (S, C, hidden); a chunk with no dots is absent.
     """
-    batch_size, max_chunks = shape
-    hidden = dots.shape[-1]
-    # Slots start at -inf so amax pooling never selects an empty slot; a
-    # slot untouched by any dot stays at -inf.
-    tokens = torch.full(
-        (batch_size * max_chunks, hidden),
-        float("-inf"),
-        dtype=dots.dtype,
-        device=dots.device,
-    )
-    selector = slot.unsqueeze(-1).expand(-1, hidden)
-    tokens = tokens.scatter_reduce(
-        0, selector, dots, reduce="amax", include_self=True
-    )
-    present = tokens[:, 0] > float("-inf")
-    tokens = torch.where(
-        present.unsqueeze(-1), tokens, torch.zeros_like(tokens)
-    )
-    return Pooled(
-        tokens.view(batch_size, max_chunks, hidden),
-        present.view(batch_size, max_chunks),
-    )
+    scene_count, dot_count, hidden = dots.shape
+    chunk_count = scene_map.chunk_pose.shape[1]
+    # Padding dots and empty chunks start at -inf, so amax never selects
+    # them, and a chunk no dot reaches stays at -inf.
+    padding = ~scene_map.dot_present[..., None]
+    real_dots = dots.masked_fill(padding, float("-inf")).flatten(0, 1)
+    # Scene s, chunk c is row s * C + c once scenes and chunks are
+    # flattened; a scatter along the first axis exports to ONNX.
+    scenes = torch.arange(scene_count, device=dots.device)
+    rows = scenes[:, None] * chunk_count + scene_map.dot_chunk
+    selector = rows.flatten()[:, None].expand(-1, hidden)
+    tokens = dots.new_full((scene_count * chunk_count, hidden), float("-inf"))
+    tokens = tokens.scatter_reduce(0, selector, real_dots, reduce="amax")
+    tokens = tokens.view(scene_count, chunk_count, hidden)
+    present = tokens[..., 0] > float("-inf")
+    tokens = torch.where(present[..., None], tokens, torch.zeros_like(tokens))
+    return Pooled(tokens, present)
 
 
 def initialise_attention(attention: nn.MultiheadAttention) -> None:
@@ -254,14 +243,8 @@ class SceneEncoder(nn.Module):
         agent_signals = scene.agent_signal_history.flatten(start_dim=-2)
         agent_tokens = agent_motion + self.signal_projection(agent_signals)
 
-        pooled_shape = (
-            agent_tokens.shape[0],
-            scene_map.chunk_signal_history.shape[1],
-        )
         dot_embeddings = self.map_encoder(scene_map.rows)
-        pooled = pool_chunks(
-            dot_embeddings, scene_map.dot_chunk_slot, pooled_shape
-        )
+        pooled = pool_chunks(dot_embeddings, scene_map)
         chunk_signals = scene_map.chunk_signal_history.flatten(start_dim=-2)
         map_tokens = pooled.tokens + self.signal_projection(chunk_signals)
 
@@ -290,13 +273,15 @@ class SceneEncoder(nn.Module):
             own_token.shape[:2], dtype=torch.bool, device=own_token.device
         )
 
-        # A scene with several targets is repeated once per target.
-        pose_embedding = self.pose_projection(
-            targets.token_pose / self.pose_divisors
-        )
-        target_view = tokens[targets.scene_index] + pose_embedding
-        view_present = present[targets.scene_index] & targets.token_visible
-        memory_tokens = torch.cat([own_token, target_view], dim=1)
+        # A scene with several targets is repeated once per target, each copy
+        # seen from that target's frame and masked to its crop.
+        view = target_view(batch)
+        pose_embedding = self.pose_projection(view.pose / self.pose_divisors)
+        scene_tokens = tokens.index_select(0, targets.scene_index)
+        target_tokens = scene_tokens + pose_embedding
+        scene_present = present.index_select(0, targets.scene_index)
+        view_present = scene_present & view.visible
+        memory_tokens = torch.cat([own_token, target_tokens], dim=1)
         memory_present = torch.cat([own_present, view_present], dim=1)
         return Memory(memory_tokens, memory_present)
 

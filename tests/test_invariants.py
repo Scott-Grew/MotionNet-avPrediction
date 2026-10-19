@@ -27,6 +27,7 @@ from womd import (
     pipeline,
     pruning,
     store,
+    view,
 )
 from womd.frame_ops import Frame
 from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
@@ -70,62 +71,50 @@ def lane_polyline_rows(first_dot_x, dot_count):
 
 
 def synthetic_scene_batch(size):
-    """A random scene batch of the given size, one object type per sample in
-    turn.
+    """A random batch of size.samples scenes with one target each, agent 0 of
+    its scene, one object type per target in turn. Map dots sit within a few
+    metres of the scene origin, inside every crop.
     """
     history = contract.HISTORY_STEPS
     signals = contract.NUM_TRAFFIC_SIGNAL_STATES
-    agent_history = torch.randn(
-        size.samples, history, contract.AGENT_FEATURE_DIM
-    )
+    scenes = size.samples
+    agent_history = torch.randn(scenes, history, contract.AGENT_FEATURE_DIM)
     agent_history[:, :, contract.AGENT_TYPE] = 0.0
-    for sample_index in range(size.samples):
-        type_column = (
-            contract.AGENT_TYPE.start + sample_index % contract.NUM_OBJECT_TYPES
-        )
+    for sample_index in range(scenes):
+        object_type = sample_index % contract.NUM_OBJECT_TYPES
+        type_column = contract.AGENT_TYPE.start + object_type
         agent_history[sample_index, :, type_column] = 1.0
     dot_count = size.polylines * size.dots_per_polyline
-    map_rows = torch.randn(dot_count, contract.MAP_FEATURE_DIM)
-    codes = torch.randint(
-        0, contract.NUM_BOUNDARY_CROSSING_CODES, (dot_count, 2)
-    )
-    map_rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
-    token_count = size.agents + size.polylines
+    map_rows = torch.randn(scenes, dot_count, contract.MAP_FEATURE_DIM)
+    code_shape = (scenes, dot_count, 2)
+    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, code_shape)
+    map_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
+    dot_chunk = torch.arange(dot_count) // size.dots_per_polyline
+    agent_shape = (scenes, size.agents, history)
     return SceneBatch(
         scene=SceneArrays(
-            agent_history=torch.randn(
-                size.samples, size.agents, history, contract.AGENT_FEATURE_DIM
-            ),
-            agent_history_mask=torch.ones(
-                size.samples, size.agents, history, dtype=torch.bool
-            ),
-            agent_signal_history=torch.rand(
-                size.samples, size.agents, history, signals
-            ),
+            agent_history=torch.randn(*agent_shape, contract.AGENT_FEATURE_DIM),
+            agent_history_mask=torch.ones(agent_shape, dtype=torch.bool),
+            agent_signal_history=torch.rand(*agent_shape, signals),
         ),
         map=MapArrays(
             rows=map_rows,
-            dot_chunk_slot=torch.arange(dot_count) // size.dots_per_polyline,
+            dot_present=torch.ones(scenes, dot_count, dtype=torch.bool),
+            dot_chunk=dot_chunk.expand(scenes, -1).clone(),
+            chunk_pose=torch.randn(scenes, size.polylines, 4),
             chunk_signal_history=torch.rand(
-                size.samples, size.polylines, history, signals
+                scenes, size.polylines, history, signals
             ),
         ),
         targets=TargetArrays(
-            scene_index=torch.arange(size.samples),
+            scene_index=torch.arange(scenes),
+            track_index=torch.zeros(scenes, dtype=torch.long),
             agent_history=agent_history,
-            agent_history_mask=torch.ones(
-                size.samples, history, dtype=torch.bool
-            ),
-            agent_signal_history=torch.rand(size.samples, history, signals),
-            token_visible=torch.ones(
-                size.samples, token_count, dtype=torch.bool
-            ),
-            token_pose=torch.randn(size.samples, token_count, 4),
-            future_positions=torch.randn(
-                size.samples, contract.FUTURE_STEPS, 2
-            ),
+            agent_history_mask=torch.ones(scenes, history, dtype=torch.bool),
+            agent_signal_history=torch.rand(scenes, history, signals),
+            future_positions=torch.randn(scenes, contract.FUTURE_STEPS, 2),
             future_mask=torch.ones(
-                size.samples, contract.FUTURE_STEPS, dtype=torch.bool
+                scenes, contract.FUTURE_STEPS, dtype=torch.bool
             ),
         ),
     )
@@ -244,23 +233,65 @@ def test_frame_transforms_compose():
     )
 
 
-def test_chunk_pooling_isolates_groups():
-    """Empty chunk slots must come back marked absent."""
-    torch.manual_seed(5)
-    dot_embeddings = torch.randn(9, 8)
-    dot_polyline_slot = torch.tensor([0, 0, 0, 1, 1, 1, 3, 3, 4])
+def pooling_map(dot_chunk, dot_present, chunk_count):
+    """The MapArrays fields pool_chunks reads, for two scenes."""
+    scene_count, dot_count = dot_chunk.shape
+    return MapArrays(
+        rows=torch.zeros(scene_count, dot_count, contract.MAP_FEATURE_DIM),
+        dot_present=dot_present,
+        dot_chunk=dot_chunk,
+        chunk_pose=torch.zeros(scene_count, chunk_count, 4),
+        chunk_signal_history=torch.zeros(scene_count, chunk_count, 1, 1),
+    )
 
-    pooled = model.pool_chunks(dot_embeddings, dot_polyline_slot, (2, 3))
+
+def test_chunk_pooling_isolates_groups():
+    """A chunk pools only its own dots, a chunk with no dots comes back
+    absent, and padding dots are never pooled.
+    """
+    torch.manual_seed(5)
+    dot_embeddings = torch.randn(2, 5, 8)
+    dot_chunk = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 1, 1, 0]])
+    dot_present = torch.tensor([[True] * 5, [True, True, True, True, False]])
+    scene_map = pooling_map(dot_chunk, dot_present, chunk_count=3)
+
+    pooled = model.pool_chunks(dot_embeddings, scene_map)
     assert pooled.tokens.shape == (2, 3, 8)
     assert pooled.present.tolist() == [[True, True, False], [True, True, False]]
     assert torch.all(pooled.tokens[:, 2] == 0.0)
 
     poisoned = dot_embeddings.clone()
-    poisoned[:3] = 999.0
-    poisoned_pooled = model.pool_chunks(poisoned, dot_polyline_slot, (2, 3))
+    poisoned[0, :3] = 999.0
+    poisoned[1, 4] = 999.0
+    poisoned_pooled = model.pool_chunks(poisoned, scene_map)
     assert torch.equal(poisoned_pooled.tokens[0, 1:], pooled.tokens[0, 1:])
     assert torch.equal(poisoned_pooled.tokens[1], pooled.tokens[1])
     assert not torch.equal(poisoned_pooled.tokens[0, 0], pooled.tokens[0, 0])
+
+
+def test_crop_stretches_ahead_with_speed():
+    """The crop is an 80 m circle behind the agent and an ellipse stretched by
+    1 + 0.5 x speed ahead of it, checked at points either side of each edge.
+    """
+    points = torch.tensor(
+        [
+            [79.0, 0.0],
+            [81.0, 0.0],
+            [-79.0, 0.0],
+            [-81.0, 0.0],
+            [0.0, 81.0],
+            [479.0, 0.0],
+            [481.0, 0.0],
+        ]
+    )[None]
+    standing = view.inside_crop(points, torch.tensor([[1.0]]))
+    assert standing.tolist() == [
+        [True, False, True, False, False, False, False]
+    ]
+    # At 10 m/s the stretch is 6, so the crop reaches 480 m ahead and still
+    # 80 m behind and to the side.
+    driving = view.inside_crop(points, torch.tensor([[6.0]]))
+    assert driving.tolist() == [[True, True, True, False, False, True, False]]
 
 
 def test_null_baselines_reproduce_their_motion():
@@ -694,34 +725,30 @@ def test_input_order_does_not_change_predictions():
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
-    batch = synthetic_scene_batch(
-        SyntheticSize(samples=2, agents=6, polylines=5, dots_per_polyline=16)
-    )
+    size = SyntheticSize(samples=2, agents=6, polylines=5, dots_per_polyline=16)
+    batch = synthetic_scene_batch(size)
     batch.scene.agent_history_mask[:, 5] = False
-    scene_agent_order = torch.randperm(6)
-    token_order = torch.cat([scene_agent_order, torch.arange(6, 11)])
-    map_order = torch.randperm(batch.map.rows.shape[0])
-    shuffled_scene = {}
-    for name, array in batch.scene._asdict().items():
-        shuffled_scene[name] = array[:, scene_agent_order]
+    agent_order = torch.randperm(6)
+    dot_order = torch.randperm(batch.map.rows.shape[1])
+    shuffled_scene = [array[:, agent_order] for array in batch.scene]
+    shuffled_map = batch.map._replace(
+        rows=batch.map.rows[:, dot_order],
+        dot_present=batch.map.dot_present[:, dot_order],
+        dot_chunk=batch.map.dot_chunk[:, dot_order],
+    )
+    # The target, agent 0, moves to wherever the shuffle put it.
+    new_index = torch.argsort(agent_order)[batch.targets.track_index]
+    shuffled_targets = batch.targets._replace(track_index=new_index)
     permuted = SceneBatch(
-        scene=SceneArrays(**shuffled_scene),
-        map=batch.map._replace(
-            rows=batch.map.rows[map_order],
-            dot_chunk_slot=batch.map.dot_chunk_slot[map_order],
-        ),
-        targets=batch.targets._replace(
-            token_visible=batch.targets.token_visible[:, token_order],
-            token_pose=batch.targets.token_pose[:, token_order],
-        ),
+        SceneArrays(*shuffled_scene), shuffled_map, shuffled_targets
     )
     with torch.no_grad():
         base = predictor(batch)
-        permuted_output = predictor(permuted)
-    base_trajectories, _, base_logits, _ = base
-    permuted_trajectories, _, permuted_logits, _ = permuted_output
-    assert torch.allclose(base_trajectories, permuted_trajectories, atol=1e-4)
-    assert torch.allclose(base_logits, permuted_logits, atol=1e-5)
+        shuffled = predictor(permuted)
+    assert torch.allclose(base.trajectories, shuffled.trajectories, atol=1e-4)
+    assert torch.allclose(
+        base.confidence_logits, shuffled.confidence_logits, atol=1e-5
+    )
 
 
 def two_lane_signal_scenario(track_count, signalled_history):

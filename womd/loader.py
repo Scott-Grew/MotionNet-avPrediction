@@ -1,7 +1,8 @@
-"""Turns a staged scenario into model inputs, the scene once in the staged
-scene frame plus each predicted agent's own view of it. SceneBatch names every
-array the model reads, and the two row layouts are drawn at the end of this
-file.
+"""Turns a staged scenario into model inputs: the scene once, in the staged
+scene frame, plus each predicted agent's own history and future in its own
+frame. How each agent sees the scene is computed inside the model, in
+womd/view.py. SceneBatch names every array the model reads, and the two row
+layouts are drawn at the end of this file.
 """
 
 from __future__ import annotations
@@ -20,11 +21,6 @@ from womd.frame_ops import Frame
 # typing.List, since the scorer container's Python 3.8 cannot
 # subscript list at import time.
 Arrays = List[ndarray]
-
-# The map an agent sees is cropped around it. A faster agent
-# covers more road in 8 s, so the crop stretches ahead with speed.
-BASE_RADIUS_METRES = 80.0
-STRETCH_GAIN = 0.5
 
 HISTORY = slice(0, contract.HISTORY_STEPS)
 FUTURE = slice(contract.CURRENT_STEP_INDEX + 1, None)
@@ -51,32 +47,13 @@ class StagedScenario(NamedTuple):
     map_dot_polyline_index: ndarray  # (D,) feature each dot belongs to
 
 
-def inside_crop(points: ndarray, radius: float, stretch: float) -> ndarray:
-    """Ellipse crop test in agent-frame coordinates. Ahead of the agent the
-    radius stretches by stretch; behind it is a circle.
-    """
-    ahead = points[:, 0]
-    sideways = points[:, 1]
-    # A point (x, y) is inside when (x / (r s))^2 + (y / r)^2 <= 1 ahead of
-    # the agent and (x / r)^2 + (y / r)^2 <= 1 behind it, for radius r and
-    # stretch s.
-    sideways_term = (sideways / radius) ** 2
-    front_term = (ahead / (radius * stretch)) ** 2
-    rear_term = (ahead / radius) ** 2
-    inside_front = front_term + sideways_term <= 1.0
-    inside_rear = rear_term + sideways_term <= 1.0
-    return np.where(ahead > 0.0, inside_front, inside_rear)
-
-
 def eligible_tracks(scenario: StagedScenario, designated_only: bool) -> ndarray:
     """Indices of tracks valid at the current step and of a predicted object
     type, optionally restricted to designated targets.
     """
     now_rows = scenario.track_rows[:, contract.CURRENT_STEP_INDEX]
-    predicted_type_columns = now_rows[:, contract.AGENT_TYPE][
-        :, : contract.NUM_OBJECT_TYPES
-    ]
-    is_predicted_type = predicted_type_columns.sum(axis=1) > 0
+    type_columns = now_rows[:, contract.AGENT_TYPE]
+    is_predicted_type = type_columns[:, : contract.NUM_OBJECT_TYPES].sum(1) > 0
     now_valid = scenario.track_valid[:, contract.CURRENT_STEP_INDEX]
     is_eligible = now_valid & is_predicted_type
     if designated_only:
@@ -124,14 +101,11 @@ def facing_lane_dot(lane_rows: ndarray, now_rows: ndarray) -> ndarray:
     """Nearest lane dot that runs each agent's way, so an agent is not handed
     the oncoming lane's light; any dot if none runs its way.
     """
-    offsets = (
-        lane_rows[None, :, contract.MAP_POSITION]
-        - now_rows[:, None, contract.AGENT_POSITION]
-    )
-    distances = np.linalg.norm(offsets, axis=2)
-    faces_the_agent_way = (
-        now_rows[:, HEADING] @ lane_rows[:, contract.MAP_DIRECTION].T > 0.0
-    )
+    lane_positions = lane_rows[None, :, contract.MAP_POSITION]
+    agent_positions = now_rows[:, None, contract.AGENT_POSITION]
+    distances = np.linalg.norm(lane_positions - agent_positions, axis=2)
+    lane_directions = lane_rows[:, contract.MAP_DIRECTION]
+    faces_the_agent_way = now_rows[:, HEADING] @ lane_directions.T > 0.0
     none_face_it = ~faces_the_agent_way.any(axis=1, keepdims=True)
     candidates = faces_the_agent_way | none_face_it
     return np.where(candidates, distances, np.inf).argmin(axis=1)
@@ -142,22 +116,19 @@ def lane_signal_histories(scenario: StagedScenario) -> ndarray:
     dot's polyline at the current step; all zeros for tracks without one.
     """
     track_rows = scenario.track_rows
-    histories = np.zeros(
-        (len(track_rows),) + SIGNAL_HISTORY_SHAPE, dtype=np.float32
-    )
+    shape = (len(track_rows),) + SIGNAL_HISTORY_SHAPE
+    histories = np.zeros(shape, dtype=np.float32)
     lane_dots = np.flatnonzero(scenario.map_rows[:, LANE_KIND_COLUMN] == 1.0)
-    assignable = np.flatnonzero(
-        scenario.track_valid[:, contract.CURRENT_STEP_INDEX]
-    )
+    now_valid = scenario.track_valid[:, contract.CURRENT_STEP_INDEX]
+    assignable = np.flatnonzero(now_valid)
     if len(lane_dots) == 0 or len(assignable) == 0:
         return histories
     lane_rows = scenario.map_rows[lane_dots]
     now_rows = track_rows[assignable, contract.CURRENT_STEP_INDEX]
     assigned_dot = facing_lane_dot(lane_rows, now_rows)
     assigned_polyline = scenario.map_dot_polyline_index[lane_dots[assigned_dot]]
-    histories[assignable] = scenario.polyline_signal_histories[
-        assigned_polyline
-    ]
+    signals = scenario.polyline_signal_histories[assigned_polyline]
+    histories[assignable] = signals
     return histories
 
 
@@ -186,76 +157,50 @@ def read_scenario(path: Path | str) -> StagedScenario:
     return staged_scenario(StagedFile.load(path))
 
 
-def chunk_dots(dot_polyline: ndarray) -> tuple[ndarray, ndarray]:
-    """Groups each polyline's dots into chunks of MAP_CHUNK_DOTS, returning the
-    chunk each dot falls in and the polyline each chunk belongs to.
+class MapChunks(NamedTuple):
+    """The scene's map dots grouped into chunks of up to MAP_CHUNK_DOTS dots
+    along each polyline. A chunk's pose is that of its middle dot.
     """
+
+    dot_chunk: ndarray  # (D,) chunk each dot belongs to
+    chunk_polyline: ndarray  # (C,) polyline each chunk belongs to
+    chunk_pose: ndarray  # (C, 4) x, y, dx, dy in the scene frame
+
+
+def map_chunks(scenario: StagedScenario) -> MapChunks:
+    """Groups each polyline's dots into chunks of MAP_CHUNK_DOTS."""
+    dot_polyline = scenario.map_dot_polyline_index
     # The index is sorted, so np.unique's first-occurrence index gives each
     # dot's offset within its own polyline's block.
     polylines, first_dot, compact_index, dots_per_polyline = np.unique(
         dot_polyline, return_index=True, return_inverse=True, return_counts=True
     )
-    position_within_polyline = (
-        np.arange(len(compact_index)) - first_dot[compact_index]
-    )
+    dot_numbers = np.arange(len(compact_index))
+    position_within_polyline = dot_numbers - first_dot[compact_index]
     chunk_dot_count = contract.MAP_CHUNK_DOTS
-    chunks_per_polyline = (
-        dots_per_polyline + chunk_dot_count - 1
-    ) // chunk_dot_count
+    chunks_per_polyline = -(-dots_per_polyline // chunk_dot_count)
     # Each polyline's chunks start where the previous polyline's left off,
     # an exclusive cumulative sum.
     first_chunk = np.cumsum(chunks_per_polyline) - chunks_per_polyline
-    dot_chunk = (
-        first_chunk[compact_index] + position_within_polyline // chunk_dot_count
-    )
-    return dot_chunk, np.repeat(polylines, chunks_per_polyline)
-
-
-class SceneTokens(NamedTuple):
-    """Where each scene token sits in the scene frame, one per agent and one
-    per map chunk.
-    """
-
-    agent_present: ndarray  # (A,)
-    agent_positions: ndarray  # (A, 2)
-    agent_directions: ndarray  # (A, 2)
-    dot_chunk: ndarray  # (D,) chunk each dot belongs to
-    chunk_polyline: ndarray  # (C,)
-    chunk_positions: ndarray  # (C, 2)
-    chunk_directions: ndarray  # (C, 2)
-
-
-def scene_tokens(scenario: StagedScenario) -> SceneTokens:
-    """Places every agent at its last valid history step and every map chunk at
-    its middle dot.
-    """
-    history_valid = scenario.track_valid[:, HISTORY]
-    # The first True in the reversed mask is the last True in the original
-    # order.
-    steps_from_end = history_valid[:, ::-1].argmax(axis=1)
-    last_valid_step = contract.HISTORY_STEPS - 1 - steps_from_end
-    agent_rows = scenario.track_rows[
-        np.arange(len(history_valid)), last_valid_step
-    ]
-    dot_chunk, chunk_polyline = chunk_dots(scenario.map_dot_polyline_index)
+    chunk_within_polyline = position_within_polyline // chunk_dot_count
+    dot_chunk = first_chunk[compact_index] + chunk_within_polyline
     _, first_dot_of_chunk, dots_per_chunk = np.unique(
         dot_chunk, return_index=True, return_counts=True
     )
-    chunk_rows = scenario.map_rows[first_dot_of_chunk + dots_per_chunk // 2]
-    return SceneTokens(
-        agent_present=history_valid.any(axis=1),
-        agent_positions=agent_rows[:, contract.AGENT_POSITION],
-        agent_directions=agent_rows[:, HEADING],
-        dot_chunk=dot_chunk,
-        chunk_polyline=chunk_polyline,
-        chunk_positions=chunk_rows[:, contract.MAP_POSITION],
-        chunk_directions=chunk_rows[:, contract.MAP_DIRECTION],
+    middle_rows = scenario.map_rows[first_dot_of_chunk + dots_per_chunk // 2]
+    middle_positions = middle_rows[:, contract.MAP_POSITION]
+    middle_directions = middle_rows[:, contract.MAP_DIRECTION]
+    chunk_pose = np.concatenate([middle_positions, middle_directions], axis=1)
+    return MapChunks(
+        dot_chunk=dot_chunk.astype(np.int64),
+        chunk_polyline=np.repeat(polylines, chunks_per_polyline),
+        chunk_pose=chunk_pose.astype(np.float32),
     )
 
 
 class TargetSample(NamedTuple):
-    """One predicted agent's view of its scene, in that agent's own frame. The
-    token fields run over the scene's agents and then its map chunks.
+    """One predicted agent: its history and future in its own frame, and
+    where it sits in its scene.
     """
 
     agent_history: ndarray  # (11, 13)
@@ -263,10 +208,7 @@ class TargetSample(NamedTuple):
     agent_signal_history: ndarray  # (11, 9)
     future_positions: ndarray  # (80, 2)
     future_mask: ndarray  # (80,)
-    agent_token_visible: ndarray  # (agents,)
-    chunk_token_visible: ndarray  # (chunks,)
-    agent_token_pose: ndarray  # (agents, 4) x, y, cos, sin
-    chunk_token_pose: ndarray  # (chunks, 4)
+    track_index: int  # the agent's row among its scene's agents
     frame: Frame  # the agent's frame in the scene frame
     track_id: int
 
@@ -281,69 +223,35 @@ class SceneSample(NamedTuple):
     scene_agent_history_mask: ndarray  # (agents, 11)
     scene_agent_signal_history: ndarray  # (agents, 11, 9)
     map_rows: ndarray  # (dots, 32)
-    map_chunk_index: ndarray  # (dots,) which chunk each dot belongs to
+    map_dot_chunk: ndarray  # (dots,) which chunk each dot belongs to
+    map_chunk_pose: ndarray  # (chunks, 4)
     map_chunk_signal_history: ndarray  # (chunks, 11, 9)
     targets: list[TargetSample]
 
 
-def token_poses(points: ndarray, directions: ndarray, frame: Frame) -> ndarray:
-    """One pose row per token, (x, y, cosine, sine), in the given frame."""
-    frame_positions = frame_ops.positions_to_frame(points, frame)
-    frame_directions = frame_ops.directions_to_frame(directions, frame.heading)
-    return np.concatenate([frame_positions, frame_directions], axis=1).astype(
-        np.float32
-    )
-
-
 class SceneView:
-    """A staged scenario with its tokens placed and each track's lane signal
+    """A staged scenario with its map chunked and each track's lane signal
     found, from which each predicted agent's sample is built.
     """
 
     def __init__(self, scenario: StagedScenario) -> None:
         self.scenario = scenario
-        self.tokens = scene_tokens(scenario)
+        self.chunks = map_chunks(scenario)
         self.track_signals = lane_signal_histories(scenario)
 
     def target(self, track_index: int) -> TargetSample:
-        """One predicted agent's view of its scene: its own history and future
-        in its own frame, which scene tokens fall inside its crop, and every
-        token's pose re-expressed in its frame.
-        """
+        """One predicted agent's history and future in its own frame."""
         scenario = self.scenario
-        tokens = self.tokens
-        frame = agent_frame(scenario.track_rows[track_index])
-        agent_track = rows_to_frame(scenario.track_rows[track_index], frame)
-        now = scenario.track_rows[track_index, contract.CURRENT_STEP_INDEX]
-        speed = float(np.linalg.norm(now[contract.AGENT_VELOCITY]))
-        dots_in_frame = frame_ops.positions_to_frame(
-            scenario.map_rows[:, contract.MAP_POSITION], frame
-        )
-        dot_inside = inside_crop(
-            dots_in_frame, BASE_RADIUS_METRES, 1.0 + STRETCH_GAIN * speed
-        )
-        # A chunk is visible if any of its dots falls inside the crop.
-        chunk_count = len(tokens.chunk_polyline)
-        dots_inside_per_chunk = np.bincount(
-            tokens.dot_chunk, weights=dot_inside, minlength=chunk_count
-        )
-        # A target never sees itself as a scene token.
-        agent_visible = tokens.agent_present.copy()
-        agent_visible[track_index] = False
+        rows = scenario.track_rows[track_index]
+        frame = agent_frame(rows)
+        agent_track = rows_to_frame(rows, frame)
         return TargetSample(
             agent_history=agent_track[HISTORY],
             agent_history_mask=scenario.track_valid[track_index, HISTORY],
             agent_signal_history=self.track_signals[track_index],
             future_positions=agent_track[FUTURE, contract.AGENT_POSITION],
             future_mask=scenario.track_valid[track_index, FUTURE],
-            agent_token_visible=agent_visible,
-            chunk_token_visible=dots_inside_per_chunk > 0,
-            agent_token_pose=token_poses(
-                tokens.agent_positions, tokens.agent_directions, frame
-            ),
-            chunk_token_pose=token_poses(
-                tokens.chunk_positions, tokens.chunk_directions, frame
-            ),
+            track_index=track_index,
             frame=frame,
             track_id=int(scenario.track_ids[track_index]),
         )
@@ -351,18 +259,18 @@ class SceneView:
     def sample(self, track_indices: list[int]) -> SceneSample:
         """The whole scene in the scene frame plus one target per index."""
         scenario = self.scenario
-        tokens = self.tokens
+        chunks = self.chunks
         targets = [self.target(index) for index in track_indices]
+        signals = scenario.polyline_signal_histories[chunks.chunk_polyline]
         return SceneSample(
             scenario_id=scenario.scenario_id,
             scene_agent_history=scenario.track_rows[:, HISTORY],
             scene_agent_history_mask=scenario.track_valid[:, HISTORY],
             scene_agent_signal_history=self.track_signals,
             map_rows=scenario.map_rows,
-            map_chunk_index=tokens.dot_chunk.astype(np.int64),
-            map_chunk_signal_history=scenario.polyline_signal_histories[
-                tokens.chunk_polyline
-            ],
+            map_dot_chunk=chunks.dot_chunk,
+            map_chunk_pose=chunks.chunk_pose,
+            map_chunk_signal_history=signals,
             targets=targets,
         )
 
@@ -393,28 +301,27 @@ class SceneArrays(NamedTuple):
 
 
 class MapArrays(NamedTuple):
-    """Every map dot of every scene in the batch, D dots concatenated, each
-    with a slot naming its scene and chunk out of the C chunks of the largest
-    scene.
+    """Every scene's map dots and chunks, zero-padded to the D dots and C
+    chunks of the largest scene.
     """
 
-    rows: ndarray  # (D, 32)
-    dot_chunk_slot: ndarray  # (D,) scene * C + chunk
+    rows: ndarray  # (S, D, 32)
+    dot_present: ndarray  # (S, D) False for padding
+    dot_chunk: ndarray  # (S, D) chunk each dot belongs to
+    chunk_pose: ndarray  # (S, C, 4) x, y, dx, dy of the middle dot
     chunk_signal_history: ndarray  # (S, C, 11, 9)
 
 
 class TargetArrays(NamedTuple):
-    """The B predicted agents of the batch, each in its own frame, with the
-    tokens of its scene, A agents and then C chunks, seen through its crop.
-    The two future fields are absent from an inference batch.
+    """The B predicted agents of the batch, each in its own frame. The two
+    future fields are absent from an inference batch.
     """
 
-    scene_index: ndarray  # (B,)
+    scene_index: ndarray  # (B,) the target's scene in the batch
+    track_index: ndarray  # (B,) the target's row among its scene's agents
     agent_history: ndarray  # (B, 11, 13)
     agent_history_mask: ndarray  # (B, 11)
     agent_signal_history: ndarray  # (B, 11, 9)
-    token_visible: ndarray  # (B, A + C)
-    token_pose: ndarray  # (B, A + C, 4) x, y, cos, sin
     future_positions: ndarray | None = None  # (B, 80, 2)
     future_mask: ndarray | None = None  # (B, 80)
 
@@ -423,10 +330,8 @@ Group = Union[SceneArrays, MapArrays, TargetArrays]
 
 
 def apply_to_group(group: Group, function: Callable[[ndarray], Any]) -> Group:
-    applied = {}
-    for name, array in group._asdict().items():
-        applied[name] = None if array is None else function(array)
-    return type(group)(**applied)
+    applied = [None if array is None else function(array) for array in group]
+    return type(group)(*applied)
 
 
 class SceneBatch(NamedTuple):
@@ -439,7 +344,7 @@ class SceneBatch(NamedTuple):
     targets: TargetArrays
 
     def each(self, function: Callable[[ndarray], Any]) -> SceneBatch:
-        """The same batch with function applied to every array, by name."""
+        """The same batch with function applied to every array."""
         return SceneBatch(
             scene=apply_to_group(self.scene, function),
             map=apply_to_group(self.map, function),
@@ -448,10 +353,9 @@ class SceneBatch(NamedTuple):
 
 
 class BatchBuilder:
-    """Joins scene samples into one batch. Scene agents and map chunks are
-    zero-padded to the largest scene, map dots are concatenated with a slot
-    saying whose they are, and every scene's targets are flattened into one
-    target axis that points back at its scene.
+    """Joins scene samples into one batch. Each scene's agents, map dots and
+    map chunks are zero-padded to the largest scene's, and every scene's
+    targets are flattened into one target axis that points back at its scene.
     """
 
     def __init__(self, samples: list[SceneSample]) -> None:
@@ -462,17 +366,8 @@ class BatchBuilder:
             self.targets.extend(sample.targets)
             self.scene_of_target.extend([index] * len(sample.targets))
         self.agents = max(len(sample.scene_agent_history) for sample in samples)
-        self.chunks = max(
-            len(sample.map_chunk_signal_history) for sample in samples
-        )
-
-    def tokens(self, agents: Arrays, chunks: Arrays, dtype: type) -> ndarray:
-        """Per-token arrays in token order, the padded scene agents and then
-        the padded map chunks.
-        """
-        agent_part = pad_and_stack(agents, self.agents, dtype)
-        chunk_part = pad_and_stack(chunks, self.chunks, dtype)
-        return np.concatenate([agent_part, chunk_part], axis=1)
+        self.dots = max(len(sample.map_rows) for sample in samples)
+        self.chunks = max(len(sample.map_chunk_pose) for sample in samples)
 
     def scene_arrays(self) -> SceneArrays:
         samples = self.samples
@@ -488,16 +383,17 @@ class BatchBuilder:
         )
 
     def map_arrays(self) -> MapArrays:
-        # A dot's slot is scene_index * chunks + its chunk index, which is
-        # unique across the batch.
-        dot_slots = []
-        for index, sample in enumerate(self.samples):
-            dot_slots.append(sample.map_chunk_index + index * self.chunks)
-        rows = [sample.map_rows for sample in self.samples]
-        signals = [sample.map_chunk_signal_history for sample in self.samples]
+        samples = self.samples
+        rows = [sample.map_rows for sample in samples]
+        present = [np.ones(len(sample.map_rows), bool) for sample in samples]
+        dot_chunks = [sample.map_dot_chunk for sample in samples]
+        poses = [sample.map_chunk_pose for sample in samples]
+        signals = [sample.map_chunk_signal_history for sample in samples]
         return MapArrays(
-            rows=np.concatenate(rows, dtype=np.float32),
-            dot_chunk_slot=np.concatenate(dot_slots, dtype=np.int64),
+            rows=pad_and_stack(rows, self.dots, np.float32),
+            dot_present=pad_and_stack(present, self.dots, bool),
+            dot_chunk=pad_and_stack(dot_chunks, self.dots, np.int64),
+            chunk_pose=pad_and_stack(poses, self.chunks, np.float32),
             chunk_signal_history=pad_and_stack(
                 signals, self.chunks, np.float32
             ),
@@ -505,10 +401,7 @@ class BatchBuilder:
 
     def target_arrays(self) -> TargetArrays:
         targets = self.targets
-        agent_visible = [target.agent_token_visible for target in targets]
-        chunk_visible = [target.chunk_token_visible for target in targets]
-        agent_poses = [target.agent_token_pose for target in targets]
-        chunk_poses = [target.chunk_token_pose for target in targets]
+        track_indices = [target.track_index for target in targets]
         histories = [target.agent_history for target in targets]
         masks = [target.agent_history_mask for target in targets]
         signals = [target.agent_signal_history for target in targets]
@@ -516,11 +409,10 @@ class BatchBuilder:
         future_masks = [target.future_mask for target in targets]
         return TargetArrays(
             scene_index=np.array(self.scene_of_target, dtype=np.int64),
+            track_index=np.array(track_indices, dtype=np.int64),
             agent_history=np.stack(histories),
             agent_history_mask=np.stack(masks),
             agent_signal_history=np.stack(signals),
-            token_visible=self.tokens(agent_visible, chunk_visible, bool),
-            token_pose=self.tokens(agent_poses, chunk_poses, np.float32),
             future_positions=np.stack(futures),
             future_mask=np.stack(future_masks),
         )

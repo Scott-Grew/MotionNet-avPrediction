@@ -23,9 +23,6 @@ from womd.frame_ops import Frame
 from womd.loader import SceneSample, StagedScenario
 from womd.model import MotionPredictor
 
-# The 16 of the 80 predicted steps that Waymo scores, 2 Hz from 10 Hz.
-SUBMISSION_STEP_SELECTOR = torch.tensor(contract.SUBMISSION_FUTURE_INDICES)
-
 Predictor = MotionPredictor | None
 
 
@@ -86,12 +83,9 @@ def predict_scene(predictor: Predictor, sample: SceneSample) -> Predictions:
             predicted = predictor(batch)
             trajectories = predicted.trajectories
             logits = predicted.confidence_logits
-    pruned = pruning.prune_modes(trajectories, logits)
-    confidences = pruning.kept_confidences(
-        trajectories, logits, pruned.trajectories
-    )
-    decimated = pruned.trajectories.index_select(2, SUBMISSION_STEP_SELECTOR)
-    return Predictions(decimated.numpy(), confidences.numpy())
+    submitted = pruning.submitted_modes(trajectories, logits)
+    trajectories = submitted.trajectories.numpy()
+    return Predictions(trajectories, submitted.confidences.numpy())
 
 
 def to_world(positions: ndarray, agent: Frame, scene: Frame) -> ndarray:

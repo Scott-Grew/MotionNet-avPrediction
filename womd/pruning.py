@@ -50,9 +50,6 @@ class PruneWalk:
         self.dropped_indices = torch.zeros_like(self.kept_indices)
         self.dropped_count = torch.zeros_like(self.kept_count)
 
-    def finished(self) -> bool:
-        return bool((self.kept_count == len(self.slot_positions)).all())
-
     def next_slot(self, flagged: Tensor, filled: Tensor) -> Tensor:
         """A one-hot mask over the slots giving, for each flagged sample, the
         next slot it has not filled yet.
@@ -100,7 +97,9 @@ class PruneWalk:
 
 def prune_modes(trajectories: Tensor, logits: Tensor) -> PrunedModes:
     """Walks each sample's modes from most to least confident, keeps one unless
-    it ends near a kept one, then backfills to 6.
+    it ends near a kept one, then backfills to 6. The walk always visits every
+    mode, so its length is fixed and it exports to ONNX; once 6 are kept, the
+    later modes change nothing.
     """
     mode_count = logits.shape[1]
     endpoints = trajectories[:, :, -1]
@@ -110,8 +109,6 @@ def prune_modes(trajectories: Tensor, logits: Tensor) -> PrunedModes:
         candidate = confidence_order[:, position]
         selector = candidate[:, None, None].expand(-1, -1, 2)
         walk.consider(candidate, endpoints.gather(1, selector))
-        if walk.finished():
-            break
 
     final_indices = walk.final_indices()
     trailing_shape = trajectories.shape[2:]
@@ -134,3 +131,20 @@ def kept_confidences(paths: Tensor, logits: Tensor, kept: Tensor) -> Tensor:
         kept.shape[:2], dtype=probabilities.dtype, device=probabilities.device
     )
     return aggregated.scatter_add(1, nearest_kept, probabilities)
+
+
+class SubmittedModes(NamedTuple):
+    """The 6 kept modes at the 16 steps Waymo scores, and their confidences."""
+
+    trajectories: Tensor  # (batch, 6, 16, 2) metres, agent frame
+    confidences: Tensor  # (batch, 6) summing to 1
+
+
+def submitted_modes(trajectories: Tensor, logits: Tensor) -> SubmittedModes:
+    """The model's 54 modes at 10 Hz cut to Waymo's 6 at 2 Hz."""
+    pruned = prune_modes(trajectories, logits)
+    kept = pruned.trajectories
+    confidences = kept_confidences(trajectories, logits, kept)
+    indices = contract.SUBMISSION_FUTURE_INDICES
+    steps = torch.tensor(indices, device=trajectories.device)
+    return SubmittedModes(kept.index_select(2, steps), confidences)
