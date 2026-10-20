@@ -62,7 +62,6 @@ bottom of `womd/contract.py`.
 %%{init: {"flowchart": {"nodeSpacing": 25, "rankSpacing": 30}, "themeVariables": {"fontSize": "13px"}}}%%
 flowchart TD
     RAW[("Waymo files")] -->|stage.py| STAGED[("Staged scenes")]
-    STAGED -->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")]
     subgraph MODEL["Model, womd/model.py, every box trained"]
         AGENTS["History encoder<br/>one token per road user"]
         ROAD["Road encoder<br/>one token per road piece"]
@@ -74,6 +73,7 @@ flowchart TD
         QUERY --> DECODER --> HEADS
     end
     STAGED -->|inputs.py| AGENTS & ROAD
+    STAGED ---->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")]
     ANCHORS --> QUERY
     HEADS -->|pruning.py, keep 6| OUT[/"Submission, live view, ONNX"/]
     HEADS --> LOSS["Training<br/>MultiPath loss"]
