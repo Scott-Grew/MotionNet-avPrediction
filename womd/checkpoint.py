@@ -55,8 +55,7 @@ def load_anchor_file(path: Path | str) -> torch.Tensor:
         )
         hint = "Refit them with fit_anchors.py."
         contract.check_provenance(provenance, path, hint)
-        unit_anchors = torch.from_numpy(anchors_file["unit_anchors"])
-    return unit_anchors
+        return torch.from_numpy(anchors_file["unit_anchors"])
 
 
 def previous_path(checkpoint_path: Path) -> Path:

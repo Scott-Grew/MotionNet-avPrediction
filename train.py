@@ -293,8 +293,8 @@ class TrainingRun:
         steps_before = epoch_index * self.plan.steps_per_epoch
         mixed_precision = self.scaler.is_enabled()
         last_checkpoint = time.perf_counter()
-        for batch in batches:
-            batch = batch.each(lambda array: array.to(self.device))
+        for host_batch in batches:
+            batch = host_batch.each(lambda array: array.to(self.device))
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
                 rounds = self.predictor.every_round(batch)
                 losses = loss.round_loss_terms(rounds, batch)

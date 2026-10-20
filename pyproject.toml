@@ -9,7 +9,20 @@ line-length = 80
 target-version = "py38"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B"]
+select = [
+    "E", "F", "W", "I", "N", "UP", "B",
+    "SIM", "RET", "C4", "ARG", "PL", "RUF", "PERF",
+]
+# Expected values in comparisons read better as numbers than as named
+# constants; tuple concatenation reads as clearly as unpacking.
+ignore = ["PLR2004", "RUF005", "PERF401"]
+
+[tool.ruff.lint.per-file-ignores]
+# Waymo's library and TensorFlow exist only inside the scorer container,
+# so they are imported inside the functions that run there.
+"container/*.py" = ["PLC0415"]
+# A staging test builds a whole fixture scenario in one function.
+"tests/*.py" = ["PLR0915"]
 
 [tool.ruff.lint.isort]
 # womd.runtime_env sets environment variables that torch and TensorFlow
