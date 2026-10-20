@@ -63,13 +63,20 @@ flowchart LR
     RAW[("Waymo<br/>files")] --> STAGE["stage.py"] --> STAGED[("Staged<br/>scenes")]
     STAGED --> INPUTS["inputs.py<br/>own view"]
     STAGED --> FIT["fit_anchors.py"] --> ANCHORS[("54 anchors<br/>per type")]
-    subgraph MODEL["Model, womd/model.py"]
-        ENCODER["Encoder<br/>6 layers"] --> DECODER["Decoder<br/>6 rounds"]
+    subgraph MODEL["Model, womd/model.py, every box trained"]
+        AGENTS["History encoder<br/>one token per road user"]
+        ROAD["Road encoder<br/>one token per road piece"]
+        ENCODER["Encoder<br/>6 layers"]
+        QUERY["Anchor queries"]
+        DECODER["Decoder<br/>6 rounds"]
+        HEADS["Path and<br/>confidence heads"]
+        AGENTS & ROAD --> ENCODER --> DECODER
+        QUERY --> DECODER --> HEADS
     end
-    INPUTS --> ENCODER
-    ANCHORS --> DECODER
-    DECODER --> PRUNE["pruning.py<br/>keep 6"] --> OUT[/"Submission<br/>live view<br/>ONNX"/]
-    DECODER --> LOSS["Training<br/>MultiPath loss"]
+    INPUTS --> AGENTS & ROAD
+    ANCHORS --> QUERY
+    HEADS --> PRUNE["pruning.py<br/>keep 6"] --> OUT[/"Submission<br/>live view<br/>ONNX"/]
+    HEADS --> LOSS["Training<br/>MultiPath loss"]
 ```
 
 ## Usage
@@ -79,13 +86,9 @@ table requires a Waymo Open Motion Dataset account; `stage.py` converts
 their files into this repository's format.
 
 ```
-make install   # install the pinned dependencies
 make test      # run the test suite, under 30 seconds
 make stage     # turn raw WOMD shards into one .npz per scene
-make anchors   # fit the 54 anchors per road-user type
 make train     # train, resuming from the checkpoint if one exists
-make predict   # write the model's predictions for the staged scenes
-make score     # score the checkpoint on the staged scenes, in Docker
 make export    # export to ONNX, check it against PyTorch, time both
 make live      # play staged scenes with live predictions
 ```
