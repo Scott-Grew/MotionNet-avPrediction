@@ -1199,11 +1199,11 @@ def test_step_head_walks_a_line_or_an_arc():
         )
         bias.zero_()
         bias[0, :, 0] = 0.5
-        straight = decoder(memory, type_index).trajectories
+        straight = decoder(memory, type_index)[-1].trajectories
         angles = 0.02 * torch.arange(contract.FUTURE_STEPS, dtype=torch.float32)
         bias[0, :, 0] = 0.5 * angles.cos()
         bias[0, :, 1] = 0.5 * angles.sin()
-        arc = decoder(memory, type_index).trajectories
+        arc = decoder(memory, type_index)[-1].trajectories
     step_numbers = torch.arange(
         1, contract.FUTURE_STEPS + 1, dtype=torch.float32
     )

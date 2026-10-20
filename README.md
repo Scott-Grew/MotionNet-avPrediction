@@ -58,7 +58,38 @@ bottom of `womd/contract.py`.
 
 ## Architecture
 
-![Architecture flowchart](architecture.png)
+```mermaid
+flowchart TD
+    RAW["Waymo scenario files"] --> STAGE["stage.py<br/>one array file per scene"]
+    STAGE --> ANCHORS["fit_anchors.py<br/>54 typical destinations<br/>per road-user type"]
+
+    subgraph INPUTS["Inputs for one road user, womd/inputs.py, all in its own frame"]
+        OWN["Its own past second"]
+        OTHERS["The 47 road users nearest<br/>its 8 s straight path"]
+        ROAD["The 256 lane and road pieces<br/>nearest that path,<br/>lights on their lanes"]
+    end
+    STAGE --> INPUTS
+
+    subgraph MODEL["Model, womd/model.py"]
+        TOKENS["One token per road user<br/>and per road piece"]
+        ENCODER["Encoder<br/>6 self-attention layers"]
+        QUERIES["54 anchor queries<br/>one per typical destination"]
+        DECODER["Decoder, 6 rounds<br/>queries attend to each other,<br/>then to the scene"]
+        HEADS["Path and confidence heads<br/>80 steps per anchor with uncertainty,<br/>one score per anchor"]
+        TOKENS --> ENCODER --> DECODER
+        QUERIES --> DECODER --> HEADS
+    end
+    OWN & OTHERS & ROAD --> TOKENS
+    ANCHORS --> QUERIES
+
+    LOSS["train.py, womd/loss.py<br/>likelihood of the recorded path<br/>under the closest anchor<br/>+ cross-entropy toward it,<br/>averaged over all 6 rounds"]
+    PRUNE["womd/pruning.py<br/>rank 54 by confidence,<br/>drop near-duplicates, keep 6"]
+    HEADS --> LOSS
+    HEADS --> PRUNE
+    PRUNE --> SUBMIT["submit.py<br/>world frame, scored by<br/>scorer.py in Docker"]
+    PRUNE --> LIVE["live.py<br/>live in Lichtblick"]
+    PRUNE --> ONNX["export_onnx.py<br/>one ONNX graph"]
+```
 
 ## Usage
 

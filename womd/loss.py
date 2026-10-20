@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from womd.inputs import TargetInputs
-from womd.model import ModePredictions, anchor_lines
+from womd.model import ModePredictions, RoundPredictions, anchor_lines
 
 # The constant term of a Gaussian's negative log likelihood, per
 # dimension.
@@ -77,3 +77,12 @@ def loss_terms(predicted: ModePredictions, targets: TargetInputs) -> LossTerms:
     )
     classification = (cross_entropy * scoreable).sum() / scoreable_count
     return LossTerms(regression + classification, regression, classification)
+
+
+def round_loss_terms(rounds: RoundPredictions, targets: TargetInputs):
+    """Every decoder round's loss, averaged over the rounds, so each round
+    must give a usable answer and the total keeps one round's scale.
+    """
+    per_round = [loss_terms(predicted, targets) for predicted in rounds]
+    averaged = [torch.stack(terms).mean() for terms in zip(*per_round)]
+    return LossTerms(*averaged)

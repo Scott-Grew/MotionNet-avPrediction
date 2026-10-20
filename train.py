@@ -296,8 +296,9 @@ class TrainingRun:
         for batch in batches:
             batch = batch.each(lambda array: array.to(self.device))
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
-                predicted = self.predictor(batch)
-                losses = loss.loss_terms(predicted, batch)
+                rounds = self.predictor.every_round(batch)
+                losses = loss.round_loss_terms(rounds, batch)
+            predicted = rounds[-1]
             global_step = steps_before + progress.batch_count
             rate = self.schedule.at(global_step)
             clipped, skipped = self.optimise(losses.total, rate)

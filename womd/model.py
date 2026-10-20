@@ -6,7 +6,7 @@ future each through a transformer decoder.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import List, NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -56,6 +56,9 @@ class ModePredictions(NamedTuple):
     log_standard_deviation: Tensor  # (batch, 54, 80, 2)
     confidence_logits: Tensor  # (batch, 54)
     anchors: Tensor  # (batch, 54, 2)
+
+
+RoundPredictions = List[ModePredictions]
 
 
 class Memory(NamedTuple):
@@ -255,7 +258,9 @@ def anchor_lines(anchors: Tensor) -> Tensor:
 class ModeDecoder(nn.Module):
     """Decodes the 54 anchor-conditioned trajectory modes and their confidences
     from the memory built by SceneEncoder. Each query is an embedding of its
-    anchor endpoint alone, so mode k always belongs to anchor k.
+    anchor endpoint alone, so mode k always belongs to anchor k. The same
+    heads read the queries after every round, so training can ask every
+    round for a usable answer.
     """
 
     def __init__(self, unit_anchors: Tensor) -> None:
@@ -273,8 +278,10 @@ class ModeDecoder(nn.Module):
         )
         self.anchor_query = two_layer_mlp(2)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        layer = nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
-        self.rounds = nn.TransformerDecoder(layer, DECODER_ROUNDS)
+        self.rounds = nn.ModuleList(
+            nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+            for _ in range(DECODER_ROUNDS)
+        )
         self.head_norm = nn.LayerNorm(HIDDEN_DIM)
         # Per future step, an x, y offset and an x, y log sigma.
         self.trajectory_head = nn.Sequential(
@@ -290,23 +297,14 @@ class ModeDecoder(nn.Module):
             nn.Linear(FEEDFORWARD_DIM, 1, bias=False),
         )
 
-    def forward(self, memory: Memory, type_index: Tensor) -> ModePredictions:
-        """Trajectories and log sigmas (batch, modes, steps, 2) in metres,
-        confidence logits (batch, modes), and the anchors used.
+    def decode(self, queries: Tensor, anchors: Tensor) -> ModePredictions:
+        """Trajectories and log sigmas (batch, modes, steps, 2) in metres and
+        confidence logits (batch, modes) from one round's queries.
         """
-        batch_size = memory.tokens.shape[0]
-        anchors = self.unit_anchors[type_index]
-        scaled_anchors = anchors / contract.DISTANCE_NORMALISER_METRES
-        queries = self.anchor_query(scaled_anchors)
-        normed_tokens = self.scene_norm(memory.tokens)
-        queries = self.rounds(
-            queries, normed_tokens, memory_key_padding_mask=~memory.present
-        )
         queries = self.head_norm(queries)
-
         # Cast up so the cumulative sum below runs in float32 even under
         # mixed precision.
-        head_shape = (batch_size, QUERY_COUNT, 2, contract.FUTURE_STEPS, 2)
+        head_shape = queries.shape[:2] + (2, contract.FUTURE_STEPS, 2)
         head_output = self.trajectory_head(queries).float().view(head_shape)
         step_displacements, log_sigma = head_output.unbind(dim=2)
         # A mode is its anchor's straight constant-speed line plus the running
@@ -321,6 +319,21 @@ class ModeDecoder(nn.Module):
             trajectories, log_sigma, confidence_logits, anchors
         )
 
+    def forward(self, memory: Memory, type_index: Tensor) -> RoundPredictions:
+        """Each round's modes, first round first; the last is the answer."""
+        anchors = self.unit_anchors[type_index]
+        scaled_anchors = anchors / contract.DISTANCE_NORMALISER_METRES
+        queries = self.anchor_query(scaled_anchors)
+        normed_tokens = self.scene_norm(memory.tokens)
+        padding = ~memory.present
+        per_round = []
+        for decoder_round in self.rounds:
+            queries = decoder_round(
+                queries, normed_tokens, memory_key_padding_mask=padding
+            )
+            per_round.append(self.decode(queries, anchors))
+        return per_round
+
 
 class MotionPredictor(nn.Module):
     def __init__(self, unit_anchors: Tensor) -> None:
@@ -332,14 +345,19 @@ class MotionPredictor(nn.Module):
     def unit_anchors(self) -> Tensor:
         return self.mode_decoder.unit_anchors
 
-    def forward(self, inputs: TargetInputs) -> ModePredictions:
+    def every_round(self, inputs: TargetInputs) -> RoundPredictions:
         """The scene encoder and mode decoder for a batch of targets, with
-        anchors chosen by each target's predicted type.
+        anchors chosen by each target's predicted type; one ModePredictions
+        per decoder round.
         """
         memory = self.scene_encoder(inputs)
         own_history = inputs.agent_history[:, 0]
         type_index = predicted_type_index(own_history)
         return self.mode_decoder(memory, type_index)
+
+    def forward(self, inputs: TargetInputs) -> ModePredictions:
+        """The last round's modes, the model's answer."""
+        return self.every_round(inputs)[-1]
 
 
 # ------------------------------------------------------------------
