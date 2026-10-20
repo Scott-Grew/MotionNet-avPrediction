@@ -59,24 +59,23 @@ bottom of `womd/contract.py`.
 ## Architecture
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 25, "rankSpacing": 30}, "themeVariables": {"fontSize": "13px"}}}%%
-flowchart TD
-    RAW[("Waymo files")] -->|stage.py| STAGED[("Staged scenes")]
+%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 30}, "themeVariables": {"fontSize": "13px"}}}%%
+flowchart LR
+    RAW[("Waymo<br/>files")] -->|stage.py| STAGED[("Staged<br/>scenes")]
     subgraph MODEL["Model, womd/model.py, every box trained"]
-        AGENTS["History encoder<br/>one token per road user"]
-        ROAD["Road encoder<br/>one token per road piece"]
-        ENCODER["Encoder, 6 layers"]
-        QUERY["Anchor queries"]
-        DECODER["Decoder, 6 rounds"]
-        HEADS["Path and confidence heads"]
+        AGENTS["History<br/>encoder"]
+        ROAD["Road<br/>encoder"]
+        ENCODER["Encoder<br/>6 layers"]
+        QUERY["Anchor<br/>queries"]
+        DECODER["Decoder<br/>6 rounds"]
+        HEADS["Path and<br/>confidence<br/>heads"]
         AGENTS & ROAD --> ENCODER --> DECODER
         QUERY --> DECODER --> HEADS
     end
     STAGED -->|inputs.py| AGENTS & ROAD
-    STAGED ---->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")]
-    ANCHORS --> QUERY
-    HEADS -->|pruning.py, keep 6| OUT[/"Submission, live view, ONNX"/]
-    HEADS --> LOSS["Training<br/>MultiPath loss"]
+    STAGED -->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")] --> QUERY
+    HEADS -->|pruning.py| OUT[/"Submission<br/>live view<br/>ONNX"/]
+    HEADS --> LOSS["Training<br/>MultiPath<br/>loss"]
 ```
 
 ## Usage
