@@ -59,21 +59,13 @@ bottom of `womd/contract.py`.
 ## Architecture
 
 ```mermaid
-flowchart TD
-    RAW[("Waymo scenario files")]
-    STAGE["stage.py<br/>stage each scene"]
-    STAGED[("Staged scenes<br/>one array file each")]
-    FIT["fit_anchors.py<br/>k-means on logged endpoints"]
-    ANCHORS[("54 anchors per type")]
-    INPUTS["womd/inputs.py<br/>each road user's own view<br/>47 neighbours<br/>256 road pieces"]
-    ENCODER["Encoder<br/>6 self-attention layers"]
-    DECODER["Decoder<br/>54 anchor queries, 6 rounds"]
-    LOSS["Training<br/>MultiPath loss, every round"]
-    PRUNE["womd/pruning.py<br/>keep 6 distinct paths"]
-    OUT[/"Submission, live view, ONNX graph"/]
-    RAW --> STAGE --> STAGED --> INPUTS --> ENCODER --> DECODER --> PRUNE --> OUT
-    STAGED --> FIT --> ANCHORS --> DECODER
-    DECODER --> LOSS
+flowchart LR
+    RAW[("Waymo<br/>files")] --> STAGE["stage.py"] --> STAGED[("Staged<br/>scenes")]
+    STAGED --> INPUTS["inputs.py<br/>own view"] --> ENCODER["Encoder<br/>6 layers"]
+    ENCODER --> DECODER["Decoder<br/>6 rounds"] --> PRUNE["pruning.py<br/>keep 6"]
+    PRUNE --> OUT[/"Submission<br/>live view<br/>ONNX"/]
+    STAGED --> FIT["fit_anchors.py"] --> ANCHORS[("54 anchors<br/>per type")] --> DECODER
+    DECODER --> LOSS["Training<br/>MultiPath loss"]
 ```
 
 ## Usage
