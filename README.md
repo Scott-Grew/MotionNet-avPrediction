@@ -59,23 +59,22 @@ bottom of `womd/contract.py`.
 ## Architecture
 
 ```mermaid
-flowchart LR
-    RAW[("Waymo<br/>files")] --> STAGE["stage.py"] --> STAGED[("Staged<br/>scenes")]
-    STAGED --> INPUTS["inputs.py<br/>own view"]
-    STAGED --> FIT["fit_anchors.py"] --> ANCHORS[("54 anchors<br/>per type")]
+flowchart TD
+    RAW[("Waymo files")] -->|stage.py| STAGED[("Staged scenes")]
+    STAGED -->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")]
     subgraph MODEL["Model, womd/model.py, every box trained"]
         AGENTS["History encoder<br/>one token per road user"]
         ROAD["Road encoder<br/>one token per road piece"]
-        ENCODER["Encoder<br/>6 layers"]
+        ENCODER["Encoder, 6 layers"]
         QUERY["Anchor queries"]
-        DECODER["Decoder<br/>6 rounds"]
-        HEADS["Path and<br/>confidence heads"]
+        DECODER["Decoder, 6 rounds"]
+        HEADS["Path and confidence heads"]
         AGENTS & ROAD --> ENCODER --> DECODER
         QUERY --> DECODER --> HEADS
     end
-    INPUTS --> AGENTS & ROAD
+    STAGED -->|inputs.py| AGENTS & ROAD
     ANCHORS --> QUERY
-    HEADS --> PRUNE["pruning.py<br/>keep 6"] --> OUT[/"Submission<br/>live view<br/>ONNX"/]
+    HEADS -->|pruning.py, keep 6| OUT[/"Submission, live view, ONNX"/]
     HEADS --> LOSS["Training<br/>MultiPath loss"]
 ```
 
