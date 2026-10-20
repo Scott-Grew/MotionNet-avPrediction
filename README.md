@@ -60,35 +60,20 @@ bottom of `womd/contract.py`.
 
 ```mermaid
 flowchart TD
-    RAW["Waymo scenario files"] --> STAGE["stage.py<br/>one array file per scene"]
-    STAGE --> ANCHORS["fit_anchors.py<br/>54 typical destinations<br/>per road-user type"]
-
-    subgraph INPUTS["Inputs for one road user, womd/inputs.py, all in its own frame"]
-        OWN["Its own past second"]
-        OTHERS["The 47 road users nearest<br/>its 8 s straight path"]
-        ROAD["The 256 lane and road pieces<br/>nearest that path,<br/>lights on their lanes"]
-    end
-    STAGE --> INPUTS
-
-    subgraph MODEL["Model, womd/model.py"]
-        TOKENS["One token per road user<br/>and per road piece"]
-        ENCODER["Encoder<br/>6 self-attention layers"]
-        QUERIES["54 anchor queries<br/>one per typical destination"]
-        DECODER["Decoder, 6 rounds<br/>queries attend to each other,<br/>then to the scene"]
-        HEADS["Path and confidence heads<br/>80 steps per anchor with uncertainty,<br/>one score per anchor"]
-        TOKENS --> ENCODER --> DECODER
-        QUERIES --> DECODER --> HEADS
-    end
-    OWN & OTHERS & ROAD --> TOKENS
-    ANCHORS --> QUERIES
-
-    LOSS["train.py, womd/loss.py<br/>likelihood of the recorded path<br/>under the closest anchor<br/>+ cross-entropy toward it,<br/>averaged over all 6 rounds"]
-    PRUNE["womd/pruning.py<br/>rank 54 by confidence,<br/>drop near-duplicates, keep 6"]
-    HEADS --> LOSS
-    HEADS --> PRUNE
-    PRUNE --> SUBMIT["submit.py<br/>world frame, scored by<br/>scorer.py in Docker"]
-    PRUNE --> LIVE["live.py<br/>live in Lichtblick"]
-    PRUNE --> ONNX["export_onnx.py<br/>one ONNX graph"]
+    RAW[("Waymo scenario files")]
+    STAGE["stage.py<br/>stage each scene"]
+    STAGED[("Staged scenes<br/>one array file each")]
+    FIT["fit_anchors.py<br/>k-means on logged endpoints"]
+    ANCHORS[("54 anchors per type")]
+    INPUTS["womd/inputs.py<br/>each road user's own view<br/>47 neighbours<br/>256 road pieces"]
+    ENCODER["Encoder<br/>6 self-attention layers"]
+    DECODER["Decoder<br/>54 anchor queries, 6 rounds"]
+    LOSS["Training<br/>MultiPath loss, every round"]
+    PRUNE["womd/pruning.py<br/>keep 6 distinct paths"]
+    OUT[/"Submission, live view, ONNX graph"/]
+    RAW --> STAGE --> STAGED --> INPUTS --> ENCODER --> DECODER --> PRUNE --> OUT
+    STAGED --> FIT --> ANCHORS --> DECODER
+    DECODER --> LOSS
 ```
 
 ## Usage
