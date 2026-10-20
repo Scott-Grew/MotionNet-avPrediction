@@ -61,10 +61,14 @@ bottom of `womd/contract.py`.
 ```mermaid
 flowchart LR
     RAW[("Waymo<br/>files")] --> STAGE["stage.py"] --> STAGED[("Staged<br/>scenes")]
-    STAGED --> INPUTS["inputs.py<br/>own view"] --> ENCODER["Encoder<br/>6 layers"]
-    ENCODER --> DECODER["Decoder<br/>6 rounds"] --> PRUNE["pruning.py<br/>keep 6"]
-    PRUNE --> OUT[/"Submission<br/>live view<br/>ONNX"/]
-    STAGED --> FIT["fit_anchors.py"] --> ANCHORS[("54 anchors<br/>per type")] --> DECODER
+    STAGED --> INPUTS["inputs.py<br/>own view"]
+    STAGED --> FIT["fit_anchors.py"] --> ANCHORS[("54 anchors<br/>per type")]
+    subgraph MODEL["Model, womd/model.py"]
+        ENCODER["Encoder<br/>6 layers"] --> DECODER["Decoder<br/>6 rounds"]
+    end
+    INPUTS --> ENCODER
+    ANCHORS --> DECODER
+    DECODER --> PRUNE["pruning.py<br/>keep 6"] --> OUT[/"Submission<br/>live view<br/>ONNX"/]
     DECODER --> LOSS["Training<br/>MultiPath loss"]
 ```
 
