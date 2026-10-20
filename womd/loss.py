@@ -10,7 +10,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from womd.loader import TargetArrays
+from womd.inputs import TargetInputs
 from womd.model import ModePredictions, anchor_lines
 
 # The constant term of a Gaussian's negative log likelihood, per
@@ -35,7 +35,7 @@ def mean_over_valid_steps(per_step: Tensor, mask: Tensor) -> Tensor:
     return (per_step * validity).sum(dim=-1) / valid_step_count
 
 
-def anchor_assigned_mode(anchors: Tensor, targets: TargetArrays) -> Tensor:
+def anchor_assigned_mode(anchors: Tensor, targets: TargetInputs) -> Tensor:
     """Assigns each sample the anchor whose constant-speed straight path is
     closest on average to the logged future.
     """
@@ -58,7 +58,7 @@ def gaussian_nll(predicted: ModePredictions, target: Tensor) -> Tensor:
     return per_axis.sum(dim=-1)
 
 
-def loss_terms(predicted: ModePredictions, targets: TargetArrays) -> LossTerms:
+def loss_terms(predicted: ModePredictions, targets: TargetInputs) -> LossTerms:
     """Combines the assigned anchor's Gaussian NLL with cross-entropy over
     anchors, averaged only over samples with a valid future.
     """

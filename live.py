@@ -22,7 +22,7 @@ from numpy import ndarray
 
 import submit
 from submit import Predict
-from womd import contract, frame_ops, loader, pipeline
+from womd import contract, frame_ops, inputs, loader, pipeline
 from womd.checkpoint import load_predictor
 from womd.loader import StagedScenario
 from womd.pruning import SubmittedModes as Kept
@@ -192,7 +192,7 @@ class LiveView:
 
     def predict_now(self, scenario: StagedScenario, tracks: ndarray) -> None:
         start = time.perf_counter()
-        scene = loader.one_scene(scenario, tracks)
+        scene = inputs.scene_inputs(scenario, tracks)
         batch = pipeline.torch_batch(scene)
         kept = submit.predict_scene(self.predict, batch)
         milliseconds = 1000 * (time.perf_counter() - start)

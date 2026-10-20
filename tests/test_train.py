@@ -15,7 +15,7 @@ from reference_implementations import unit_anchor_offsets_per_type
 
 import train
 from womd import checkpoint, contract, loss, model
-from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
+from womd.inputs import TargetInputs
 from womd.model import MotionPredictor
 
 KERNEL_PATH = (
@@ -27,48 +27,24 @@ KERNEL_PATH = (
 )
 
 
-def build_synthetic_map_rows(scene_count, dot_count):
-    """Random map rows whose two boundary-crossing columns hold valid codes."""
-    map_rows = torch.randn(scene_count, dot_count, contract.MAP_FEATURE_DIM)
-    code_shape = (scene_count, dot_count, 2)
-    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, code_shape)
-    map_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
-    return map_rows
-
-
 def synthetic_batch():
-    """Two scenes of three agents and ten map dots in two chunks, with one
-    target each, agent 0 of its scene.
+    """Two targets, each with three agents (itself first) and two map chunks
+    of five dots whose crossing columns hold valid codes.
     """
     history = contract.HISTORY_STEPS
     signals = contract.NUM_TRAFFIC_SIGNAL_STATES
-    dot_chunk = (torch.arange(10) // 5).expand(2, -1).clone()
-    return SceneBatch(
-        scene=SceneArrays(
-            agent_history=torch.randn(
-                2, 3, history, contract.AGENT_FEATURE_DIM
-            ),
-            agent_history_mask=torch.ones(2, 3, history, dtype=torch.bool),
-            agent_signal_history=torch.zeros(2, 3, history, signals),
-        ),
-        map=MapArrays(
-            rows=build_synthetic_map_rows(2, 10),
-            dot_present=torch.ones(2, 10, dtype=torch.bool),
-            dot_chunk=dot_chunk,
-            chunk_pose=torch.randn(2, 2, 4),
-            chunk_signal_history=torch.zeros(2, 2, history, signals),
-        ),
-        targets=TargetArrays(
-            scene_index=torch.arange(2),
-            track_index=torch.zeros(2, dtype=torch.long),
-            frame_pose=torch.tensor([0.0, 0.0, 1.0, 0.0]).repeat(2, 1),
-            speed=torch.zeros(2),
-            agent_history=torch.randn(2, history, contract.AGENT_FEATURE_DIM),
-            agent_history_mask=torch.ones(2, history, dtype=torch.bool),
-            agent_signal_history=torch.zeros(2, history, signals),
-            future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
-            future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
-        ),
+    chunk_rows = torch.randn(2, 2, 5, contract.MAP_FEATURE_DIM)
+    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, (2, 2, 5))
+    chunk_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
+    chunk_rows[..., contract.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
+    return TargetInputs(
+        agent_history=torch.randn(2, 3, history, contract.AGENT_FEATURE_DIM),
+        agent_history_mask=torch.ones(2, 3, history, dtype=torch.bool),
+        chunk_rows=chunk_rows,
+        chunk_dot_mask=torch.ones(2, 2, 5, dtype=torch.bool),
+        chunk_signal_history=torch.zeros(2, 2, history, signals),
+        future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
+        future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
     )
 
 
@@ -129,7 +105,7 @@ def test_one_training_step_runs_end_to_end():
         train.parameter_groups(predictor), lr=train.LEARNING_RATE
     )
     batch = synthetic_batch()
-    total = loss.loss_terms(predictor(batch), batch.targets).total
+    total = loss.loss_terms(predictor(batch), batch).total
     optimizer.zero_grad()
     total.backward()
     optimizer.step()

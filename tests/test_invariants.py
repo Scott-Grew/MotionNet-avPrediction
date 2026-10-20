@@ -20,6 +20,7 @@ from womd import (
     baseline,
     contract,
     frame_ops,
+    inputs,
     loader,
     loss,
     metrics,
@@ -27,10 +28,9 @@ from womd import (
     pipeline,
     pruning,
     store,
-    view,
 )
 from womd.frame_ops import Frame
-from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
+from womd.inputs import TargetInputs
 from womd.model import ModePredictions
 from womd.pipeline import BatchSettings
 from womd_protos import scenario_pb2
@@ -70,62 +70,43 @@ def lane_polyline_rows(first_dot_x, dot_count):
     return rows
 
 
-def synthetic_scene_batch(size):
-    """A random batch of size.samples scenes with one target each, agent 0 of
-    its scene, one object type per target in turn. Map dots sit within a few
-    metres of the scene origin, inside every crop.
+def synthetic_inputs(size):
+    """A random batch of size.samples targets, one object type per target in
+    turn, each with size.agents agents (the target first) and size.polylines
+    chunks of size.dots_per_polyline dots.
     """
     history = contract.HISTORY_STEPS
     signals = contract.NUM_TRAFFIC_SIGNAL_STATES
-    scenes = size.samples
-    agent_history = torch.randn(scenes, history, contract.AGENT_FEATURE_DIM)
-    agent_history[:, :, contract.AGENT_TYPE] = 0.0
-    for sample_index in range(scenes):
+    batch = size.samples
+    agent_shape = (batch, size.agents, history)
+    agent_history = torch.randn(*agent_shape, contract.AGENT_FEATURE_DIM)
+    agent_history[..., contract.AGENT_TYPE] = 0.0
+    for sample_index in range(batch):
         object_type = sample_index % contract.NUM_OBJECT_TYPES
         type_column = contract.AGENT_TYPE.start + object_type
-        agent_history[sample_index, :, type_column] = 1.0
-    dot_count = size.polylines * size.dots_per_polyline
-    map_rows = torch.randn(scenes, dot_count, contract.MAP_FEATURE_DIM)
-    code_shape = (scenes, dot_count, 2)
-    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, code_shape)
-    map_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING :] = codes.float()
-    dot_chunk = torch.arange(dot_count) // size.dots_per_polyline
-    agent_shape = (scenes, size.agents, history)
-    return SceneBatch(
-        scene=SceneArrays(
-            agent_history=torch.randn(*agent_shape, contract.AGENT_FEATURE_DIM),
-            agent_history_mask=torch.ones(agent_shape, dtype=torch.bool),
-            agent_signal_history=torch.rand(*agent_shape, signals),
+        agent_history[sample_index, :, :, type_column] = 1.0
+    dot_shape = (batch, size.polylines, size.dots_per_polyline)
+    chunk_rows = torch.randn(*dot_shape, contract.MAP_FEATURE_DIM)
+    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, dot_shape)
+    chunk_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
+    chunk_rows[..., contract.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
+    return TargetInputs(
+        agent_history=agent_history,
+        agent_history_mask=torch.ones(agent_shape, dtype=torch.bool),
+        chunk_rows=chunk_rows,
+        chunk_dot_mask=torch.ones(dot_shape, dtype=torch.bool),
+        chunk_signal_history=torch.rand(
+            batch, size.polylines, history, signals
         ),
-        map=MapArrays(
-            rows=map_rows,
-            dot_present=torch.ones(scenes, dot_count, dtype=torch.bool),
-            dot_chunk=dot_chunk.expand(scenes, -1).clone(),
-            chunk_pose=torch.randn(scenes, size.polylines, 4),
-            chunk_signal_history=torch.rand(
-                scenes, size.polylines, history, signals
-            ),
-        ),
-        targets=TargetArrays(
-            scene_index=torch.arange(scenes),
-            track_index=torch.zeros(scenes, dtype=torch.long),
-            frame_pose=torch.tensor([0.0, 0.0, 1.0, 0.0]).repeat(scenes, 1),
-            speed=torch.zeros(scenes),
-            agent_history=agent_history,
-            agent_history_mask=torch.ones(scenes, history, dtype=torch.bool),
-            agent_signal_history=torch.rand(scenes, history, signals),
-            future_positions=torch.randn(scenes, contract.FUTURE_STEPS, 2),
-            future_mask=torch.ones(
-                scenes, contract.FUTURE_STEPS, dtype=torch.bool
-            ),
-        ),
+        future_positions=torch.randn(batch, contract.FUTURE_STEPS, 2),
+        future_mask=torch.ones(batch, contract.FUTURE_STEPS, dtype=torch.bool),
     )
 
 
 def future_targets(future_positions, future_mask):
-    """A TargetArrays holding only a future, for the loss and monitor tests."""
-    blanks = [None] * (len(TargetArrays._fields) - 2)
-    return TargetArrays(*blanks, future_positions, future_mask)
+    """A TargetInputs holding only a future, for the loss and monitor tests."""
+    blanks = [None] * (len(TargetInputs._fields) - 2)
+    return TargetInputs(*blanks, future_positions, future_mask)
 
 
 def test_agent_frame_transform_inverts():
@@ -235,65 +216,114 @@ def test_frame_transforms_compose():
     )
 
 
-def pooling_map(dot_chunk, dot_present, chunk_count):
-    """The MapArrays fields pool_chunks reads, for two scenes."""
-    scene_count, dot_count = dot_chunk.shape
-    return MapArrays(
-        rows=torch.zeros(scene_count, dot_count, contract.MAP_FEATURE_DIM),
-        dot_present=dot_present,
-        dot_chunk=dot_chunk,
-        chunk_pose=torch.zeros(scene_count, chunk_count, 4),
-        chunk_signal_history=torch.zeros(scene_count, chunk_count, 1, 1),
+def rotated_scenario(scenario, angle, shift):
+    """The same staged scenario with every position, direction and heading
+    turned by angle about the origin and then moved by shift, computed with
+    its own rotation matrix rather than frame_ops.
+    """
+    rotation = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+    )
+    tracks = scenario.track_rows.astype(np.float64).copy()
+    for columns in (contract.AGENT_VELOCITY, slice(2, 4)):
+        tracks[..., columns] = tracks[..., columns] @ rotation.T
+    positions = tracks[..., contract.AGENT_POSITION]
+    tracks[..., contract.AGENT_POSITION] = positions @ rotation.T + shift
+    rows = scenario.map_rows.astype(np.float64).copy()
+    directions = rows[:, contract.MAP_DIRECTION]
+    rows[:, contract.MAP_DIRECTION] = directions @ rotation.T
+    rows[:, contract.MAP_POSITION] = rows[:, contract.MAP_POSITION] @ rotation.T
+    rows[:, contract.MAP_POSITION] += shift
+    stops = rows[:, contract.MAP_STOP_POINT]
+    has_stop = (stops != 0.0).any(axis=1)
+    rows[has_stop, contract.MAP_STOP_POINT] = stops[has_stop] @ rotation.T
+    rows[has_stop, contract.MAP_STOP_POINT] += shift
+    return scenario._replace(
+        track_rows=tracks.astype(np.float32), map_rows=rows.astype(np.float32)
     )
 
 
-def test_chunk_pooling_isolates_groups():
-    """A chunk pools only its own dots, a chunk with no dots comes back
-    absent, and padding dots are never pooled.
+def test_inputs_ignore_where_the_scene_sits():
+    """Turning and moving a whole staged scene must leave every target's
+    inputs unchanged, since they are all expressed in the target's frame.
+    """
+    scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:1]
+    if not scenario_paths:
+        pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
+    scenario = loader.read_scenario(scenario_paths[0])
+    tracks = loader.designated_tracks(scenario)
+    moved = rotated_scenario(scenario, 2.1, np.array([-310.0, 75.5]))
+    original = inputs.scene_inputs(scenario, tracks)
+    turned = inputs.scene_inputs(moved, tracks)
+    for name, before, after in zip(original._fields, original, turned):
+        assert np.allclose(before, after, atol=2e-3), name
+
+
+def test_lane_ahead_lands_ahead():
+    """A target at (10, 5) facing +y sees a lane dot at (10, 15) 10 m straight
+    ahead, at (10, 0) in its own frame.
+    """
+    lane = lane_polyline_rows(0.0, 1)
+    lane[0, contract.MAP_POSITION] = [10.0, 15.0]
+    lane[0, contract.MAP_DIRECTION] = [0.0, 1.0]
+    frame = Frame(np.array([10.0, 5.0]), np.pi / 2)
+    moved = inputs.map_rows_to_frame(lane, frame)
+    assert np.allclose(moved[0, contract.MAP_POSITION], [10.0, 0.0])
+    assert np.allclose(moved[0, contract.MAP_DIRECTION], [1.0, 0.0])
+    assert np.all(moved[0, contract.MAP_STOP_POINT] == 0.0)
+
+
+def test_path_distance_matches_dense_sampling():
+    """The closed-form distance to the 8 s path equals the smallest distance
+    to 2,001 points sampled along it.
+    """
+    generator = np.random.default_rng(3)
+    points = generator.uniform(-60.0, 60.0, (200, 2))
+    for path_end in (np.array([30.0, -8.0]), np.zeros(2)):
+        samples = np.linspace(0.0, 1.0, 2001)[:, None] * path_end
+        gaps = np.linalg.norm(points[:, None] - samples[None], axis=-1)
+        dense = gaps.min(axis=1)
+        closed_form = inputs.segment_distance(points, path_end)
+        assert np.allclose(closed_form, dense, atol=0.02)
+
+
+def test_padded_slots_change_nothing():
+    """Extra empty agent and chunk slots, filled with garbage under their
+    masks, must not move any prediction.
     """
     torch.manual_seed(5)
-    dot_embeddings = torch.randn(2, 5, 8)
-    dot_chunk = torch.tensor([[0, 0, 0, 1, 1], [0, 0, 1, 1, 0]])
-    dot_present = torch.tensor([[True] * 5, [True, True, True, True, False]])
-    scene_map = pooling_map(dot_chunk, dot_present, chunk_count=3)
-
-    tokens, present = model.pool_chunks(dot_embeddings, scene_map)
-    assert tokens.shape == (2, 3, 8)
-    assert present.tolist() == [[True, True, False], [True, True, False]]
-    assert torch.all(tokens[:, 2] == 0.0)
-
-    poisoned = dot_embeddings.clone()
-    poisoned[0, :3] = 999.0
-    poisoned[1, 4] = 999.0
-    poisoned_tokens, _ = model.pool_chunks(poisoned, scene_map)
-    assert torch.equal(poisoned_tokens[0, 1:], tokens[0, 1:])
-    assert torch.equal(poisoned_tokens[1], tokens[1])
-    assert not torch.equal(poisoned_tokens[0, 0], tokens[0, 0])
-
-
-def test_crop_stretches_ahead_with_speed():
-    """The crop is an 80 m circle behind the agent and an ellipse stretched by
-    1 + 0.5 x speed ahead of it, checked at points either side of each edge.
-    """
-    points = torch.tensor(
-        [
-            [79.0, 0.0],
-            [81.0, 0.0],
-            [-79.0, 0.0],
-            [-81.0, 0.0],
-            [0.0, 81.0],
-            [479.0, 0.0],
-            [481.0, 0.0],
-        ]
-    )[None]
-    standing = view.inside_crop(points, torch.tensor([[1.0]]))
-    assert standing.tolist() == [
-        [True, False, True, False, False, False, False]
-    ]
-    # At 10 m/s the stretch is 6, so the crop reaches 480 m ahead and still
-    # 80 m behind and to the side.
-    driving = view.inside_crop(points, torch.tensor([[6.0]]))
-    assert driving.tolist() == [[True, True, True, False, False, True, False]]
+    predictor = model.MotionPredictor(
+        reference_implementations.unit_anchor_offsets_per_type()
+    ).eval()
+    size = SyntheticSize(samples=3, agents=4, polylines=5, dots_per_polyline=8)
+    batch = synthetic_inputs(size)
+    batch.chunk_dot_mask[:, :, 6:] = False
+    wider = size._replace(agents=7, polylines=9)
+    garbage = synthetic_inputs(wider)
+    padded = TargetInputs(
+        agent_history=torch.cat(
+            [batch.agent_history, garbage.agent_history[:, 4:]], dim=1
+        ),
+        agent_history_mask=torch.cat(
+            [batch.agent_history_mask, torch.zeros(3, 3, 11, dtype=torch.bool)],
+            dim=1,
+        ),
+        chunk_rows=torch.cat([batch.chunk_rows, garbage.chunk_rows[:, 5:]], 1),
+        chunk_dot_mask=torch.cat(
+            [batch.chunk_dot_mask, torch.zeros(3, 4, 8, dtype=torch.bool)], 1
+        ),
+        chunk_signal_history=torch.cat(
+            [batch.chunk_signal_history, garbage.chunk_signal_history[:, 5:]],
+            dim=1,
+        ),
+    )
+    with torch.no_grad():
+        base = predictor(batch)
+        widened = predictor(padded)
+    assert torch.allclose(base.trajectories, widened.trajectories, atol=1e-4)
+    assert torch.allclose(
+        base.confidence_logits, widened.confidence_logits, atol=1e-5
+    )
 
 
 def test_null_baselines_reproduce_their_motion():
@@ -513,7 +543,7 @@ def test_submission_returns_to_the_world_frame():
     scenario = loader.read_scenario(scenario_paths[0])
     tracks = loader.eligible_tracks(scenario, designated_only=True)[:1]
     track_index = tracks[0]
-    targets = loader.one_scene(scenario, tracks).targets
+    targets = inputs.scene_inputs(scenario, tracks)
     agent_frame_future = targets.future_positions[0]
     frame = loader.agent_frame(scenario.track_rows[track_index])
 
@@ -721,27 +751,28 @@ def test_scorer_tensors_group_by_scenario(tmp_path):
 
 
 def test_input_order_does_not_change_predictions():
-    """Scene agents and map dots are shuffled; trajectories must not move."""
+    """Other agents, map chunks and the dots inside each chunk are shuffled;
+    trajectories must not move.
+    """
     torch.manual_seed(11)
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
     size = SyntheticSize(samples=2, agents=6, polylines=5, dots_per_polyline=16)
-    batch = synthetic_scene_batch(size)
-    batch.scene.agent_history_mask[:, 5] = False
-    agent_order = torch.randperm(6)
-    dot_order = torch.randperm(batch.map.rows.shape[1])
-    shuffled_scene = [array[:, agent_order] for array in batch.scene]
-    shuffled_map = batch.map._replace(
-        rows=batch.map.rows[:, dot_order],
-        dot_present=batch.map.dot_present[:, dot_order],
-        dot_chunk=batch.map.dot_chunk[:, dot_order],
+    batch = synthetic_inputs(size)
+    batch.agent_history_mask[:, 5] = False
+    agent_order = torch.cat(
+        [torch.zeros(1, dtype=torch.long), 1 + torch.randperm(5)]
     )
-    # The target, agent 0, moves to wherever the shuffle put it.
-    new_index = torch.argsort(agent_order)[batch.targets.track_index]
-    shuffled_targets = batch.targets._replace(track_index=new_index)
-    permuted = SceneBatch(
-        SceneArrays(*shuffled_scene), shuffled_map, shuffled_targets
+    chunk_order = torch.randperm(5)
+    dot_order = torch.randperm(16)
+    chunk_rows = batch.chunk_rows[:, chunk_order][:, :, dot_order]
+    permuted = TargetInputs(
+        agent_history=batch.agent_history[:, agent_order],
+        agent_history_mask=batch.agent_history_mask[:, agent_order],
+        chunk_rows=chunk_rows,
+        chunk_dot_mask=batch.chunk_dot_mask[:, chunk_order][:, :, dot_order],
+        chunk_signal_history=batch.chunk_signal_history[:, chunk_order],
     )
     with torch.no_grad():
         base = predictor(batch)
@@ -797,9 +828,9 @@ def two_lane_signal_scenario(track_count, signalled_history):
     return loader.staged_scenario(staged)
 
 
-def test_agents_carry_their_lane_signal_history():
-    """An agent on a signalled lane receives that lane's signal history, and the
-    encoder's output depends on it.
+def test_lane_chunks_carry_their_light():
+    """The chunk of a signalled lane carries that lane's light history, the
+    other lane's chunk carries none, and the prediction depends on it.
     """
     signal_shape = (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
     signalled_history = np.zeros(signal_shape, dtype=np.float32)
@@ -807,38 +838,30 @@ def test_agents_carry_their_lane_signal_history():
     go_column = contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")
     signalled_history[:8, stop_column] = 1.0
     signalled_history[8:, go_column] = 1.0
-    first_track = np.array([0])
-    three_agent_scene = loader.one_scene(
-        two_lane_signal_scenario(3, signalled_history), first_track
+    scenario = two_lane_signal_scenario(3, signalled_history)
+    target_inputs = inputs.scene_inputs(scenario, np.array([0]))
+    lights = target_inputs.chunk_signal_history[0]
+    lit_chunks = [chunk for chunk in lights if chunk.any()]
+    assert len(lit_chunks) == 1
+    assert np.array_equal(lit_chunks[0], signalled_history)
+
+    batch = pipeline.torch_batch(target_inputs)
+    dark = batch._replace(
+        chunk_signal_history=torch.zeros_like(batch.chunk_signal_history)
     )
-    two_agent_scene = loader.one_scene(
-        two_lane_signal_scenario(2, signalled_history), first_track
-    )
-    assert np.array_equal(
-        three_agent_scene.targets.agent_signal_history[0], signalled_history
-    )
-    assert np.all(three_agent_scene.scene.agent_signal_history[0, 1:] == 0.0)
-    batch = loader.joined_batch([three_agent_scene, two_agent_scene])
-    assert batch.scene.agent_signal_history.shape == (2, 3) + signal_shape
-    assert np.all(batch.scene.agent_signal_history[1, 2] == 0.0)
-    tensor_batch = pipeline.torch_batch(batch)
-    silenced_targets = tensor_batch.targets._replace(
-        agent_signal_history=torch.zeros_like(
-            tensor_batch.targets.agent_signal_history
-        )
-    )
-    silenced_batch = tensor_batch._replace(targets=silenced_targets)
     torch.manual_seed(47)
-    encoder = model.SceneEncoder()
+    predictor = model.MotionPredictor(
+        reference_implementations.unit_anchor_offsets_per_type()
+    ).eval()
     with torch.no_grad():
-        memory = encoder(tensor_batch)
-        silenced_memory = encoder(silenced_batch)
-    assert not torch.allclose(memory.tokens[0, 0], silenced_memory.tokens[0, 0])
+        lit = predictor(batch).trajectories
+        unlit = predictor(dark).trajectories
+    assert not torch.allclose(lit, unlit)
 
 
 def test_target_prediction_ignores_batch_company():
     """A target predicted alone must equal the same target batched beside other
-    targets and another scene.
+    targets from another scene.
     """
     signal_shape = (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
     signalled_history = np.zeros(signal_shape, dtype=np.float32)
@@ -849,19 +872,14 @@ def test_target_prediction_ignores_batch_company():
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
-    alone_scene = loader.one_scene(three_track_scenario, np.array([1]))
-    together_scenes = [
-        loader.one_scene(two_track_scenario, np.array([0])),
-        loader.one_scene(three_track_scenario, np.array([0, 1, 2])),
-    ]
+    alone = inputs.scene_inputs(three_track_scenario, np.array([1]))
+    first = inputs.scene_inputs(two_track_scenario, np.array([0]))
+    second = inputs.scene_inputs(three_track_scenario, np.array([0, 1]))
+    together = TargetInputs(*map(np.concatenate, zip(first, second)))
     with torch.no_grad():
-        alone_batch = pipeline.torch_batch(alone_scene)
-        together_batch = pipeline.torch_batch(
-            loader.joined_batch(together_scenes)
-        )
-        alone = predictor(alone_batch).trajectories
-        together = predictor(together_batch).trajectories
-    assert torch.allclose(alone[0], together[2], atol=1e-4)
+        alone_paths = predictor(pipeline.torch_batch(alone)).trajectories
+        together_paths = predictor(pipeline.torch_batch(together)).trajectories
+    assert torch.allclose(alone_paths[0], together_paths[2], atol=1e-4)
 
 
 def test_zero_head_output_lands_on_the_anchor():
@@ -883,7 +901,7 @@ def test_zero_head_output_lands_on_the_anchor():
         polylines=2,
         dots_per_polyline=10,
     )
-    batch = synthetic_scene_batch(size)
+    batch = synthetic_inputs(size)
     with torch.no_grad():
         predicted = predictor(batch)
     assert torch.allclose(
@@ -1039,7 +1057,7 @@ def test_every_model_output_moves_the_loss():
         polylines=2,
         dots_per_polyline=10,
     )
-    batch = synthetic_scene_batch(size)
+    batch = synthetic_inputs(size)
     with torch.no_grad():
         emitted = predictor(batch)
     perturbations = {
@@ -1053,7 +1071,7 @@ def test_every_model_output_moves_the_loss():
     assert set(perturbations) == set(ModePredictions._fields)
 
     def total(predicted):
-        return loss.loss_terms(predicted, batch.targets).total
+        return loss.loss_terms(predicted, batch).total
 
     unperturbed = total(emitted)
     for name, perturb in perturbations.items():
@@ -1073,7 +1091,7 @@ def test_no_step_uncertainty_starts_saturated():
         polylines=2,
         dots_per_polyline=10,
     )
-    batch = synthetic_scene_batch(size)
+    batch = synthetic_inputs(size)
     with torch.no_grad():
         predicted = predictor(batch)
     assert predicted.trajectories.isfinite().all()
@@ -1112,7 +1130,7 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
     )
     batch = next(iter(pipeline.batches(scenario_paths, TWO_STAGED_SCENARIOS)))
     predicted = predictor(batch)
-    losses = loss.loss_terms(predicted, batch.targets)
+    losses = loss.loss_terms(predicted, batch)
     assert torch.stack(list(losses)).isfinite().all()
     losses.total.backward()
     starved = [
@@ -1124,7 +1142,7 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
     optimizer.step()
     progress = metrics.EpochProgress(torch.device("cpu"))
     detached = ModePredictions(*(tensor.detach() for tensor in predicted))
-    progress.add_kept_mode_errors(detached, batch.targets)
+    progress.add_kept_mode_errors(detached, batch)
     scalars = progress.epoch_scalars()
     assert math.isfinite(scalars["epoch/ade_80step"])
     assert math.isfinite(scalars["epoch/fde_80step"])

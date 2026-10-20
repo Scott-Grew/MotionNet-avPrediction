@@ -27,7 +27,7 @@ from womd.checkpoint import (
     previous_path,
     save_checkpoint,
 )
-from womd.loader import SceneBatch
+from womd.inputs import TargetInputs
 from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars
 from womd.model import MotionPredictor
 from womd.pipeline import BatchSettings
@@ -38,7 +38,7 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
 SECONDS_PER_HOUR = 3600
 
-Batches = Iterable[SceneBatch]
+Batches = Iterable[TargetInputs]
 
 
 class EpochPlan(NamedTuple):
@@ -297,12 +297,12 @@ class TrainingRun:
             batch = batch.each(lambda array: array.to(self.device))
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
                 predicted = self.predictor(batch)
-                losses = loss.loss_terms(predicted, batch.targets)
+                losses = loss.loss_terms(predicted, batch)
             global_step = steps_before + progress.batch_count
             rate = self.schedule.at(global_step)
             clipped, skipped = self.optimise(losses.total, rate)
             loss_is_finite = progress.record(losses, clipped, skipped)
-            progress.monitor_batch(predicted, batch.targets)
+            progress.monitor_batch(predicted, batch)
 
             if progress.batch_count % LOG_EVERY_BATCHES == 0:
                 heading = f"  batch {progress.batch_count}"

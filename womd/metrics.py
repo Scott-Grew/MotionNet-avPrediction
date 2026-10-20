@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from womd.loader import TargetArrays
+from womd.inputs import TargetInputs
 from womd.loss import LossTerms, mean_over_valid_steps
 from womd.model import QUERY_COUNT, ModePredictions
 from womd.pruning import prune_modes
@@ -29,7 +29,7 @@ def mean_or_nan(total: Tensor | float, count: Tensor | int) -> float:
     return float(total / count) if count else float("nan")
 
 
-def mode_distances(trajectories: Tensor, targets: TargetArrays) -> Tensor:
+def mode_distances(trajectories: Tensor, targets: TargetInputs) -> Tensor:
     """Each mode's mean distance to the logged future over its valid steps."""
     logged = targets.future_positions.unsqueeze(1)
     step_distances = (trajectories - logged).norm(dim=-1)
@@ -72,7 +72,7 @@ class EpochProgress:
         self.skipped_count += int(skipped)
         return bool(loss_is_finite)
 
-    def monitor_batch(self, predicted: ModePredictions, targets: TargetArrays):
+    def monitor_batch(self, predicted: ModePredictions, targets: TargetInputs):
         """Counts the batch's samples and closest modes, and on every
         LOG_EVERY_BATCHES-th batch adds it to the pruned minADE and minFDE.
         """

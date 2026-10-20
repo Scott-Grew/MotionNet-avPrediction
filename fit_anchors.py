@@ -34,15 +34,16 @@ def reachable_endpoints(paths: list[Path]) -> tuple[Tensor, Tensor]:
     for path in paths:
         scenario = loader.read_scenario(path)
         eligible = loader.eligible_tracks(scenario, designated_only=True)
-        if len(eligible) == 0:
-            continue
-        targets = loader.one_scene(scenario, eligible).targets
-        for index in range(len(eligible)):
-            valid_steps = np.flatnonzero(targets.future_mask[index])
+        for track_index in eligible:
+            rows = scenario.track_rows[track_index]
+            own_rows = loader.rows_to_frame(rows, loader.agent_frame(rows))
+            future_valid = scenario.track_valid[track_index, loader.FUTURE]
+            valid_steps = np.flatnonzero(future_valid)
             if valid_steps.size == 0:
                 continue
-            histories.append(targets.agent_history[index])
-            positions.append(targets.future_positions[index, valid_steps[-1]])
+            future = own_rows[loader.FUTURE, contract.AGENT_POSITION]
+            histories.append(own_rows[loader.HISTORY])
+            positions.append(future[valid_steps[-1]])
     history = torch.from_numpy(np.stack(histories))
     endpoints = torch.from_numpy(np.stack(positions))
     type_index = model.predicted_type_index(history)

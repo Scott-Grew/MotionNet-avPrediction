@@ -1,19 +1,18 @@
-"""The network. Every agent and map chunk in a scene becomes a token and the
-tokens self-attend once per scene; each predicted agent then reads them
-through its own crop and 54 anchored futures are decoded.
+"""The network. Everything a predicted agent sees arrives in its own frame
+(womd/inputs.py): each agent's history and each map chunk become one token, a
+transformer encoder relates the tokens, and 54 anchor queries decode one
+future each through a transformer decoder.
 """
 
 from __future__ import annotations
 
-import math
 from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
 
 from womd import contract
-from womd.loader import MapArrays, SceneBatch
-from womd.view import token_poses, visible_tokens
+from womd.inputs import TargetInputs
 
 # Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
@@ -26,16 +25,15 @@ DECODER_ROUNDS = 6
 # The decoder predicts one future per anchor, 54 per object type;
 # womd/pruning.py later keeps the 6 that Waymo scores.
 QUERY_COUNT = 54
-# The customary transformer initialisation scale, used for the
-# learned queries.
-QUERY_INITIALISATION_SCALE = 0.02
+# A chunk's dots are read relative to its centre in units of half a
+# chunk's length, so a 20 m curve spans about -1 to 1.
+CHUNK_HALF_LENGTH_METRES = (
+    contract.MAP_CHUNK_DOTS * contract.MAP_POINT_SPACING_METRES / 2
+)
 # Predicted log sigma is clamped to 0.2 m .. 148 m; without a
 # floor the likelihood rewards ever-narrower Gaussians.
 MINIMUM_LOG_STANDARD_DEVIATION = -1.609
 MAXIMUM_LOG_STANDARD_DEVIATION = 5.0
-
-# Tokens with a mask of which are real, (..., N, hidden) and (..., N).
-Tokens = tuple[Tensor, Tensor]
 
 # torch's own pre-norm transformer layers, with no dropout.
 TRANSFORMER_LAYER_SETTINGS = {
@@ -61,12 +59,12 @@ class ModePredictions(NamedTuple):
 
 
 class Memory(NamedTuple):
-    """Each target's view of its scene: its own history token first, then its
-    scene's tokens, and a mask of which of those it may attend to.
+    """The encoded tokens of each target's scene, agents (the target first)
+    then map chunks, and a mask of which tokens are real.
     """
 
-    tokens: Tensor  # (targets, 1 + agents + chunks, hidden)
-    present: Tensor  # (targets, 1 + agents + chunks)
+    tokens: Tensor  # (targets, 48 + 256, hidden)
+    present: Tensor  # (targets, 48 + 256)
 
 
 def agent_feature_divisors() -> Tensor:
@@ -83,11 +81,12 @@ def agent_feature_divisors() -> Tensor:
 
 
 def map_feature_divisors() -> Tensor:
-    """Per-feature scale for map rows, position and stop point in metres and
-    speed limit in miles per hour.
+    """Per-feature scale for map rows: position relative to its chunk's
+    centre, stop point in the target's frame in metres, and speed limit in
+    miles per hour.
     """
     divisors = torch.ones(contract.MAP_FEATURE_DIM)
-    divisors[contract.MAP_POSITION] = contract.DISTANCE_NORMALISER_METRES
+    divisors[contract.MAP_POSITION] = CHUNK_HALF_LENGTH_METRES
     divisors[contract.MAP_SPEED_LIMIT] = (
         contract.SPEED_LIMIT_NORMALISER_MILES_PER_HOUR
     )
@@ -154,130 +153,71 @@ class MapDotEncoder(nn.Module):
         return self.network(features)
 
 
-def pool_chunks(dots: Tensor, scene_map: MapArrays) -> Tokens:
-    """Max-pools each scene's dot tokens (S, D, hidden) into its chunk tokens
-    (S, C, hidden), and marks which chunks any dot reached (S, C).
+class MapChunkEncoder(nn.Module):
+    """Encodes each map chunk into one token: its dots relative to the chunk's
+    centre through the dot encoder, max-pooled, then the centre, the mean
+    direction and the chunk's traffic-light history added.
     """
-    scene_count, dot_count, hidden = dots.shape
-    chunk_count = scene_map.chunk_pose.shape[1]
-    # Padding dots and empty chunks start at -inf, so amax never selects
-    # them, and a chunk no dot reaches stays at -inf.
-    padding = ~scene_map.dot_present[..., None]
-    real_dots = dots.masked_fill(padding, float("-inf")).flatten(0, 1)
-    # Scene s, chunk c is row s * C + c once scenes and chunks are
-    # flattened; a scatter along the first axis exports to ONNX.
-    scenes = torch.arange(scene_count, device=dots.device)
-    rows = scenes[:, None] * chunk_count + scene_map.dot_chunk
-    selector = rows.flatten()[:, None].expand(-1, hidden)
-    tokens = dots.new_full((scene_count * chunk_count, hidden), float("-inf"))
-    tokens = tokens.scatter_reduce(0, selector, real_dots, reduce="amax")
-    tokens = tokens.view(scene_count, chunk_count, hidden)
-    present = tokens[..., 0] > float("-inf")
-    tokens = torch.where(present[..., None], tokens, torch.zeros_like(tokens))
-    return tokens, present
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.dot_encoder = MapDotEncoder()
+        self.pose_projection = nn.Linear(4, HIDDEN_DIM)
+        self.signal_projection = nn.Linear(
+            contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False
+        )
 
-def initialise_attention(attention: nn.MultiheadAttention) -> None:
-    """Re-draws torch's fused query-key-value projection from the uniform range
-    three separate nn.Linear layers would start in.
-    """
-    bound = 1.0 / math.sqrt(HIDDEN_DIM)
-    nn.init.uniform_(attention.in_proj_weight, -bound, bound)
-    nn.init.uniform_(attention.in_proj_bias, -bound, bound)
-    nn.init.uniform_(attention.out_proj.bias, -bound, bound)
+    def forward(self, inputs: TargetInputs) -> tuple[Tensor, Tensor]:
+        """Chunk tokens (B, chunks, hidden) and whether each chunk has any dot
+        (B, chunks).
+        """
+        rows = inputs.chunk_rows
+        dot_mask = inputs.chunk_dot_mask
+        is_dot = dot_mask.unsqueeze(-1).to(rows.dtype)
+        dot_count = is_dot.sum(dim=-2).clamp_min(1.0)
+        positions = rows[..., contract.MAP_POSITION]
+        directions = rows[..., contract.MAP_DIRECTION]
+        centre = (positions * is_dot).sum(dim=-2) / dot_count
+        mean_direction = (directions * is_dot).sum(dim=-2) / dot_count
+        local = positions - centre.unsqueeze(-2)
+        local_rows = torch.cat([local, rows[..., 2:]], dim=-1)
 
-
-def scene_attention_layer() -> nn.TransformerEncoderLayer:
-    layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
-    initialise_attention(layer.self_attn)
-    return layer
-
-
-def decoder_round_layer() -> nn.TransformerDecoderLayer:
-    """One decoder round of self-attention over the modes, cross-attention to
-    the scene tokens and feedforward.
-    """
-    layer = nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
-    initialise_attention(layer.self_attn)
-    initialise_attention(layer.multihead_attn)
-    return layer
+        dots = self.dot_encoder(local_rows)
+        dots = dots.masked_fill(~dot_mask.unsqueeze(-1), float("-inf"))
+        pooled = dots.max(dim=-2).values
+        present = dot_mask.any(dim=-1)
+        pooled = pooled.masked_fill(~present.unsqueeze(-1), 0.0)
+        scaled_centre = centre / contract.DISTANCE_NORMALISER_METRES
+        pose = torch.cat([scaled_centre, mean_direction], dim=-1)
+        signals = inputs.chunk_signal_history.flatten(start_dim=-2)
+        tokens = pooled + self.pose_projection(pose)
+        return tokens + self.signal_projection(signals), present
 
 
 class SceneEncoder(nn.Module):
-    """Encodes each scene once, in the scene frame, then gives every predicted
-    agent its own view of those tokens.
+    """Turns a target's agents and map chunks into tokens and relates them with
+    self-attention. Everything is already in the target's frame.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.agent_encoder = AgentHistoryEncoder()
-        self.scene_agent_encoder = AgentHistoryEncoder()
-        self.map_encoder = MapDotEncoder()
-        self.signal_projection = nn.Linear(
-            contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False
-        )
-        # A token pose is (x, y, cosine, sine), and only x and y are metres
-        # that need scaling.
-        self.pose_projection = nn.Linear(4, HIDDEN_DIM)
-        metres = contract.DISTANCE_NORMALISER_METRES
-        self.register_buffer(
-            "pose_divisors", torch.tensor([metres, metres, 1.0, 1.0])
-        )
-        self.layers = nn.ModuleList(
-            scene_attention_layer() for _ in range(SCENE_ATTENTION_ROUNDS)
+        self.map_encoder = MapChunkEncoder()
+        layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+        self.layers = nn.TransformerEncoder(
+            layer, SCENE_ATTENTION_ROUNDS, enable_nested_tensor=False
         )
 
-    def scene_tokens(self, batch: SceneBatch) -> Tokens:
-        """Tokens (scenes, agents + chunks, hidden), in that order, after
-        self-attention, and a mask of which tokens are real.
-        """
-        scene = batch.scene
-        scene_map = batch.map
-        agent_motion = self.scene_agent_encoder(
-            scene.agent_history, scene.agent_history_mask
-        )
-        agent_signals = scene.agent_signal_history.flatten(start_dim=-2)
-        agent_tokens = agent_motion + self.signal_projection(agent_signals)
-
-        dot_embeddings = self.map_encoder(scene_map.rows)
-        chunk_tokens, chunk_present = pool_chunks(dot_embeddings, scene_map)
-        chunk_signals = scene_map.chunk_signal_history.flatten(start_dim=-2)
-        map_tokens = chunk_tokens + self.signal_projection(chunk_signals)
-
-        tokens = torch.cat([agent_tokens, map_tokens], dim=1)
-        agent_present = scene.agent_history_mask.any(dim=-1)
+    def forward(self, inputs: TargetInputs) -> Memory:
+        history = inputs.agent_history
+        mask = inputs.agent_history_mask
+        agent_tokens = self.agent_encoder(history, mask)
+        agent_present = mask.any(dim=-1)
+        chunk_tokens, chunk_present = self.map_encoder(inputs)
+        tokens = torch.cat([agent_tokens, chunk_tokens], dim=1)
         present = torch.cat([agent_present, chunk_present], dim=1)
-        for layer in self.layers:
-            tokens = layer(tokens, src_key_padding_mask=~present)
-        return tokens, present
-
-    def forward(self, batch: SceneBatch) -> Memory:
-        """Each target's memory: its own history token, then its scene's tokens
-        with each token's pose in the target's frame added, masked to its
-        crop.
-        """
-        tokens, present = self.scene_tokens(batch)
-        targets = batch.targets
-        own_motion = self.agent_encoder(
-            targets.agent_history, targets.agent_history_mask
-        )
-        own_signals = targets.agent_signal_history.flatten(start_dim=-2)
-        own_token = (
-            own_motion + self.signal_projection(own_signals)
-        ).unsqueeze(1)
-        own_present = torch.ones_like(own_token[..., 0], dtype=torch.bool)
-
-        # A scene with several targets is repeated once per target, each copy
-        # seen from that target's frame and masked to its crop.
-        poses = token_poses(batch)
-        pose_embedding = self.pose_projection(poses / self.pose_divisors)
-        scene_tokens = tokens.index_select(0, targets.scene_index)
-        target_tokens = scene_tokens + pose_embedding
-        scene_present = present.index_select(0, targets.scene_index)
-        view_present = scene_present & visible_tokens(batch)
-        memory_tokens = torch.cat([own_token, target_tokens], dim=1)
-        memory_present = torch.cat([own_present, view_present], dim=1)
-        return Memory(memory_tokens, memory_present)
+        encoded = self.layers(tokens, src_key_padding_mask=~present)
+        return Memory(encoded, present)
 
 
 def predicted_type_index(history: Tensor) -> Tensor:
@@ -314,9 +254,8 @@ def anchor_lines(anchors: Tensor) -> Tensor:
 
 class ModeDecoder(nn.Module):
     """Decodes the 54 anchor-conditioned trajectory modes and their confidences
-    from the memory built by SceneEncoder. Each query is a learned vector plus
-    an embedding of its anchor endpoint, so each query starts tied to one
-    anchor.
+    from the memory built by SceneEncoder. Each query is an embedding of its
+    anchor endpoint alone, so mode k always belongs to anchor k.
     """
 
     def __init__(self, unit_anchors: Tensor) -> None:
@@ -327,19 +266,15 @@ class ModeDecoder(nn.Module):
                 f"unit_anchors has shape {tuple(unit_anchors.shape)},"
                 f" not {expected_shape}"
             )
-        self.queries = nn.Parameter(
-            torch.randn(QUERY_COUNT, HIDDEN_DIM) * QUERY_INITIALISATION_SCALE
-        )
         # Anchor endpoints in metres, despite the name, which saved
         # checkpoints and anchor files depend on.
         self.register_buffer(
             "unit_anchors", unit_anchors.detach().clone().float()
         )
-        self.anchor_projection = nn.Linear(2, HIDDEN_DIM)
+        self.anchor_query = two_layer_mlp(2)
         self.scene_norm = nn.LayerNorm(HIDDEN_DIM)
-        self.rounds = nn.ModuleList(
-            decoder_round_layer() for _ in range(DECODER_ROUNDS)
-        )
+        layer = nn.TransformerDecoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+        self.rounds = nn.TransformerDecoder(layer, DECODER_ROUNDS)
         self.head_norm = nn.LayerNorm(HIDDEN_DIM)
         # Per future step, an x, y offset and an x, y log sigma.
         self.trajectory_head = nn.Sequential(
@@ -361,14 +296,12 @@ class ModeDecoder(nn.Module):
         """
         batch_size = memory.tokens.shape[0]
         anchors = self.unit_anchors[type_index]
-        queries = self.queries + self.anchor_projection(
-            anchors / contract.DISTANCE_NORMALISER_METRES
-        )
+        scaled_anchors = anchors / contract.DISTANCE_NORMALISER_METRES
+        queries = self.anchor_query(scaled_anchors)
         normed_tokens = self.scene_norm(memory.tokens)
-        for decoder_round in self.rounds:
-            queries = decoder_round(
-                queries, normed_tokens, memory_key_padding_mask=~memory.present
-            )
+        queries = self.rounds(
+            queries, normed_tokens, memory_key_padding_mask=~memory.present
+        )
         queries = self.head_norm(queries)
 
         # Cast up so the cumulative sum below runs in float32 even under
@@ -399,41 +332,31 @@ class MotionPredictor(nn.Module):
     def unit_anchors(self) -> Tensor:
         return self.mode_decoder.unit_anchors
 
-    def forward(self, batch: SceneBatch) -> ModePredictions:
-        """The scene encoder and mode decoder for one batch, with anchors
-        chosen by each agent's predicted type.
+    def forward(self, inputs: TargetInputs) -> ModePredictions:
+        """The scene encoder and mode decoder for a batch of targets, with
+        anchors chosen by each target's predicted type.
         """
-        memory = self.scene_encoder(batch)
-        type_index = predicted_type_index(batch.targets.agent_history)
+        memory = self.scene_encoder(inputs)
+        own_history = inputs.agent_history[:, 0]
+        type_index = predicted_type_index(own_history)
         return self.mode_decoder(memory, type_index)
 
 
 # ------------------------------------------------------------------
-# DATA FLOW for S scenes holding B predicted agents, hidden width 192
+# DATA FLOW for B predicted agents, hidden width 192, all in each
+# agent's own frame (womd/inputs.py)
 #
-#   once per scene, in the scene frame.
-#
-#   scene_agent_history  --MLP-->      A tokens  \
-#                                                 >  (S, A+C, 192)
-#   map_rows  --MLP, max-pool-->       C tokens  /
-#   (each token also gets its traffic-light history)
+#   48 agent histories --MLP over 11 steps-->     48 tokens  \
+#                                                              > (B, 304, 192)
+#   256 map chunks --MLP per dot, max-pool,                  /
+#                    + centre, direction, lights--> 256 tokens
 #                          |
 #            6 x pre-norm self-attention layer
 #                          |
-#                     scene tokens
-#                          |
-#   once per predicted agent.
-#
-#   its scene's tokens, each + an embedding of that token's pose
-#   in the agent's frame, masked to the agent's crop
-#   agent_history  --MLP-->  1 own token, placed first
-#                          |
-#                  (B, 1+A+C, 192)
-#                          |
-#   54 queries, each a learned vector + its anchor's embedding
+#   54 queries, each an MLP of its anchor endpoint
 #                          |
 #            6 x [ self-attention over the 54 modes,
-#                  cross-attention to the agent's tokens,
+#                  cross-attention to the tokens,
 #                  feedforward ]
 #                          |
 #            +-------------+--------------+

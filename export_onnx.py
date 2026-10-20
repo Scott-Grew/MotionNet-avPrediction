@@ -1,5 +1,5 @@
-"""Exports the whole inference path to one ONNX graph: a scene of any size
-in, each designated target's 6 kept futures at Waymo's 2 Hz and their
+"""Exports the whole inference path to one ONNX graph: any number of
+targets' inputs in, each target's 6 kept futures at Waymo's 2 Hz and their
 confidences out, in the target's own frame. Checks the graph against torch
 on every scene and times both.
 """
@@ -20,61 +20,26 @@ import onnxruntime
 import torch
 from torch import Tensor, nn
 
-from womd import loader, pipeline
+from womd import inputs, loader, pipeline
 from womd.checkpoint import load_predictor
-from womd.loader import MapArrays, SceneArrays, SceneBatch, TargetArrays
+from womd.inputs import TargetInputs
 from womd.pruning import submitted_modes
 
-# The graph's inputs are the batch arrays the model reads, scene group
-# first, named "<group>_<field>"; the logged future is not an input.
-TARGET_INPUTS = [name for name in TargetArrays._fields if "future" not in name]
-INPUT_FIELDS = (
-    [("scene", name) for name in SceneArrays._fields]
-    + [("map", name) for name in MapArrays._fields]
-    + [("targets", name) for name in TARGET_INPUTS]
-)
-INPUT_NAMES = [f"{group}_{name}" for group, name in INPUT_FIELDS]
+# The graph's inputs are the arrays the model reads, in TargetInputs order;
+# the logged future is not an input.
+INPUT_NAMES = [name for name in TargetInputs._fields if "future" not in name]
 OUTPUT_NAMES = ["trajectories", "confidences"]
-OPSET_VERSION = 18
+OPSET_VERSION = 17
 WARMUP_RUNS = 2
 
 Session = onnxruntime.InferenceSession
 Outputs = tuple[Tensor, Tensor]
-RunOnce = Callable[[SceneBatch], object]
+RunOnce = Callable[[TargetInputs], object]
 
 
-def varying_axes(group: str, name: str) -> dict[int, str]:
-    """The axes of one input whose size changes from scene to scene."""
-    if group == "targets":
-        return {0: "targets"}
-    if group == "scene":
-        return {0: "scenes", 1: "agents"}
-    if name.startswith("chunk"):
-        return {0: "scenes", 1: "chunks"}
-    return {0: "scenes", 1: "dots"}
-
-
-def graph_inputs(batch: SceneBatch) -> tuple[Tensor, ...]:
-    """The batch's arrays in INPUT_FIELDS order."""
-    tensors = []
-    for group, name in INPUT_FIELDS:
-        arrays = getattr(batch, group)
-        tensors.append(getattr(arrays, name))
-    return tuple(tensors)
-
-
-def batch_from_graph_inputs(tensors: tuple[Tensor, ...]) -> SceneBatch:
-    """The SceneBatch behind positional tensors in INPUT_FIELDS order."""
-    groups: dict[str, dict[str, Tensor]] = {
-        "scene": {},
-        "map": {},
-        "targets": {},
-    }
-    for (group, name), tensor in zip(INPUT_FIELDS, tensors, strict=True):
-        groups[group][name] = tensor
-    scene = SceneArrays(**groups["scene"])
-    scene_map = MapArrays(**groups["map"])
-    return SceneBatch(scene, scene_map, TargetArrays(**groups["targets"]))
+def graph_inputs(batch: TargetInputs) -> tuple[Tensor, ...]:
+    """The batch's arrays in INPUT_NAMES order."""
+    return tuple(getattr(batch, name) for name in INPUT_NAMES)
 
 
 class InferenceGraph(nn.Module):
@@ -87,18 +52,17 @@ class InferenceGraph(nn.Module):
         self.predictor = predictor
 
     def forward(self, *tensors: Tensor) -> Outputs:
-        predicted = self.predictor(batch_from_graph_inputs(tensors))
+        predicted = self.predictor(TargetInputs(*tensors))
         trajectories = predicted.trajectories
         logits = predicted.confidence_logits
         submitted = submitted_modes(trajectories, logits)
         return submitted.trajectories, submitted.confidences
 
 
-def export(graph: InferenceGraph, batch: SceneBatch, path: Path) -> None:
-    """Traces the graph on one scene, with every scene-sized axis left free."""
-    axes = {name: {0: "targets"} for name in OUTPUT_NAMES}
-    for (group, name), input_name in zip(INPUT_FIELDS, INPUT_NAMES):
-        axes[input_name] = varying_axes(group, name)
+def export(graph: InferenceGraph, batch: TargetInputs, path: Path) -> None:
+    """Traces the graph on one scene, with the target axis left free."""
+    names = INPUT_NAMES + OUTPUT_NAMES
+    axes = {name: {0: "targets"} for name in names}
     torch.onnx.export(
         graph,
         graph_inputs(batch),
@@ -118,19 +82,19 @@ def onnx_session(path: Path, threads: int) -> Session:
     return Session(str(path), options, providers=providers)
 
 
-def torch_run(graph: InferenceGraph, batch: SceneBatch) -> Outputs:
+def torch_run(graph: InferenceGraph, batch: TargetInputs) -> Outputs:
     with torch.no_grad():
         return graph(*graph_inputs(batch))
 
 
-def onnx_run(session: Session, batch: SceneBatch) -> list[np.ndarray]:
+def onnx_run(session: Session, batch: TargetInputs) -> list[np.ndarray]:
     feeds = {}
     for name, tensor in zip(INPUT_NAMES, graph_inputs(batch), strict=True):
         feeds[name] = tensor.numpy()
     return session.run(OUTPUT_NAMES, feeds)
 
 
-def scene_milliseconds(run: RunOnce, batches: list[SceneBatch]) -> list[float]:
+def milliseconds(run: RunOnce, batches: list[TargetInputs]) -> list[float]:
     """Times run over each batch after a few warm-up calls, one duration in
     milliseconds per scene.
     """
@@ -144,7 +108,7 @@ def scene_milliseconds(run: RunOnce, batches: list[SceneBatch]) -> list[float]:
     return durations
 
 
-def designated_batches(paths: list[Path]) -> list[SceneBatch]:
+def designated_batches(paths: list[Path]) -> list[TargetInputs]:
     """One batch per scenario holding its designated targets, skipping
     scenarios without any.
     """
@@ -153,7 +117,7 @@ def designated_batches(paths: list[Path]) -> list[SceneBatch]:
         scenario = loader.read_scenario(path)
         tracks = loader.designated_tracks(scenario)
         if len(tracks):
-            scene = loader.one_scene(scenario, tracks)
+            scene = inputs.scene_inputs(scenario, tracks)
             batches.append(pipeline.torch_batch(scene))
     return batches
 
@@ -185,8 +149,8 @@ def main() -> None:
         onnx_trajectories = run_onnx(batch)[0]
         gap = np.abs(torch_trajectories - onnx_trajectories).max()
         gaps.append(float(gap))
-    torch_times = scene_milliseconds(run_torch, batches)
-    onnx_times = scene_milliseconds(run_onnx, batches)
+    torch_times = milliseconds(run_torch, batches)
+    onnx_times = milliseconds(run_onnx, batches)
     print(f"{len(batches)} scenes, one graph at {arguments.onnx_path}")
     print(f"onnx differs from torch by at most {max(gaps):.2e} m")
     print(

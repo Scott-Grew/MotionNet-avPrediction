@@ -18,30 +18,38 @@ import torch
 from numpy import ndarray
 from torch import Tensor
 
-from womd import baseline, contract, frame_ops, loader, pipeline, pruning
+from womd import (
+    baseline,
+    contract,
+    frame_ops,
+    inputs,
+    loader,
+    pipeline,
+    pruning,
+)
 from womd.checkpoint import load_predictor
 from womd.frame_ops import Frame
-from womd.loader import SceneBatch
+from womd.inputs import TargetInputs
 from womd.model import MotionPredictor
 from womd.pruning import SubmittedModes
 
 # A prediction function takes a batch and returns every target's modes,
 # trajectories (B, modes, 80, 2) and confidence logits (B, modes).
 Modes = tuple[Tensor, Tensor]
-Predict = Callable[[SceneBatch], Modes]
+Predict = Callable[[TargetInputs], Modes]
 
 
-def model_modes(predictor: MotionPredictor, batch: SceneBatch) -> Modes:
+def model_modes(predictor: MotionPredictor, batch: TargetInputs) -> Modes:
     predicted = predictor(batch)
     return predicted.trajectories, predicted.confidence_logits
 
 
-def constant_velocity_modes(batch: SceneBatch) -> Modes:
+def constant_velocity_modes(batch: TargetInputs) -> Modes:
     """The control: each target carried on at its current velocity."""
-    return baseline.constant_velocity(batch.targets.agent_history)
+    return baseline.constant_velocity(batch.agent_history[:, 0])
 
 
-def predict_scene(predict: Predict, batch: SceneBatch) -> SubmittedModes:
+def predict_scene(predict: Predict, batch: TargetInputs) -> SubmittedModes:
     """One scene's modes at 10 Hz become Waymo's 6 kept modes at 2 Hz, in
     each target's own frame.
     """
@@ -67,7 +75,7 @@ def submission(predict: Predict, staged: Path) -> contract.Submission:
     for path in sorted(staged.glob("*.npz")):
         scenario = loader.read_scenario(path)
         tracks = loader.designated_tracks(scenario)
-        batch = pipeline.torch_batch(loader.one_scene(scenario, tracks))
+        batch = pipeline.torch_batch(inputs.scene_inputs(scenario, tracks))
         kept = predict_scene(predict, batch)
         kept_paths = kept.trajectories.numpy()
         kept_rows = zip(tracks, kept_paths, kept.confidences.numpy())
