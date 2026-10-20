@@ -59,6 +59,7 @@ bottom of `womd/contract.py`.
 ## Architecture
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 25, "rankSpacing": 30}, "themeVariables": {"fontSize": "13px"}}}%%
 flowchart TD
     RAW[("Waymo files")] -->|stage.py| STAGED[("Staged scenes")]
     STAGED -->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")]
