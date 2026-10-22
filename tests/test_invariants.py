@@ -5,6 +5,9 @@ loss, pruning, metrics and submission.
 import importlib.util
 import json
 import math
+import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -18,6 +21,7 @@ import submit
 import train
 from womd import (
     baseline,
+    checkpoint,
     contract,
     frame_ops,
     inputs,
@@ -288,8 +292,8 @@ def test_path_distance_matches_dense_sampling():
 
 
 def test_padded_slots_change_nothing():
-    """Extra empty agent and chunk slots, filled with garbage under their
-    masks, must not move any prediction.
+    """Extra empty agent and chunk slots, and masked history steps and map
+    dots, all holding NaN under their masks, must not move any prediction.
     """
     torch.manual_seed(5)
     predictor = model.MotionPredictor(
@@ -298,17 +302,26 @@ def test_padded_slots_change_nothing():
     size = SyntheticSize(samples=3, agents=4, polylines=5, dots_per_polyline=8)
     batch = synthetic_inputs(size)
     batch.chunk_dot_mask[:, :, 6:] = False
+    batch.agent_history_mask[:, 1:, :3] = False
     wider = size._replace(agents=7, polylines=9)
     garbage = synthetic_inputs(wider)
+    nan = float("nan")
+    garbage.agent_history.fill_(nan)
+    garbage.chunk_rows.fill_(nan)
+    garbage.chunk_signal_history.fill_(nan)
+    poisoned_history = batch.agent_history.clone()
+    poisoned_history[~batch.agent_history_mask] = nan
+    poisoned_rows = batch.chunk_rows.clone()
+    poisoned_rows[~batch.chunk_dot_mask] = nan
     padded = TargetInputs(
         agent_history=torch.cat(
-            [batch.agent_history, garbage.agent_history[:, 4:]], dim=1
+            [poisoned_history, garbage.agent_history[:, 4:]], dim=1
         ),
         agent_history_mask=torch.cat(
             [batch.agent_history_mask, torch.zeros(3, 3, 11, dtype=torch.bool)],
             dim=1,
         ),
-        chunk_rows=torch.cat([batch.chunk_rows, garbage.chunk_rows[:, 5:]], 1),
+        chunk_rows=torch.cat([poisoned_rows, garbage.chunk_rows[:, 5:]], 1),
         chunk_dot_mask=torch.cat(
             [batch.chunk_dot_mask, torch.zeros(3, 4, 8, dtype=torch.bool)], 1
         ),
@@ -1032,7 +1045,7 @@ def test_masked_steps_move_no_loss():
 
     masked_steps = ~future_mask
     poisoned_positions = future_positions.clone()
-    poisoned_positions[masked_steps] = 1e6
+    poisoned_positions[masked_steps] = float("nan")
     poisoned_trajectories = trajectories.clone()
     poisoned_trajectories[
         masked_steps.unsqueeze(1).expand(-1, model.QUERY_COUNT, -1)
@@ -1219,3 +1232,144 @@ def test_step_head_walks_a_line_or_an_arc():
     )
     turning = torch.atan2(steps[:, 1], steps[:, 0]).diff()
     assert torch.allclose(turning, torch.full_like(turning, 0.02), atol=1e-5)
+
+
+def test_unreadable_staged_file_names_itself(tmp_path):
+    """One bad file among 122,352 must say which file it is."""
+    source = sorted(STAGED_DIRECTORY.glob("*.npz"))[0]
+    file_bytes = source.read_bytes()
+    truncated = tmp_path / "truncated.npz"
+    truncated.write_bytes(file_bytes[: len(file_bytes) // 2])
+    with np.load(source) as staged:
+        kept_names = [name for name in staged.files if name != "map_rows"]
+        kept_arrays = {name: staged[name] for name in kept_names}
+    missing = tmp_path / "missing.npz"
+    np.savez_compressed(missing, **kept_arrays)
+    for path in (truncated, missing):
+        with pytest.raises(ValueError, match=re.escape(str(path))):
+            contract.StagedFile.load(path)
+    with pytest.raises(ValueError, match=re.escape(str(truncated))):
+        loader.read_track_arrays(truncated)
+
+
+def test_step_count_matches_a_serial_count():
+    """The threaded count must equal a serial count that re-derives each
+    eligible track from the raw staged arrays.
+    """
+    paths = sorted(STAGED_DIRECTORY.glob("*.npz"))
+    worker_count = 3
+    batch_size = 8
+    settings = TWO_STAGED_SCENARIOS._replace(
+        batch_size=batch_size, worker_count=worker_count, designated_only=False
+    )
+    now = contract.CURRENT_STEP_INDEX
+    expected = 0
+    for worker_index in range(worker_count):
+        targets = 0
+        for path in paths[worker_index::worker_count]:
+            with np.load(path) as staged:
+                valid_now = staged["track_valid"][:, now]
+                type_rows = staged["track_rows"][:, now, contract.AGENT_TYPE]
+            is_predicted = type_rows[:, : contract.NUM_OBJECT_TYPES].any(axis=1)
+            targets += int((valid_now & is_predicted).sum())
+        expected += math.ceil(targets / batch_size)
+    assert pipeline.steps_per_epoch(paths, settings) == expected
+
+
+def test_pruning_fills_six_slots_from_three_modes():
+    """With fewer modes than slots, the kept modes match the plain loop and
+    the backfilled slots carry no confidence.
+    """
+    endpoints = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+    ramp = torch.linspace(0.0, 1.0, contract.FUTURE_STEPS)[:, None]
+    trajectories = (endpoints[:, None, :] * ramp)[None]
+    logits = torch.tensor([[1.0, 3.0, 2.0]])
+    pruned = pruning.prune_modes(trajectories, logits)
+    walked_trajectories, walked_logits = (
+        reference_implementations.prune_modes_single_sample(
+            trajectories[0], logits[0]
+        )
+    )
+    assert pruned.kept_count.item() == 3
+    assert torch.equal(pruned.trajectories[0, :3], walked_trajectories)
+    assert torch.equal(pruned.confidence_logits[0, :3], walked_logits)
+    submitted = pruning.submitted_modes(trajectories, logits)
+    assert torch.allclose(submitted.confidences.sum(dim=-1), torch.ones(1))
+    assert torch.all(submitted.confidences[0, 3:] == 0.0)
+
+
+def test_broken_submission_is_refused(tmp_path):
+    """A submission row the scorer would misread must fail on save."""
+    slots = contract.NUM_PREDICTED_MODES
+    steps = len(contract.SUBMISSION_FUTURE_INDICES)
+    confidences = np.zeros((2, slots))
+    confidences[:, 0] = 1.0
+    good = contract.Submission(
+        scenario_id=np.array(["scene", "scene"]),
+        track_id=np.array([1, 2], dtype=np.int64),
+        world_trajectories=np.zeros((2, slots, steps, 2)),
+        confidences=confidences,
+        provenance=contract.artifact_provenance("test", tmp_path),
+    )
+    good.save(tmp_path / "good.npz")
+    assert len(contract.Submission.load(tmp_path / "good.npz").track_id) == 2
+    negative = confidences.copy()
+    negative[0, :2] = [1.5, -0.5]
+    not_finite = good.world_trajectories.copy()
+    not_finite[1, 0, 0, 0] = np.nan
+    broken = [
+        good._replace(confidences=negative),
+        good._replace(confidences=confidences * 0.5),
+        good._replace(track_id=np.array([1, 1], dtype=np.int64)),
+        good._replace(world_trajectories=not_finite),
+    ]
+    for submission in broken:
+        with pytest.raises(ValueError):
+            submission.save(tmp_path / "broken.npz")
+
+
+def test_checkpoint_of_another_design_is_refused(tmp_path):
+    """Weights from a different model design must be refused by name."""
+    anchors = reference_implementations.unit_anchor_offsets_per_type()
+    model_state = model.MotionPredictor(anchors).state_dict()
+    renamed = {f"old.{name}": value for name, value in model_state.items()}
+    renamed[checkpoint.ANCHORS_KEY] = model_state[checkpoint.ANCHORS_KEY]
+    path = tmp_path / "other_design.pt"
+    stored = {
+        "code_version": contract.STAGING_CODE_VERSION,
+        "model_state": renamed,
+    }
+    torch.save(stored, path)
+    with pytest.raises(ValueError, match="different model design"):
+        checkpoint.load_predictor(path)
+
+
+EXIT_PROBE = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[2])
+from womd import pipeline
+from womd.pipeline import BatchSettings
+
+if __name__ == "__main__":
+    paths = sorted(Path(sys.argv[1]).glob("*.npz"))[:1]
+    settings = BatchSettings(4, 1, 1, 0, True)
+    for batch in pipeline.batches(paths, settings):
+        pass
+"""
+
+
+def test_worker_run_exits(tmp_path):
+    """A process that iterated a one-worker DataLoader must exit, which on
+    macOS needs the resource-tracker pipe kept from torch_shm_manager.
+    """
+    script = tmp_path / "exit_probe.py"
+    script.write_text(EXIT_PROBE)
+    repository = Path(__file__).resolve().parents[1]
+    arguments = [str(script), str(STAGED_DIRECTORY), str(repository)]
+    command = [sys.executable, *arguments]
+    finished = subprocess.run(
+        command, timeout=60, capture_output=True, check=False
+    )
+    assert finished.returncode == 0, finished.stderr.decode()[-2000:]

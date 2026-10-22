@@ -117,8 +117,11 @@ def test_one_training_step_runs_end_to_end():
 
 
 def literal_run_arguments(call):
-    """The literal arguments of one subprocess.run([...]) call, or None."""
-    is_run = isinstance(call.func, ast.Attribute) and call.func.attr == "run"
+    """The literal arguments of one subprocess.run([...]) or
+    subprocess.Popen([...]) call, or None.
+    """
+    is_attribute = isinstance(call.func, ast.Attribute)
+    is_run = is_attribute and call.func.attr in ("run", "Popen")
     if not is_run or not call.args:
         return None
     argument_list = call.args[0]
@@ -224,3 +227,112 @@ def test_kernel_command_line_parses(tmp_path):
                 "the kernel's train.py command line does not parse: "
                 f"{error_output.getvalue()}"
             ) from parse_failure
+
+
+REPOSITORY = Path(__file__).resolve().parents[1]
+STAGED_DIRECTORY = REPOSITORY / "data" / "staged"
+ANCHOR_FILE = REPOSITORY / "data" / "training_anchors_54_sklearn.npz"
+
+
+def training_run(staged, checkpoint_path, anchors=ANCHOR_FILE, *extra):
+    """A TrainingRun built by train.py's own parser, on CPU, no workers."""
+    command_line = [
+        "train.py",
+        str(staged),
+        str(checkpoint_path),
+        "--epochs",
+        "2",
+        "--batch-size",
+        "4",
+        "--workers",
+        "0",
+        "--anchors",
+        str(anchors),
+        "--checkpoint-every-seconds",
+        "300",
+        "--stop-after-seconds",
+        "600",
+        "--warmup-steps",
+        "3",
+        "--gradient-clip-norm",
+        "250",
+        "--resume",
+        *extra,
+    ]
+    with unittest.mock.patch("sys.argv", command_line):
+        return train.TrainingRun(train.parse_arguments())
+
+
+def staged_copy(directory, first, count):
+    directory.mkdir()
+    for path in sorted(STAGED_DIRECTORY.glob("*.npz"))[first : first + count]:
+        (directory / path.name).write_bytes(path.read_bytes())
+    return directory
+
+
+def test_non_finite_step_changes_no_weight(tmp_path):
+    """Without an enabled gradient scaler, a NaN loss must be skipped, not
+    stepped into every weight.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    run = training_run(staged, tmp_path / "checkpoint.pt")
+    assert not run.scaler.is_enabled()
+    before = [
+        parameter.detach().clone() for parameter in run.predictor.parameters()
+    ]
+    batch = synthetic_batch()
+    total = loss.loss_terms(run.predictor(batch), batch).total * float("nan")
+    clipped, skipped = run.optimise(total, rate=1e-3)
+    assert skipped and not clipped
+    after = list(run.predictor.parameters())
+    assert all(torch.equal(old, new) for old, new in zip(before, after))
+
+
+def test_resume_checks_what_it_resumes(tmp_path):
+    """A resumed run refuses other anchors, recounts for other scenes and
+    restores a checkpoint left only as its fallback.
+    """
+    first = staged_copy(tmp_path / "first", 0, 3)
+    other = staged_copy(tmp_path / "other", 3, 3)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    training_run(first, checkpoint_path).save(1)
+
+    with np.load(ANCHOR_FILE) as stored:
+        doubled = {name: stored[name] for name in stored.files}
+    doubled["unit_anchors"] = doubled["unit_anchors"] * 2.0
+    other_anchors = tmp_path / "other_anchors.npz"
+    np.savez(other_anchors, **doubled)
+    with pytest.raises(ValueError, match="other anchors"):
+        training_run(first, checkpoint_path, other_anchors)
+
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        recounted = training_run(other, checkpoint_path)
+    assert "read from the checkpoint" not in printed.getvalue()
+    expected_steps = train.pipeline.steps_per_epoch(
+        recounted.paths, recounted.batch_settings(0)
+    )
+    assert recounted.plan.steps_per_epoch == expected_steps
+
+    checkpoint_path.replace(checkpoint.previous_path(checkpoint_path))
+    restored = training_run(first, checkpoint_path)
+    assert checkpoint_path.exists() and restored.completed_epochs == 1
+
+
+def test_decay_from_the_first_epoch_starts_after_warm_up(tmp_path):
+    """The cosine fall may not start before warm-up ends, or the rate drops
+    from the peak in one step.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    run = training_run(
+        staged,
+        tmp_path / "checkpoint.pt",
+        ANCHOR_FILE,
+        "--decay-from-epoch",
+        "1",
+    )
+    schedule = run.schedule
+    peak = run.arguments.learning_rate
+    end_of_warm_up = run.arguments.warmup_steps
+    assert schedule.at(end_of_warm_up - 1) == pytest.approx(peak)
+    assert schedule.at(end_of_warm_up) == pytest.approx(peak)

@@ -5,7 +5,10 @@ stamp that ties each file to the code version that wrote it.
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
+import zlib
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -193,13 +196,64 @@ def check_provenance(stamp: Any, path: Path | str, hint: str) -> dict[str, str]:
     """
     if stamp is None:
         raise ValueError(f"{path} has no provenance stamp. {hint}")
-    provenance = json.loads(str(stamp))
-    if provenance["code_version"] != STAGING_CODE_VERSION:
+    try:
+        provenance = json.loads(str(stamp))
+        code_version = provenance["code_version"]
+    except (ValueError, KeyError, TypeError) as error:
+        message = f"{path} has an unreadable provenance stamp ({error}). {hint}"
+        raise ValueError(message) from error
+    if code_version != STAGING_CODE_VERSION:
         raise ValueError(
-            f"{path} is from code version {provenance['code_version']!r},"
+            f"{path} is from code version {code_version!r},"
             f" this tree is {STAGING_CODE_VERSION!r}. {hint}"
         )
     return provenance
+
+
+def read_in_one_call(path: Path | str) -> io.BytesIO:
+    """The whole file from one read call, for np.load to parse in memory.
+    np.load on a path makes a seek and a read per zip member, and each of
+    those calls waits on Kaggle's /kaggle/input mount.
+    """
+    file_bytes = Path(path).read_bytes()
+    return io.BytesIO(file_bytes)
+
+
+# What numpy and zipfile raise on a truncated, empty or corrupt archive, or
+# on a file that is not an .npz archive at all.
+ARCHIVE_ERRORS = (
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+)
+
+
+def read_staged_arrays(path: Path | str, record: Any) -> dict[str, np.ndarray]:
+    """The arrays a staged file holds for each field of a NamedTuple record;
+    fields with a default are optional. A file that is not a readable
+    archive, or lacks a required array, raises an error naming the file, so
+    one bad file among 122,352 can be found.
+    """
+    in_memory = read_in_one_call(path)
+    required = [
+        name for name in record._fields if name not in record._field_defaults
+    ]
+    try:
+        with np.load(in_memory) as staged:
+            stored = set(staged.files)
+            present = [name for name in record._fields if name in stored]
+            arrays = {name: staged[name] for name in present}
+    except ARCHIVE_ERRORS as error:
+        message = f"{path} is not a readable staged file ({error!r})"
+        raise ValueError(message) from error
+    missing = [name for name in required if name not in arrays]
+    if missing:
+        raise ValueError(f"{path} lacks the staged arrays {missing}")
+    return arrays
 
 
 class StagedFile(NamedTuple):
@@ -235,10 +289,7 @@ class StagedFile(NamedTuple):
 
     @classmethod
     def load(cls, path: Path | str) -> StagedFile:
-        with np.load(path) as staged:
-            stored = set(staged.files)
-            named = [name for name in cls._fields if name in stored]
-            arrays = {name: staged[name] for name in named}
+        arrays = read_staged_arrays(path, cls)
         if "provenance" in arrays:
             hint = "Restage the directory with stage.py."
             check_provenance(arrays["provenance"], path, hint)
@@ -250,6 +301,11 @@ class StagedFile(NamedTuple):
                 f" over {row_count} map rows"
             )
         return cls(**arrays)
+
+
+# Confidences come from a float32 softmax, so their sums sit within about
+# 1e-7 of 1; a chosen value.
+CONFIDENCE_SUM_TOLERANCE = 1e-5
 
 
 class Submission(NamedTuple):
@@ -264,6 +320,7 @@ class Submission(NamedTuple):
     provenance: np.ndarray  # () str
 
     def save(self, path: Path) -> None:
+        self.check(path)
         np.savez_compressed(path, **self._asdict())
 
     @classmethod
@@ -272,4 +329,37 @@ class Submission(NamedTuple):
             arrays = {name: stored[name] for name in stored.files}
         hint = "Regenerate the predictions with submit.py."
         check_provenance(arrays.get("provenance"), path, hint)
-        return cls(**arrays)
+        submission = cls(**arrays)
+        submission.check(path)
+        return submission
+
+    def check(self, path: Path | str) -> None:
+        """Raises unless every row is one target's 6 finite futures with
+        confidences that are non-negative and sum to 1, each target once.
+        """
+        target_count = len(self.track_id)
+        expected_shape = (target_count, NUM_PREDICTED_MODES)
+        trajectory_shape = expected_shape + (len(SUBMISSION_FUTURE_INDICES), 2)
+        problems = []
+        if self.scenario_id.shape != (target_count,):
+            problems.append(f"scenario_id shape {self.scenario_id.shape}")
+        if self.world_trajectories.shape != trajectory_shape:
+            problems.append(f"trajectory shape {self.world_trajectories.shape}")
+        if self.confidences.shape != expected_shape:
+            problems.append(f"confidence shape {self.confidences.shape}")
+        if problems:
+            raise ValueError(f"{path}: {', '.join(problems)}")
+        if not np.isfinite(self.world_trajectories).all():
+            problems.append("non-finite trajectories")
+        if not np.isfinite(self.confidences).all():
+            problems.append("non-finite confidences")
+        if (self.confidences < 0).any():
+            problems.append("negative confidences")
+        confidence_sums = self.confidences.sum(axis=1)
+        if not np.allclose(confidence_sums, 1.0, atol=CONFIDENCE_SUM_TOLERANCE):
+            problems.append("confidences that do not sum to 1")
+        targets = set(zip(self.scenario_id.tolist(), self.track_id.tolist()))
+        if len(targets) != target_count:
+            problems.append(f"{target_count - len(targets)} repeated targets")
+        if problems:
+            raise ValueError(f"{path}: {', '.join(problems)}")

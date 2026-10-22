@@ -9,7 +9,11 @@ from __future__ import annotations
 import womd.runtime_env  # noqa: F401
 
 import argparse
+import faulthandler
+import hashlib
 import math
+import signal
+import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -21,7 +25,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from womd import contract, loss, pipeline
 from womd.checkpoint import (
+    ANCHORS_KEY,
     GradScaler,
+    check_model_state,
     load_anchor_file,
     load_checkpoint,
     previous_path,
@@ -37,6 +43,7 @@ from womd.pipeline import BatchSettings
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
 SECONDS_PER_HOUR = 3600
+STACK_DUMP_SECONDS = 1800
 
 Batches = Iterable[TargetInputs]
 
@@ -48,6 +55,7 @@ class EpochPlan(NamedTuple):
     """
 
     scenario_count: int
+    scenario_names_digest: str
     worker_count: int
     batch_size: int
     designated_only: bool
@@ -83,22 +91,6 @@ class Schedule(NamedTuple):
         # The rate is peak * (1 + cos(pi f)) / 2 for fraction f through the
         # fall.
         return self.peak * 0.5 * (1.0 + math.cos(math.pi * fraction))
-
-
-class Reporter:
-    """Writes each table of scalars to TensorBoard and prints it as the log
-    line, so the console and the board never drift.
-    """
-
-    def __init__(self, directory: Path) -> None:
-        self.writer = SummaryWriter(directory)
-
-    def report(self, heading: str, scalars: Scalars, step: int) -> None:
-        for name, value in scalars.items():
-            self.writer.add_scalar(name, value, step)
-        printed = [f"{name} {value:.4g}" for name, value in scalars.items()]
-        print(" | ".join([heading] + printed), flush=True)
-        self.writer.flush()
 
 
 def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
@@ -156,6 +148,7 @@ class TrainingRun:
     """
 
     def __init__(self, arguments: argparse.Namespace) -> None:
+        self.launch_time = time.perf_counter()
         self.arguments = arguments
         self.device = training_device()
         torch.manual_seed(arguments.seed)
@@ -166,6 +159,7 @@ class TrainingRun:
         scaling = arguments.mixed_precision and self.device.type == "cuda"
         self.scaler = GradScaler(enabled=scaling)
         self.completed_epochs, stored_plan = self.resume()
+        self.saved_epochs = self.completed_epochs
 
         self.paths = sorted(arguments.staged_directory.glob("*.npz"))
         if not self.paths:
@@ -175,7 +169,17 @@ class TrainingRun:
         self.plan = self.plan_epochs(stored_plan)
         self.schedule = self.learning_rate_schedule()
         tensorboard = arguments.checkpoint_path.parent / "tensorboard"
-        self.reporter = Reporter(tensorboard)
+        self.writer = SummaryWriter(tensorboard)
+
+    def report(self, heading: str, scalars: Scalars, step: int) -> None:
+        """Writes a table of scalars to TensorBoard and prints it as the log
+        line, so the console and the board never drift.
+        """
+        for name, value in scalars.items():
+            self.writer.add_scalar(name, value, step)
+        printed = [f"{name} {value:.4g}" for name, value in scalars.items()]
+        print(" | ".join([heading] + printed), flush=True)
+        self.writer.flush()
 
     def resume(self) -> tuple[int, EpochPlan | None]:
         """Loads the checkpoint when --resume is set and returns how many epochs
@@ -186,13 +190,27 @@ class TrainingRun:
         if not self.arguments.resume:
             return 0, None
         path = self.arguments.checkpoint_path
-        if not path.exists() and previous_path(path).exists():
-            path = previous_path(path)
-            print(f"checkpoint missing, resuming from {path}", flush=True)
+        fallback = previous_path(path)
+        if not path.exists() and fallback.exists():
+            # A crash between save_checkpoint's two renames leaves only the
+            # fallback, which is moved back so the checkpoint path holds it.
+            fallback.replace(path)
+            print(
+                f"checkpoint missing, restored it from {fallback}", flush=True
+            )
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
-        self.predictor.load_state_dict(checkpoint["model_state"])
+        model_state = checkpoint["model_state"]
+        check_model_state(self.predictor, model_state, path)
+        stored_anchors = model_state[ANCHORS_KEY].to(self.device)
+        given_anchors = self.predictor.state_dict()[ANCHORS_KEY]
+        if not torch.equal(stored_anchors, given_anchors):
+            raise ValueError(
+                f"{path} was trained with other anchors than"
+                f" {self.arguments.anchors}; resume with the anchors it holds"
+            )
+        self.predictor.load_state_dict(model_state)
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
         if "gradient_scaler_state" in checkpoint:
             scaler_state = checkpoint["gradient_scaler_state"]
@@ -217,8 +235,10 @@ class TrainingRun:
         measured in, read from the checkpoint when the settings match.
         """
         settings = self.batch_settings(0)
+        names = "\n".join(path.name for path in self.paths).encode()
         settings_now = EpochPlan(
             scenario_count=len(self.paths),
+            scenario_names_digest=hashlib.sha256(names).hexdigest(),
             worker_count=settings.worker_count,
             batch_size=settings.batch_size,
             designated_only=settings.designated_only,
@@ -245,7 +265,10 @@ class TrainingRun:
         decay_start = None
         decay_end = None
         if arguments.decay_from_epoch is not None:
-            decay_start = (arguments.decay_from_epoch - 1) * steps
+            # The fall starts no earlier than the end of warm-up, so the
+            # rate never drops from the peak in one step.
+            first_decay_step = (arguments.decay_from_epoch - 1) * steps
+            decay_start = max(first_decay_step, arguments.warmup_steps)
             decay_end = arguments.epochs * steps
         peak = arguments.learning_rate
         return Schedule(peak, arguments.warmup_steps, decay_start, decay_end)
@@ -262,6 +285,7 @@ class TrainingRun:
             "epoch_plan": self.plan._asdict(),
         }
         save_checkpoint(self.arguments.checkpoint_path, state)
+        self.saved_epochs = completed_epochs
 
     def optimise(self, total: Tensor, rate: float) -> tuple[bool, bool]:
         """Sets this step's rate, then backward pass, gradient clip and
@@ -276,6 +300,12 @@ class TrainingRun:
         self.scaler.unscale_(self.optimizer)
         parameters = self.predictor.parameters()
         gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
+        # A disabled scaler steps on any gradient, so a non-finite one is
+        # skipped here instead.
+        step_is_finite = torch.isfinite(total) & torch.isfinite(gradient_norm)
+        if not self.scaler.is_enabled() and not step_is_finite:
+            self.optimizer.zero_grad()
+            return False, True
         self.scaler.step(self.optimizer)
         # The scaler lowers its scale only when it skipped a step over
         # non-finite gradients, which is how skips are detected.
@@ -293,8 +323,12 @@ class TrainingRun:
         steps_before = epoch_index * self.plan.steps_per_epoch
         mixed_precision = self.scaler.is_enabled()
         last_checkpoint = time.perf_counter()
+        wait_start = time.perf_counter()
         for host_batch in batches:
-            batch = host_batch.each(lambda array: array.to(self.device))
+            progress.data_wait_seconds += time.perf_counter() - wait_start
+            batch = host_batch.each(
+                lambda array: array.to(self.device, non_blocking=True)
+            )
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
                 rounds = self.predictor.every_round(batch)
                 losses = loss.round_loss_terms(rounds, batch)
@@ -308,13 +342,14 @@ class TrainingRun:
             if progress.batch_count % LOG_EVERY_BATCHES == 0:
                 heading = f"  batch {progress.batch_count}"
                 scalars = progress.log_scalars(rate)
-                self.reporter.report(heading, scalars, global_step + 1)
+                self.report(heading, scalars, global_step + 1)
 
             seconds = time.perf_counter() - last_checkpoint
             if seconds >= self.arguments.checkpoint_every_seconds:
                 if loss_is_finite:
                     self.save(epoch_index)
                 last_checkpoint = time.perf_counter()
+            wait_start = time.perf_counter()
         return progress.epoch_scalars()
 
     def stop_message(self, prefix: str, elapsed: float, completed: int) -> str:
@@ -324,7 +359,7 @@ class TrainingRun:
             f" --stop-after-seconds budget of"
             f" {arguments.stop_after_seconds / SECONDS_PER_HOUR:.2f} h."
             f" {completed} of {arguments.epochs} epochs are complete and"
-            f" {arguments.checkpoint_path} holds them."
+            f" {arguments.checkpoint_path} holds {self.saved_epochs}."
         )
 
     def run(self) -> None:
@@ -334,7 +369,7 @@ class TrainingRun:
         arguments = self.arguments
         remaining = range(self.completed_epochs, arguments.epochs)
         budget = arguments.stop_after_seconds
-        start = time.perf_counter()
+        start = self.launch_time
         last_epoch_seconds = 0.0
         for epoch_index in remaining:
             # Stop before an epoch that would not fit in the time budget,
@@ -342,7 +377,9 @@ class TrainingRun:
             elapsed = time.perf_counter() - start
             if elapsed + last_epoch_seconds > budget:
                 heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
-                print(self.stop_message(heading, elapsed, epoch_index))
+                print(
+                    self.stop_message(heading, elapsed, epoch_index), flush=True
+                )
                 return
 
             epoch_start = time.perf_counter()
@@ -351,7 +388,7 @@ class TrainingRun:
             scalars = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
             heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
-            self.reporter.report(heading, scalars, epoch_index + 1)
+            self.report(heading, scalars, epoch_index + 1)
 
             total = scalars["epoch/loss_total"]
             if math.isfinite(total):
@@ -359,16 +396,22 @@ class TrainingRun:
             else:
                 print(
                     f"epoch {epoch_index + 1} mean total loss {total},"
-                    f" checkpoint left as it was"
+                    f" checkpoint left as it was",
+                    flush=True,
                 )
 
             elapsed = time.perf_counter() - start
             if elapsed >= budget:
                 completed = epoch_index + 1
-                print(self.stop_message("STOPPING EARLY", elapsed, completed))
+                print(
+                    self.stop_message("STOPPING EARLY", elapsed, completed),
+                    flush=True,
+                )
                 return
         print(
-            f"done: {arguments.checkpoint_path} holds {arguments.epochs} epochs"
+            f"done: {arguments.checkpoint_path} holds"
+            f" {self.saved_epochs} epochs",
+            flush=True,
         )
 
 
@@ -387,4 +430,10 @@ class TrainingRun:
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
+    faulthandler.dump_traceback_later(
+        STACK_DUMP_SECONDS, repeat=True, file=sys.stderr
+    )
+    # The Kaggle launcher sends SIGUSR1 before it kills a run that passed
+    # its deadline, so the log shows where the run was.
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr)
     TrainingRun(parse_arguments()).run()

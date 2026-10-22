@@ -6,6 +6,7 @@ It steers runs; reported numbers come only from Waymo's scorer.
 
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
@@ -46,6 +47,7 @@ class EpochProgress:
     def __init__(self, device: torch.device) -> None:
         self.start = time.perf_counter()
         self.batch_count = 0
+        self.finite_batch_count = 0
         self.sample_count = 0
         self.loss_sums = np.zeros(len(LossTerms._fields))
         self.ade_sum = 0.0
@@ -55,6 +57,7 @@ class EpochProgress:
         self.non_finite_count = 0
         self.skipped_count = 0
         self.clipped_count = 0
+        self.data_wait_seconds = 0.0
         self.winner_counts = torch.zeros(
             QUERY_COUNT, dtype=torch.long, device=device
         )
@@ -64,9 +67,11 @@ class EpochProgress:
         returns whether its total loss was finite.
         """
         values = [float(term.detach()) for term in losses]
-        self.loss_sums += values
         self.batch_count += 1
-        loss_is_finite = np.isfinite(values[0])
+        loss_is_finite = bool(np.isfinite(values).all())
+        if loss_is_finite:
+            self.loss_sums += values
+            self.finite_batch_count += 1
         self.non_finite_count += int(not loss_is_finite)
         self.clipped_count += int(clipped)
         self.skipped_count += int(skipped)
@@ -106,9 +111,21 @@ class EpochProgress:
         self.fde_count += final_valid.sum()
 
     def loss_means(self, prefix: str) -> Scalars:
-        means = self.loss_sums / max(self.batch_count, 1)
+        """Mean losses over the finite steps; NaN when no step was finite.
+        A skipped non-finite step changed no weight, so it is left out.
+        """
         names = [prefix + name for name in LossTerms._fields]
+        if self.finite_batch_count == 0:
+            return dict.fromkeys(names, math.nan)
+        means = self.loss_sums / self.finite_batch_count
         return dict(zip(names, means.tolist()))
+
+    def health_scalars(self) -> Scalars:
+        return {
+            "health/non_finite_losses": self.non_finite_count,
+            "health/skipped_steps": self.skipped_count,
+            "health/clipped_steps": self.clipped_count,
+        }
 
     def log_scalars(self, learning_rate: float) -> Scalars:
         """The table printed every LOG_EVERY_BATCHES, after which the
@@ -122,11 +139,10 @@ class EpochProgress:
             "monitor/ade_80step": mean_or_nan(self.ade_sum, self.ade_count),
             "monitor/fde_80step": mean_or_nan(self.fde_sum, self.fde_count),
             "monitor/never_win_anchors": never_win_count,
-            "health/non_finite_losses": self.non_finite_count,
-            "health/skipped_steps": self.skipped_count,
-            "health/clipped_steps": self.clipped_count,
+            **self.health_scalars(),
             "optimisation/learning_rate": learning_rate,
             "throughput/samples_per_second": self.sample_count / elapsed,
+            "time_share/data_wait": self.data_wait_seconds / elapsed,
         }
 
     def epoch_scalars(self) -> Scalars:
@@ -134,5 +150,6 @@ class EpochProgress:
             **self.loss_means("epoch/loss_"),
             "epoch/ade_80step": mean_or_nan(self.ade_sum, self.ade_count),
             "epoch/fde_80step": mean_or_nan(self.fde_sum, self.fde_count),
+            **self.health_scalars(),
             "epoch/seconds": time.perf_counter() - self.start,
         }

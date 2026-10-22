@@ -6,7 +6,7 @@ agent's model inputs from what it reads.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Union
 
 import numpy as np
 from numpy import ndarray
@@ -37,7 +37,18 @@ class StagedScenario(NamedTuple):
     map_dot_polyline_index: ndarray  # (D,) feature each dot belongs to
 
 
-def eligible_tracks(scenario: StagedScenario, designated_only: bool) -> ndarray:
+class TrackArrays(NamedTuple):
+    """The three staged arrays that decide which tracks are predicted."""
+
+    track_rows: ndarray  # (T, 91, 13)
+    track_valid: ndarray  # (T, 91)
+    is_designated_target: ndarray  # (T,)
+
+
+TrackSource = Union[StagedScenario, TrackArrays]
+
+
+def eligible_tracks(scenario: TrackSource, designated_only: bool) -> ndarray:
     """Indices of tracks valid at the current step and of a predicted object
     type, optionally restricted to designated targets.
     """
@@ -105,6 +116,15 @@ def staged_scenario(staged: StagedFile) -> StagedScenario:
 
 def read_scenario(path: Path | str) -> StagedScenario:
     return staged_scenario(StagedFile.load(path))
+
+
+def read_track_arrays(path: Path | str) -> TrackArrays:
+    """Decompresses only the arrays eligible_tracks reads and skips
+    read_scenario's provenance check. The file arrives in one read call, as
+    in StagedFile.load.
+    """
+    arrays = contract.read_staged_arrays(path, TrackArrays)
+    return TrackArrays(**arrays)
 
 
 def designated_tracks(scenario: StagedScenario) -> ndarray:

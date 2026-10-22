@@ -31,7 +31,6 @@ from womd.checkpoint import load_predictor
 from womd.frame_ops import Frame
 from womd.inputs import TargetInputs
 from womd.model import MotionPredictor
-from womd.pruning import SubmittedModes
 
 # A prediction function takes a batch and returns every target's modes,
 # trajectories (B, modes, 80, 2) and confidence logits (B, modes).
@@ -49,12 +48,16 @@ def constant_velocity_modes(batch: TargetInputs) -> Modes:
     return baseline.constant_velocity(batch.agent_history[:, 0])
 
 
-def predict_scene(predict: Predict, batch: TargetInputs) -> SubmittedModes:
+def predict_scene(predict: Predict, batch: TargetInputs, scenario_id: str):
     """One scene's modes at 10 Hz become Waymo's 6 kept modes at 2 Hz, in
-    each target's own frame.
+    each target's own frame. A non-finite mode is refused here, because
+    pruning would turn it into confidences that still sum to 1.
     """
     with torch.no_grad():
         trajectories, logits = predict(batch)
+    finite = torch.isfinite(trajectories).all() & torch.isfinite(logits).all()
+    if not finite:
+        raise ValueError(f"{scenario_id}: the model output is not finite")
     return pruning.submitted_modes(trajectories, logits)
 
 
@@ -75,8 +78,10 @@ def submission(predict: Predict, staged: Path) -> contract.Submission:
     for path in sorted(staged.glob("*.npz")):
         scenario = loader.read_scenario(path)
         tracks = loader.designated_tracks(scenario)
+        if len(tracks) == 0:
+            continue
         batch = pipeline.torch_batch(inputs.scene_inputs(scenario, tracks))
-        kept = predict_scene(predict, batch)
+        kept = predict_scene(predict, batch, scenario.scenario_id)
         kept_paths = kept.trajectories.numpy()
         kept_rows = zip(tracks, kept_paths, kept.confidences.numpy())
         for track_index, paths, scores in kept_rows:
@@ -86,6 +91,8 @@ def submission(predict: Predict, staged: Path) -> contract.Submission:
             track_ids.append(scenario.track_ids[track_index])
             world_trajectories.append(world)
             confidences.append(scores)
+    if not scenario_ids:
+        raise ValueError(f"{staged}: no staged scene has a designated target")
     return contract.Submission(
         scenario_id=np.array(scenario_ids),
         track_id=np.array(track_ids, dtype=np.int64),

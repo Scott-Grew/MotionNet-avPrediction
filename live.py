@@ -194,7 +194,7 @@ class LiveView:
         start = time.perf_counter()
         scene = inputs.scene_inputs(scenario, tracks)
         batch = pipeline.torch_batch(scene)
-        kept = submit.predict_scene(self.predict, batch)
+        kept = submit.predict_scene(self.predict, batch, scenario.scenario_id)
         milliseconds = 1000 * (time.perf_counter() - start)
         self.futures_channel.log(futures_update(scenario, tracks, kept))
         print(

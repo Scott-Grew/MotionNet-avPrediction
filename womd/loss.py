@@ -35,11 +35,21 @@ def mean_over_valid_steps(per_step: Tensor, mask: Tensor) -> Tensor:
     return (per_step * validity).sum(dim=-1) / valid_step_count
 
 
+def observed_future(targets: TargetInputs) -> Tensor:
+    """The logged future with invalid steps replaced by zeros. Masking a NaN
+    or inf step after the NLL would still leave 0 * inf in the gradient.
+    """
+    step_is_valid = targets.future_mask.unsqueeze(-1)
+    future = targets.future_positions
+    zeros = torch.zeros_like(future)
+    return torch.where(step_is_valid, future, zeros)
+
+
 def anchor_assigned_mode(anchors: Tensor, targets: TargetInputs) -> Tensor:
     """Assigns each sample the anchor whose constant-speed straight path is
     closest on average to the logged future.
     """
-    future = targets.future_positions
+    future = observed_future(targets)
     anchor_paths = anchor_lines(anchors.to(future.dtype))
     step_distances = (anchor_paths - future.unsqueeze(1)).norm(dim=-1)
     mean_distance = mean_over_valid_steps(step_distances, targets.future_mask)
@@ -58,15 +68,22 @@ def gaussian_nll(predicted: ModePredictions, target: Tensor) -> Tensor:
     return per_axis.sum(dim=-1)
 
 
-def loss_terms(predicted: ModePredictions, targets: TargetInputs) -> LossTerms:
+def loss_terms(
+    predicted: ModePredictions,
+    targets: TargetInputs,
+    assigned_mode: Tensor | None = None,
+) -> LossTerms:
     """Combines the assigned anchor's Gaussian NLL with cross-entropy over
-    anchors, averaged only over samples with a valid future.
+    anchors, averaged only over samples with a valid future. The assignment
+    is computed here unless the caller already has it.
     """
-    step_nll = gaussian_nll(predicted, targets.future_positions)
+    future = observed_future(targets)
+    step_nll = gaussian_nll(predicted, future)
     mode_nll = mean_over_valid_steps(step_nll, targets.future_mask)
     scoreable = targets.future_mask.any(dim=-1).to(step_nll.dtype)
     scoreable_count = scoreable.sum().clamp_min(1.0)
-    assigned_mode = anchor_assigned_mode(predicted.anchors, targets)
+    if assigned_mode is None:
+        assigned_mode = anchor_assigned_mode(predicted.anchors, targets)
 
     # Only the assigned anchor's per-mode NLL counts toward the
     # regression term.
@@ -81,8 +98,12 @@ def loss_terms(predicted: ModePredictions, targets: TargetInputs) -> LossTerms:
 
 def round_loss_terms(rounds: RoundPredictions, targets: TargetInputs):
     """Every decoder round's loss, averaged over the rounds, so each round
-    must give a usable answer and the total keeps one round's scale.
+    must give a usable answer and the total keeps one round's scale. Every
+    round shares the same anchors, so the assignment is computed once.
     """
-    per_round = [loss_terms(predicted, targets) for predicted in rounds]
+    assigned_mode = anchor_assigned_mode(rounds[-1].anchors, targets)
+    per_round = [
+        loss_terms(predicted, targets, assigned_mode) for predicted in rounds
+    ]
     averaged = [torch.stack(terms).mean() for terms in zip(*per_round)]
     return LossTerms(*averaged)

@@ -144,14 +144,14 @@ def path_end(tracks: ndarray, target: int) -> ndarray:
     return now[contract.AGENT_VELOCITY] * contract.FUTURE_HORIZON_SECONDS
 
 
-def nearest_agents(scenario: StagedScenario, tracks: ndarray, target: int):
+def nearest_agents(scenario: StagedScenario, history: ndarray, target: int):
     """The target, then up to AGENT_SLOTS - 1 other tracks with a valid history
-    step, nearest first to the target's 8 s path. tracks holds every track's
-    rows (T, 91, 13) in the target's frame.
+    step, nearest first to the target's 8 s path. history holds every track's
+    history rows (T, 11, 13) in the target's frame.
     """
     history_valid = scenario.track_valid[:, HISTORY]
-    positions = last_valid_positions(tracks[:, HISTORY], history_valid)
-    distances = segment_distance(positions, path_end(tracks, target))
+    positions = last_valid_positions(history, history_valid)
+    distances = segment_distance(positions, path_end(history, target))
     is_candidate = history_valid.any(axis=1)
     is_candidate[target] = False
     others = np.flatnonzero(is_candidate)
@@ -159,13 +159,16 @@ def nearest_agents(scenario: StagedScenario, tracks: ndarray, target: int):
     return np.concatenate([[target], nearest_first[: AGENT_SLOTS - 1]])
 
 
-def nearest_chunks(chunks: SceneChunks, end: ndarray, frame: Frame) -> ndarray:
+def nearest_chunks(chunks: SceneChunks, scenario, target: int) -> ndarray:
     """Up to CHUNK_SLOTS chunk indices, nearest first by each chunk's nearest
-    dot to the path from the origin to end, in the frame's coordinates.
+    dot to the target's 8 s straight path at its current velocity. Distances
+    do not change with the frame, so they are measured in the scene frame.
     """
+    now = scenario.track_rows[target, contract.CURRENT_STEP_INDEX]
+    start = now[contract.AGENT_POSITION]
+    travel = now[contract.AGENT_VELOCITY] * contract.FUTURE_HORIZON_SECONDS
     scene_positions = chunks.rows[..., contract.MAP_POSITION]
-    positions = frame_ops.positions_to_frame(scene_positions, frame)
-    distances = segment_distance(positions, end)
+    distances = segment_distance(scene_positions - start, travel)
     nearest_dot = np.where(chunks.dot_mask, distances, np.inf).min(axis=1)
     return np.argsort(nearest_dot, kind="stable")[:CHUNK_SLOTS]
 
@@ -175,27 +178,30 @@ def target_inputs(scenario, chunks: SceneChunks, target: int) -> TargetInputs:
     step and padded to AGENT_SLOTS agents and CHUNK_SLOTS chunks.
     """
     frame = agent_frame(scenario.track_rows[target])
-    tracks = rows_to_frame(scenario.track_rows, frame)
-    agents = nearest_agents(scenario, tracks, target)
-    chosen = nearest_chunks(chunks, path_end(tracks, target), frame)
+    history = rows_to_frame(scenario.track_rows[:, HISTORY], frame)
+    own_track = rows_to_frame(scenario.track_rows[target], frame)
+    agents = nearest_agents(scenario, history, target)
+    chosen = nearest_chunks(chunks, scenario, target)
     chunk_rows = map_rows_to_frame(chunks.rows[chosen], frame)
     dot_mask = chunks.dot_mask[chosen]
     chunk_rows[~dot_mask] = 0.0
     agent_mask = scenario.track_valid[agents, HISTORY]
     signals = chunks.signal_history[chosen]
     return TargetInputs(
-        agent_history=padded(tracks[agents, HISTORY], AGENT_SLOTS),
+        agent_history=padded(history[agents], AGENT_SLOTS),
         agent_history_mask=padded(agent_mask, AGENT_SLOTS),
         chunk_rows=padded(chunk_rows, CHUNK_SLOTS),
         chunk_dot_mask=padded(dot_mask, CHUNK_SLOTS),
         chunk_signal_history=padded(signals, CHUNK_SLOTS),
-        future_positions=tracks[target, FUTURE, contract.AGENT_POSITION],
+        future_positions=own_track[FUTURE, contract.AGENT_POSITION],
         future_mask=scenario.track_valid[target, FUTURE],
     )
 
 
 def scene_inputs(scenario: StagedScenario, targets: ndarray) -> TargetInputs:
     """Every given target of one scene, stacked on a leading axis."""
+    if len(targets) == 0:
+        raise ValueError(f"{scenario.scenario_id}: no targets to stack")
     chunks = scene_chunks(scenario)
     per_target = []
     for target in targets:

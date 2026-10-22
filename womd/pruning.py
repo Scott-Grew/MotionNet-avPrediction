@@ -40,7 +40,7 @@ class PruneWalk:
         self.kept_indices = torch.zeros(
             batch_size, slot_count, dtype=torch.long, device=device
         )
-        self.kept_endpoints = torch.zeros_like(endpoints[:, :slot_count])
+        self.kept_endpoints = endpoints.new_zeros(batch_size, slot_count, 2)
         self.kept_slot_filled = torch.zeros_like(
             self.kept_indices, dtype=torch.bool
         )

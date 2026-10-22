@@ -105,124 +105,6 @@ def two_layer_mlp(input_width: int) -> nn.Sequential:
     )
 
 
-class AgentHistoryEncoder(nn.Module):
-    """Encodes one agent's history steps into a single hidden-dim token. The
-    MLP reads the whole window at once, each step's features plus one
-    validity flag per step.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.register_buffer("feature_divisors", agent_feature_divisors())
-        self.network = two_layer_mlp(
-            contract.HISTORY_STEPS * (contract.AGENT_FEATURE_DIM + 1)
-        )
-
-    def forward(self, history: Tensor, mask: Tensor) -> Tensor:
-        """History (..., steps, features) and mask (..., steps) in, one (...,
-        hidden) token out; invalid steps are zeroed.
-        """
-        step_is_valid = mask.unsqueeze(-1).to(history.dtype)
-        masked_history = history / self.feature_divisors * step_is_valid
-        with_validity = torch.cat([masked_history, step_is_valid], dim=-1)
-        return self.network(with_validity.flatten(start_dim=-2))
-
-
-class MapDotEncoder(nn.Module):
-    """Encodes one map dot (one metre of a polyline) into a hidden-dim token.
-    The two crossing codes are category numbers, not quantities, so each is
-    widened to a one-hot before the MLP sees it.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.register_buffer("feature_divisors", map_feature_divisors())
-        self.register_buffer(
-            "crossing_code_rows",
-            torch.eye(contract.NUM_BOUNDARY_CROSSING_CODES),
-        )
-        plain_columns = contract.MAP_LEFT_BOUNDARY_CROSSING
-        one_hot_columns = 2 * contract.NUM_BOUNDARY_CROSSING_CODES
-        self.network = two_layer_mlp(plain_columns + one_hot_columns)
-
-    def forward(self, map_rows: Tensor) -> Tensor:
-        """Map rows (..., 32) in, one (..., hidden) token per dot out."""
-        crossing = contract.MAP_LEFT_BOUNDARY_CROSSING
-        scaled = map_rows / self.feature_divisors
-        plain = scaled[..., :crossing]
-        crossing_codes = map_rows[..., crossing:].long()
-        one_hot = self.crossing_code_rows[crossing_codes].flatten(start_dim=-2)
-        features = torch.cat([plain, one_hot.to(scaled.dtype)], dim=-1)
-        return self.network(features)
-
-
-class MapChunkEncoder(nn.Module):
-    """Encodes each map chunk into one token: its dots relative to the chunk's
-    centre through the dot encoder, max-pooled, then the centre, the mean
-    direction and the chunk's traffic-light history added.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.dot_encoder = MapDotEncoder()
-        self.pose_projection = nn.Linear(4, HIDDEN_DIM)
-        self.signal_projection = nn.Linear(
-            contract.POLYLINE_SIGNAL_DIM, HIDDEN_DIM, bias=False
-        )
-
-    def forward(self, inputs: TargetInputs) -> tuple[Tensor, Tensor]:
-        """Chunk tokens (B, chunks, hidden) and whether each chunk has any dot
-        (B, chunks).
-        """
-        rows = inputs.chunk_rows
-        dot_mask = inputs.chunk_dot_mask
-        is_dot = dot_mask.unsqueeze(-1).to(rows.dtype)
-        dot_count = is_dot.sum(dim=-2).clamp_min(1.0)
-        positions = rows[..., contract.MAP_POSITION]
-        directions = rows[..., contract.MAP_DIRECTION]
-        centre = (positions * is_dot).sum(dim=-2) / dot_count
-        mean_direction = (directions * is_dot).sum(dim=-2) / dot_count
-        local = positions - centre.unsqueeze(-2)
-        local_rows = torch.cat([local, rows[..., 2:]], dim=-1)
-
-        dots = self.dot_encoder(local_rows)
-        dots = dots.masked_fill(~dot_mask.unsqueeze(-1), float("-inf"))
-        pooled = dots.max(dim=-2).values
-        present = dot_mask.any(dim=-1)
-        pooled = pooled.masked_fill(~present.unsqueeze(-1), 0.0)
-        scaled_centre = centre / contract.DISTANCE_NORMALISER_METRES
-        pose = torch.cat([scaled_centre, mean_direction], dim=-1)
-        signals = inputs.chunk_signal_history.flatten(start_dim=-2)
-        tokens = pooled + self.pose_projection(pose)
-        return tokens + self.signal_projection(signals), present
-
-
-class SceneEncoder(nn.Module):
-    """Turns a target's agents and map chunks into tokens and relates them with
-    self-attention. Everything is already in the target's frame.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.agent_encoder = AgentHistoryEncoder()
-        self.map_encoder = MapChunkEncoder()
-        layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
-        self.layers = nn.TransformerEncoder(
-            layer, SCENE_ATTENTION_ROUNDS, enable_nested_tensor=False
-        )
-
-    def forward(self, inputs: TargetInputs) -> Memory:
-        history = inputs.agent_history
-        mask = inputs.agent_history_mask
-        agent_tokens = self.agent_encoder(history, mask)
-        agent_present = mask.any(dim=-1)
-        chunk_tokens, chunk_present = self.map_encoder(inputs)
-        tokens = torch.cat([agent_tokens, chunk_tokens], dim=1)
-        present = torch.cat([agent_present, chunk_present], dim=1)
-        encoded = self.layers(tokens, src_key_padding_mask=~present)
-        return Memory(encoded, present)
-
-
 def predicted_type_index(history: Tensor) -> Tensor:
     """Each agent's predicted type index, from the one-hot object type at the
     current history step.
@@ -257,8 +139,8 @@ def anchor_lines(anchors: Tensor) -> Tensor:
 
 class ModeDecoder(nn.Module):
     """Decodes the 54 anchor-conditioned trajectory modes and their confidences
-    from the memory built by SceneEncoder. Each query is an embedding of its
-    anchor endpoint alone, so mode k always belongs to anchor k. The same
+    from the memory MotionPredictor.encode builds. Each query is an embedding
+    of its anchor endpoint alone, so mode k always belongs to anchor k. The same
     heads read the queries after every round, so training can ask every
     round for a usable answer.
     """
@@ -297,9 +179,12 @@ class ModeDecoder(nn.Module):
             nn.Linear(FEEDFORWARD_DIM, 1, bias=False),
         )
 
-    def decode(self, queries: Tensor, anchors: Tensor) -> ModePredictions:
+    def decode(
+        self, queries: Tensor, anchors: Tensor, lines: Tensor
+    ) -> ModePredictions:
         """Trajectories and log sigmas (batch, modes, steps, 2) in metres and
-        confidence logits (batch, modes) from one round's queries.
+        confidence logits (batch, modes) from one round's queries. lines is
+        anchor_lines(anchors), built once per forward pass.
         """
         queries = self.head_norm(queries)
         # Cast up so the cumulative sum below runs in float32 even under
@@ -309,7 +194,6 @@ class ModeDecoder(nn.Module):
         step_displacements, log_sigma = head_output.unbind(dim=2)
         # A mode is its anchor's straight constant-speed line plus the running
         # sum of the predicted per-step offsets.
-        lines = anchor_lines(anchors)
         trajectories = step_displacements.cumsum(dim=-2) + lines
         log_sigma = log_sigma.clamp(
             MINIMUM_LOG_STANDARD_DEVIATION, MAXIMUM_LOG_STANDARD_DEVIATION
@@ -322,6 +206,7 @@ class ModeDecoder(nn.Module):
     def forward(self, memory: Memory, type_index: Tensor) -> RoundPredictions:
         """Each round's modes, first round first; the last is the answer."""
         anchors = self.unit_anchors[type_index]
+        lines = anchor_lines(anchors)
         scaled_anchors = anchors / contract.DISTANCE_NORMALISER_METRES
         queries = self.anchor_query(scaled_anchors)
         normed_tokens = self.scene_norm(memory.tokens)
@@ -331,26 +216,121 @@ class ModeDecoder(nn.Module):
             queries = decoder_round(
                 queries, normed_tokens, memory_key_padding_mask=padding
             )
-            per_round.append(self.decode(queries, anchors))
+            per_round.append(self.decode(queries, anchors, lines))
         return per_round
 
 
 class MotionPredictor(nn.Module):
+    """The scene encoder and the mode decoder. The encoder's weights live
+    here: an MLP over each agent's 11 history steps, an MLP per map dot that
+    is max-pooled into chunk tokens, and the transformer encoder that relates
+    all the tokens. Everything arrives already in the target's frame.
+    """
+
     def __init__(self, unit_anchors: Tensor) -> None:
         super().__init__()
-        self.scene_encoder = SceneEncoder()
+        self.register_buffer("agent_divisors", agent_feature_divisors())
+        self.register_buffer("map_divisors", map_feature_divisors())
+        crossing_codes = contract.NUM_BOUNDARY_CROSSING_CODES
+        self.register_buffer("crossing_code_rows", torch.eye(crossing_codes))
+        step_width = contract.AGENT_FEATURE_DIM + 1
+        self.agent_network = two_layer_mlp(contract.HISTORY_STEPS * step_width)
+        plain_columns = contract.MAP_LEFT_BOUNDARY_CROSSING
+        self.dot_network = two_layer_mlp(plain_columns + 2 * crossing_codes)
+        self.chunk_pose_projection = nn.Linear(4, HIDDEN_DIM)
+        signal_width = contract.POLYLINE_SIGNAL_DIM
+        self.signal_projection = nn.Linear(signal_width, HIDDEN_DIM, bias=False)
+        layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
+        self.encoder = nn.TransformerEncoder(
+            layer, SCENE_ATTENTION_ROUNDS, enable_nested_tensor=False
+        )
         self.mode_decoder = ModeDecoder(unit_anchors)
 
     @property
     def unit_anchors(self) -> Tensor:
         return self.mode_decoder.unit_anchors
 
-    def every_round(self, inputs: TargetInputs) -> RoundPredictions:
-        """The scene encoder and mode decoder for a batch of targets, with
-        anchors chosen by each target's predicted type; one ModePredictions
-        per decoder round.
+    def agent_tokens(self, inputs: TargetInputs) -> Tensor:
+        """One token per agent slot (B, 48, hidden) from its history steps and
+        one validity flag per step. Invalid steps are replaced by zeros
+        rather than multiplied by zero, so a NaN or inf stored there cannot
+        leak through.
         """
-        memory = self.scene_encoder(inputs)
+        history = inputs.agent_history
+        step_is_valid = inputs.agent_history_mask.unsqueeze(-1)
+        zeros = torch.zeros_like(history)
+        observed = torch.where(step_is_valid, history, zeros)
+        scaled = observed / self.agent_divisors
+        validity = step_is_valid.to(history.dtype)
+        with_validity = torch.cat([scaled, validity], dim=-1)
+        return self.agent_network(with_validity.flatten(start_dim=-2))
+
+    def dot_tokens(self, map_rows: Tensor) -> Tensor:
+        """One token per map dot. The two crossing codes are category numbers,
+        not quantities, so each is widened to a one-hot first.
+        """
+        crossing = contract.MAP_LEFT_BOUNDARY_CROSSING
+        scaled = map_rows / self.map_divisors
+        plain = scaled[..., :crossing]
+        crossing_codes = map_rows[..., crossing:].long()
+        one_hot = self.crossing_code_rows[crossing_codes].flatten(start_dim=-2)
+        features = torch.cat([plain, one_hot.to(scaled.dtype)], dim=-1)
+        return self.dot_network(features)
+
+    def chunk_tokens(self, inputs: TargetInputs) -> tuple[Tensor, Tensor]:
+        """Chunk tokens (B, 256, hidden) and whether each chunk has any dot.
+        A token is its dots relative to the chunk's centre, max-pooled, plus
+        the centre, the mean direction and the chunk's light history. Masked
+        dots and absent chunks are replaced by zeros first, so a NaN stored
+        under a mask cannot reach an index or a token.
+        """
+        dot_mask = inputs.chunk_dot_mask
+        stored_rows = inputs.chunk_rows
+        rows_zeros = torch.zeros_like(stored_rows)
+        rows = torch.where(dot_mask.unsqueeze(-1), stored_rows, rows_zeros)
+        present = dot_mask.any(dim=-1)
+        stored_signals = inputs.chunk_signal_history
+        signal_zeros = torch.zeros_like(stored_signals)
+        chunk_is_present = present[..., None, None]
+        signal_history = torch.where(
+            chunk_is_present, stored_signals, signal_zeros
+        )
+        is_dot = dot_mask.unsqueeze(-1).to(rows.dtype)
+        dot_count = is_dot.sum(dim=-2).clamp_min(1.0)
+        positions = rows[..., contract.MAP_POSITION]
+        directions = rows[..., contract.MAP_DIRECTION]
+        centre = (positions * is_dot).sum(dim=-2) / dot_count
+        mean_direction = (directions * is_dot).sum(dim=-2) / dot_count
+        local = positions - centre.unsqueeze(-2)
+        local_rows = torch.cat([local, rows[..., 2:]], dim=-1)
+
+        dots = self.dot_tokens(local_rows)
+        dots = dots.masked_fill(~dot_mask.unsqueeze(-1), float("-inf"))
+        pooled = dots.max(dim=-2).values
+        pooled = pooled.masked_fill(~present.unsqueeze(-1), 0.0)
+        scaled_centre = centre / contract.DISTANCE_NORMALISER_METRES
+        pose = torch.cat([scaled_centre, mean_direction], dim=-1)
+        signals = signal_history.flatten(start_dim=-2)
+        tokens = pooled + self.chunk_pose_projection(pose)
+        return tokens + self.signal_projection(signals), present
+
+    def encode(self, inputs: TargetInputs) -> Memory:
+        """The agent and chunk tokens after self-attention, and which of them
+        are real.
+        """
+        agent_tokens = self.agent_tokens(inputs)
+        agent_present = inputs.agent_history_mask.any(dim=-1)
+        chunk_tokens, chunk_present = self.chunk_tokens(inputs)
+        tokens = torch.cat([agent_tokens, chunk_tokens], dim=1)
+        present = torch.cat([agent_present, chunk_present], dim=1)
+        encoded = self.encoder(tokens, src_key_padding_mask=~present)
+        return Memory(encoded, present)
+
+    def every_round(self, inputs: TargetInputs) -> RoundPredictions:
+        """One ModePredictions per decoder round, with anchors chosen by each
+        target's predicted type.
+        """
+        memory = self.encode(inputs)
         own_history = inputs.agent_history[:, 0]
         type_index = predicted_type_index(own_history)
         return self.mode_decoder(memory, type_index)

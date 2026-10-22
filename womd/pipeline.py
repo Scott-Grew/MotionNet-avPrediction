@@ -4,8 +4,13 @@ multi-worker DataLoader, which stacks them into batches.
 
 from __future__ import annotations
 
+import itertools
 import math
+import os
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import resource_tracker
 from pathlib import Path
 from typing import NamedTuple
 
@@ -15,6 +20,9 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from womd import inputs, loader
 from womd.inputs import TargetInputs
+
+COUNT_REPORT_EVERY_FILES = 10000
+COUNT_READ_THREADS = 32
 
 
 class BatchSettings(NamedTuple):
@@ -63,21 +71,37 @@ def worker_share(paths: list[Path], index: int, count: int) -> list[Path]:
 
 def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
     """Batches per epoch, the sum over workers of ceil(eligible targets /
-    batch size), because each worker fills its own batches. Counting opens
-    every staged file.
+    batch size), because each worker fills its own batches. Counting reads
+    three arrays from every staged file, on COUNT_READ_THREADS threads so
+    the waits on each file's read overlap.
     """
     worker_count = max(settings.worker_count, 1)
+    designated_only = itertools.repeat(settings.designated_only)
+    start = time.perf_counter()
+    targets_per_file = np.zeros(len(paths), dtype=np.int64)
+    with ThreadPoolExecutor(COUNT_READ_THREADS) as executor:
+        counts = executor.map(eligible_count, paths, designated_only)
+        for file_index, count in enumerate(counts):
+            targets_per_file[file_index] = count
+            files_read = file_index + 1
+            if files_read % COUNT_REPORT_EVERY_FILES == 0:
+                seconds = time.perf_counter() - start
+                print(
+                    f"counted {files_read} of {len(paths)} files"
+                    f" in {seconds:.0f} s",
+                    flush=True,
+                )
     step_count = 0
     for index in range(worker_count):
-        targets = 0
-        for path in worker_share(paths, index, worker_count):
-            scenario = loader.read_scenario(path)
-            eligible = loader.eligible_tracks(
-                scenario, settings.designated_only
-            )
-            targets += len(eligible)
+        targets = int(targets_per_file[index::worker_count].sum())
         step_count += math.ceil(targets / settings.batch_size)
     return step_count
+
+
+def eligible_count(path: Path, designated_only: bool) -> int:
+    tracks = loader.read_track_arrays(path)
+    eligible = loader.eligible_tracks(tracks, designated_only)
+    return len(eligible)
 
 
 def batches(paths: list[Path], settings: BatchSettings) -> DataLoader:
@@ -92,4 +116,18 @@ def batches(paths: list[Path], settings: BatchSettings) -> DataLoader:
         num_workers=settings.worker_count,
         prefetch_factor=prefetch,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=keep_tracker_pipe_private,
     )
+
+
+def keep_tracker_pipe_private(_worker_index: int) -> None:
+    """Stops programs a worker starts from inheriting multiprocessing's
+    resource-tracker pipe. On macOS each worker starts a torch_shm_manager,
+    which would hold the pipe open while the main process holds a socket to
+    it; the tracker then never sees the pipe close and the main process
+    waits on the tracker forever at exit. The private attribute is read so
+    that a worker without a tracker does not start one.
+    """
+    tracker_pipe = resource_tracker._resource_tracker._fd
+    if tracker_pipe is not None:
+        os.set_inheritable(tracker_pipe, False)
