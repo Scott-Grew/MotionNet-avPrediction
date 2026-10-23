@@ -63,9 +63,13 @@ flowchart LR
     RAW[("Waymo<br/>shards")] -->|stage.py| STAGED[("Staged<br/>scenes")]
     STAGED -->|views.py| VIEW["Each target's view,<br/>in its own frame"]
     STAGED -->|fit_anchors.py| ANCHORS[("54 anchors")]
-    VIEW & ANCHORS --> MODEL["model.py<br/>encoder, decoder"]
-    MODEL -->|loss.py| TRAIN["train.py"]
-    MODEL -->|pruning.py| OUT[/"6 futures:<br/>submission, live view, ONNX"/]
+    subgraph MODEL["model.py"]
+        ENCODER["Encoder"] --> DECODER["Decoder"]
+    end
+    VIEW --> ENCODER
+    ANCHORS --> DECODER
+    DECODER -->|loss.py| TRAIN["train.py"]
+    DECODER -->|pruning.py| OUT[/"6 futures:<br/>submission, live view, ONNX"/]
 ```
 
 ## Usage
