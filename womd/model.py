@@ -16,7 +16,7 @@ from womd.views import TargetInputs
 
 # Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
-HIDDEN_DIM = 192
+HIDDEN_DIM = 256
 FEEDFORWARD_DIM = 4 * HIDDEN_DIM
 ATTENTION_HEAD_COUNT = 4
 SCENE_ATTENTION_ROUNDS = 6
@@ -338,11 +338,11 @@ class MotionPredictor(nn.Module):
 
 
 # ------------------------------------------------------------------
-# DATA FLOW for B predicted agents, hidden width 192, all in each
-# agent's own frame (womd/inputs.py)
+# DATA FLOW for B predicted agents, hidden width 256, all in each
+# agent's own frame (womd/views.py)
 #
 #   48 agent histories --MLP over 11 steps-->     48 tokens  \
-#                                                              > (B, 304, 192)
+#                                                              > (B, 304, 256)
 #   256 map chunks --MLP per dot, max-pool,                  /
 #                    + centre, direction, lights--> 256 tokens
 #                          |
