@@ -330,8 +330,8 @@ def test_padded_slots_change_nothing():
         ),
     )
     with torch.no_grad():
-        base = predictor(batch)
-        widened = predictor(padded)
+        base = predictor(batch)[-1]
+        widened = predictor(padded)[-1]
     assert torch.allclose(base.trajectories, widened.trajectories, atol=1e-4)
     assert torch.allclose(
         base.confidence_logits, widened.confidence_logits, atol=1e-5
@@ -675,8 +675,8 @@ def test_input_order_does_not_change_predictions():
         chunk_signal_history=batch.chunk_signal_history[:, chunk_order],
     )
     with torch.no_grad():
-        base = predictor(batch)
-        shuffled = predictor(permuted)
+        base = predictor(batch)[-1]
+        shuffled = predictor(permuted)[-1]
     assert torch.allclose(base.trajectories, shuffled.trajectories, atol=1e-4)
     assert torch.allclose(
         base.confidence_logits, shuffled.confidence_logits, atol=1e-5
@@ -745,8 +745,8 @@ def test_lane_chunks_carry_their_light():
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
     with torch.no_grad():
-        lit = predictor(batch).trajectories
-        unlit = predictor(dark).trajectories
+        lit = predictor(batch)[-1].trajectories
+        unlit = predictor(dark)[-1].trajectories
     assert not torch.allclose(lit, unlit)
 
 
@@ -768,8 +768,10 @@ def test_target_prediction_ignores_batch_company():
     second = views.scene_inputs(three_track_scenario, np.array([0, 1]))
     together = TargetInputs(*map(np.concatenate, zip(first, second)))
     with torch.no_grad():
-        alone_paths = predictor(alone.each(torch.from_numpy)).trajectories
-        together_paths = predictor(together.each(torch.from_numpy)).trajectories
+        alone_paths = predictor(alone.each(torch.from_numpy))[-1].trajectories
+        together_paths = predictor(together.each(torch.from_numpy))[
+            -1
+        ].trajectories
     assert torch.allclose(alone_paths[0], together_paths[2], atol=1e-4)
 
 
@@ -794,7 +796,7 @@ def test_zero_head_output_lands_on_the_anchor():
     )
     batch = synthetic_inputs(size)
     with torch.no_grad():
-        predicted = predictor(batch)
+        predicted = predictor(batch)[-1]
     assert torch.allclose(
         predicted.trajectories[:, :, -1], unit_anchors, atol=1e-4
     )
@@ -950,7 +952,7 @@ def test_every_model_output_moves_the_loss():
     )
     batch = synthetic_inputs(size)
     with torch.no_grad():
-        emitted = predictor(batch)
+        emitted = predictor(batch)[-1]
     perturbations = {
         "trajectories": lambda value: value + 1.0,
         "log_standard_deviation": lambda value: value + 1.0,
@@ -984,7 +986,7 @@ def test_no_step_uncertainty_starts_saturated():
     )
     batch = synthetic_inputs(size)
     with torch.no_grad():
-        predicted = predictor(batch)
+        predicted = predictor(batch)[-1]
     assert predicted.trajectories.isfinite().all()
     assert predicted.confidence_logits.isfinite().all()
     log_sigma = predicted.log_standard_deviation
@@ -1020,7 +1022,7 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
         train.parameter_groups(predictor), lr=train.LEARNING_RATE
     )
     batch = next(iter(pipeline.batches(scenario_paths, TWO_STAGED_SCENARIOS)))
-    predicted = predictor(batch)
+    predicted = predictor(batch)[-1]
     losses = loss.loss_terms(predicted, batch)
     assert torch.stack(list(losses)).isfinite().all()
     losses.total.backward()

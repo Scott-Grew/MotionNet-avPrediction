@@ -326,18 +326,15 @@ class MotionPredictor(nn.Module):
         encoded = self.encoder(tokens, src_key_padding_mask=~present)
         return Memory(encoded, present)
 
-    def every_round(self, inputs: TargetInputs) -> RoundPredictions:
+    def forward(self, inputs: TargetInputs) -> RoundPredictions:
         """One ModePredictions per decoder round, with anchors chosen by each
-        target's predicted type.
+        target's predicted type; the last round is the model's answer.
+        Training reads every round, so this is the one call DDP wraps.
         """
         memory = self.encode(inputs)
         own_history = inputs.agent_history[:, 0]
         type_index = predicted_type_index(own_history)
         return self.mode_decoder(memory, type_index)
-
-    def forward(self, inputs: TargetInputs) -> ModePredictions:
-        """The last round's modes, the model's answer."""
-        return self.every_round(inputs)[-1]
 
 
 # ------------------------------------------------------------------

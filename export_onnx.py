@@ -52,7 +52,7 @@ class InferenceGraph(nn.Module):
         self.predictor = predictor
 
     def forward(self, *tensors: Tensor) -> Outputs:
-        predicted = self.predictor(TargetInputs(*tensors))
+        predicted = self.predictor(TargetInputs(*tensors))[-1]
         trajectories = predicted.trajectories
         logits = predicted.confidence_logits
         submitted = submitted_modes(trajectories, logits)

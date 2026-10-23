@@ -31,7 +31,7 @@ Predict = Callable[[TargetInputs], Modes]
 
 
 def model_modes(predictor: MotionPredictor, batch: TargetInputs) -> Modes:
-    predicted = predictor(batch)
+    predicted = predictor(batch)[-1]
     return predicted.trajectories, predicted.confidence_logits
 
 

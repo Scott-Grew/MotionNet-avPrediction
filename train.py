@@ -1,7 +1,8 @@
 """Step 3 of 5.
 
-Trains the model on staged scenarios on one device; resumable, with a time
-budget so a Kaggle session stops cleanly before it is cut off.
+Trains the model on staged scenarios, on one device or, launched by torchrun,
+one process per GPU; resumable, with a time budget so a Kaggle session stops
+cleanly before it is cut off.
 """
 
 from __future__ import annotations
@@ -9,9 +10,11 @@ from __future__ import annotations
 import womd.runtime_env  # noqa: F401
 
 import argparse
+import contextlib
 import faulthandler
 import hashlib
 import math
+import os
 import signal
 import sys
 import time
@@ -20,7 +23,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor, distributed, nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from womd import layout, loss, pipeline
@@ -55,6 +59,7 @@ class EpochPlan(NamedTuple):
     """
 
     scenario_names_digest: str
+    process_count: int
     worker_count: int
     batch_size: int
     designated_only: bool
@@ -139,11 +144,35 @@ class TrainingRun:
     def __init__(self, arguments: argparse.Namespace) -> None:
         self.launch_time = time.perf_counter()
         self.arguments = arguments
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device_type)
+        # torchrun sets these three; a plain launch is one process.
+        self.process_count = int(os.environ.get("WORLD_SIZE", "1"))
+        self.rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.is_main = self.rank == 0
+        if arguments.batch_size % self.process_count:
+            raise ValueError(
+                f"--batch-size {arguments.batch_size} does not split over"
+                f" {self.process_count} processes"
+            )
+        self.device = torch.device("cpu")
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda", local_rank)
+            torch.cuda.set_device(self.device)
+        if self.process_count > 1:
+            backend = "nccl" if self.device.type == "cuda" else "gloo"
+            distributed.init_process_group(backend)
         torch.manual_seed(arguments.seed)
         anchors = load_anchor_file(arguments.anchors)
         self.predictor = MotionPredictor(anchors).to(self.device)
+        # DDP averages every gradient across the processes; with one
+        # process the model is trained directly.
+        self.trainer = self.predictor
+        if self.process_count > 1:
+            on_gpu = self.device.type == "cuda"
+            device_ids = [local_rank] if on_gpu else None
+            self.trainer = DistributedDataParallel(
+                self.predictor, device_ids=device_ids
+            )
         groups = parameter_groups(self.predictor)
         self.optimizer = torch.optim.AdamW(groups, lr=arguments.learning_rate)
         scaling = arguments.mixed_precision and self.device.type == "cuda"
@@ -151,20 +180,42 @@ class TrainingRun:
         self.completed_epochs, stored_plan = self.resume()
         self.saved_epochs = self.completed_epochs
 
-        self.paths = sorted(arguments.staged_directory.glob("*.npz"))
-        if not self.paths:
+        self.all_paths = sorted(arguments.staged_directory.glob("*.npz"))
+        if not self.all_paths:
             raise FileNotFoundError(
                 f"no .npz scenarios in {arguments.staged_directory}"
             )
+        self.paths = self.all_paths[self.rank :: self.process_count]
         self.plan = self.plan_epochs(stored_plan)
         self.schedule = self.learning_rate_schedule()
         tensorboard = arguments.checkpoint_path.parent / "tensorboard"
-        self.writer = SummaryWriter(tensorboard)
+        self.writer = SummaryWriter(tensorboard) if self.is_main else None
+
+    def main_decides(self, decision: bool) -> bool:
+        """The main process's decision, sent to every process, so all of them
+        stop or go together.
+        """
+        if self.process_count == 1:
+            return decision
+        shared = torch.tensor(int(decision), device=self.device)
+        distributed.broadcast(shared, src=0)
+        return bool(shared.item())
+
+    def smallest(self, value: int) -> int:
+        """The smallest value across the processes."""
+        if self.process_count == 1:
+            return value
+        shared = torch.tensor(value, device=self.device)
+        distributed.all_reduce(shared, op=distributed.ReduceOp.MIN)
+        return int(shared.item())
 
     def report(self, heading: str, scalars: Scalars, step: int) -> None:
         """Writes a table of scalars to TensorBoard and prints it as the log
-        line, so the console and the board never drift.
+        line, so the console and the board never drift. Only the main
+        process reports.
         """
+        if not self.is_main:
+            return
         for name, value in scalars.items():
             self.writer.add_scalar(name, value, step)
         printed = [f"{name} {value:.4g}" for name, value in scalars.items()]
@@ -181,11 +232,14 @@ class TrainingRun:
             return 0, None
         path = self.arguments.checkpoint_path
         fallback = previous_path(path)
-        if not path.exists() and fallback.exists():
+        missing = not path.exists() and fallback.exists()
+        if self.is_main and missing:
             # A crash between save_checkpoint's two renames leaves only the
             # fallback, which is moved back so the checkpoint path holds it.
             fallback.replace(path)
             print(f"checkpoint missing, restored it from {fallback}")
+        if self.process_count > 1:
+            distributed.barrier()
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
@@ -209,7 +263,7 @@ class TrainingRun:
     def batch_settings(self, epoch_index: int) -> BatchSettings:
         arguments = self.arguments
         return BatchSettings(
-            batch_size=arguments.batch_size,
+            batch_size=arguments.batch_size // self.process_count,
             worker_count=arguments.workers,
             prefetch_batches=arguments.prefetch,
             seed=arguments.seed + epoch_index,
@@ -221,9 +275,10 @@ class TrainingRun:
         measured in, read from the checkpoint when the settings match.
         """
         settings = self.batch_settings(0)
-        names = "\n".join(path.name for path in self.paths).encode()
+        names = "\n".join(path.name for path in self.all_paths).encode()
         settings_now = (
             hashlib.sha256(names).hexdigest(),
+            self.process_count,
             settings.worker_count,
             settings.batch_size,
             settings.designated_only,
@@ -231,7 +286,10 @@ class TrainingRun:
         if stored is not None and stored[:-1] == settings_now:
             print("optimiser step count read from the checkpoint")
             return stored
-        count = pipeline.steps_per_epoch(self.paths, settings)
+        # Each process counts its own share of the files; every process
+        # then stops at the smallest count, so none waits on another.
+        own_count = pipeline.steps_per_epoch(self.paths, settings)
+        count = self.smallest(own_count)
         epochs = self.arguments.epochs
         print(
             f"{count} optimiser steps per epoch,"
@@ -254,6 +312,8 @@ class TrainingRun:
         return Schedule(peak, arguments.warmup_steps, decay_start, decay_end)
 
     def save(self, completed_epochs: int) -> None:
+        if not self.is_main:
+            return
         model_state = self.predictor.state_dict()
         state = {
             "model_state": model_state,
@@ -281,7 +341,7 @@ class TrainingRun:
         gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, clip)
         # A disabled scaler steps on any gradient, so a non-finite one is
         # skipped here instead.
-        step_is_finite = torch.isfinite(total) & torch.isfinite(gradient_norm)
+        step_is_finite = bool(torch.isfinite(gradient_norm))
         if not self.scaler.is_enabled() and not step_is_finite:
             self.optimizer.zero_grad()
             return False, True
@@ -309,7 +369,7 @@ class TrainingRun:
                 lambda array: array.to(self.device, non_blocking=True)
             )
             with torch.amp.autocast(self.device.type, enabled=mixed_precision):
-                rounds = self.predictor.every_round(batch)
+                rounds = self.trainer(batch)
                 losses = loss.round_loss_terms(rounds, batch)
             predicted = rounds[-1]
             global_step = steps_before + progress.batch_count
@@ -328,6 +388,10 @@ class TrainingRun:
                 if loss_is_finite:
                     self.save(epoch_index)
                 last_checkpoint = time.perf_counter()
+            # Every process stops at the same step count, so no process
+            # waits for a gradient the others will never send.
+            if progress.batch_count == self.plan.steps_per_epoch:
+                break
             wait_start = time.perf_counter()
         return progress.epoch_scalars()
 
@@ -354,7 +418,7 @@ class TrainingRun:
             # Stop before an epoch that would not fit in the time budget,
             # since Kaggle ends a session without warning.
             elapsed = time.perf_counter() - start
-            if elapsed + last_epoch_seconds > budget:
+            if self.main_decides(elapsed + last_epoch_seconds > budget):
                 heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
                 print(self.stop_message(heading, elapsed, epoch_index))
                 return
@@ -377,7 +441,7 @@ class TrainingRun:
                 )
 
             elapsed = time.perf_counter() - start
-            if elapsed >= budget:
+            if self.main_decides(elapsed >= budget):
                 completed = epoch_index + 1
                 print(self.stop_message("STOPPING EARLY", elapsed, completed))
                 return
@@ -410,4 +474,12 @@ if __name__ == "__main__":
     faulthandler.register(signal.SIGUSR1, file=sys.stderr)
     # Kaggle pipes stdout to its log, so each line is flushed as printed.
     sys.stdout.reconfigure(line_buffering=True)
-    TrainingRun(parse_arguments()).run()
+    # Only the main process prints; the others would repeat every line,
+    # and print() writes nothing while sys.stdout is None.
+    printing = contextlib.nullcontext()
+    if os.environ.get("RANK", "0") != "0":
+        printing = contextlib.redirect_stdout(None)
+    with printing:
+        TrainingRun(parse_arguments()).run()
+    if distributed.is_initialized():
+        distributed.destroy_process_group()

@@ -105,7 +105,7 @@ def test_one_training_step_runs_end_to_end():
         train.parameter_groups(predictor), lr=train.LEARNING_RATE
     )
     batch = synthetic_batch()
-    total = loss.loss_terms(predictor(batch), batch).total
+    total = loss.loss_terms(predictor(batch)[-1], batch).total
     optimizer.zero_grad()
     total.backward()
     optimizer.step()
@@ -279,7 +279,9 @@ def test_non_finite_step_changes_no_weight(tmp_path):
         parameter.detach().clone() for parameter in run.predictor.parameters()
     ]
     batch = synthetic_batch()
-    total = loss.loss_terms(run.predictor(batch), batch).total * float("nan")
+    total = loss.loss_terms(run.predictor(batch)[-1], batch).total * float(
+        "nan"
+    )
     clipped, skipped = run.optimise(total, rate=1e-3)
     assert skipped and not clipped
     after = list(run.predictor.parameters())
