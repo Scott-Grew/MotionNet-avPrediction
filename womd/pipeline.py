@@ -22,7 +22,7 @@ from womd import formats, views
 from womd.views import TargetInputs
 
 COUNT_REPORT_EVERY_FILES = 10000
-COUNT_READ_THREADS = 32
+COUNT_READ_THREADS = 128
 
 
 class BatchSettings(NamedTuple):
