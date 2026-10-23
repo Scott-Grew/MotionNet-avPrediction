@@ -22,9 +22,9 @@ from numpy import ndarray
 
 import submit
 from submit import Predict
-from womd import contract, frame_ops, inputs, loader, pipeline
+from womd import frames, layout, views
 from womd.checkpoint import load_predictor
-from womd.loader import StagedScenario
+from womd.formats import StagedFile
 from womd.pruning import SubmittedModes as Kept
 
 PORT = 8765
@@ -41,11 +41,11 @@ FUTURE_LINE_WIDTH = 0.3
 FUTURE_OPACITY_FLOOR = 0.2
 
 
-def color(red: float, green: float, blue: float) -> messages.Color:
-    return messages.Color(r=red, g=green, b=blue, a=1.0)
+def color(red: float, green: float, blue: float, alpha: float = 1.0):
+    return messages.Color(r=red, g=green, b=blue, a=alpha)
 
 
-# One map colour per entry of contract.MAP_POLYLINE_KINDS, in its order.
+# One map colour per entry of layout.MAP_POLYLINE_KINDS, in its order.
 MAP_KIND_COLORS = (
     color(0.35, 0.35, 0.35),
     color(0.85, 0.85, 0.85),
@@ -64,7 +64,8 @@ AGENT_TYPE_COLORS = (
     color(0.6, 0.6, 0.6),
 )
 SELF_DRIVING_CAR_COLOR = color(0.9, 0.9, 0.9)
-TARGET_COLOR = color(1.0, 0.5, 0.1)
+TARGET_RGB = (1.0, 0.5, 0.1)
+TARGET_COLOR = color(*TARGET_RGB)
 
 
 def flat_pose(position: ndarray, heading: float, height: float):
@@ -103,13 +104,13 @@ def scene_update(name: str, **primitives: list) -> messages.SceneUpdate:
     return messages.SceneUpdate(entities=[entity])
 
 
-def map_update(scenario: StagedScenario) -> messages.SceneUpdate:
+def map_update(scenario: StagedFile) -> messages.SceneUpdate:
     """Every map feature as one line through its dots, coloured by kind."""
     split_at = np.cumsum(scenario.feature_lengths)[:-1]
     lines = []
     for feature_rows in np.split(scenario.map_rows, split_at):
-        kind = feature_rows[0, contract.MAP_KIND].argmax()
-        positions = feature_rows[:, contract.MAP_POSITION]
+        kind = feature_rows[0, layout.MAP_KIND].argmax()
+        positions = feature_rows[:, layout.MAP_POSITION]
         kind_color = MAP_KIND_COLORS[kind]
         lines.append(line_strip(positions, MAP_LINE_WIDTH, kind_color))
     return scene_update("map", lines=lines)
@@ -118,24 +119,24 @@ def map_update(scenario: StagedScenario) -> messages.SceneUpdate:
 def agent_color(rows: ndarray, is_target: bool) -> messages.Color:
     if is_target:
         return TARGET_COLOR
-    if rows[contract.AGENT_IS_SDC] == 1.0:
+    if rows[layout.AGENT_IS_SDC] == 1.0:
         return SELF_DRIVING_CAR_COLOR
-    return AGENT_TYPE_COLORS[rows[contract.AGENT_TYPE].argmax()]
+    return AGENT_TYPE_COLORS[rows[layout.AGENT_TYPE].argmax()]
 
 
-def agents_update(scenario: StagedScenario, tracks: ndarray, step: int):
+def agents_update(scenario: StagedFile, tracks: ndarray, step: int):
     """A box for every track valid at the step, the predicted tracks in
     orange.
     """
     cubes = []
     for track_index in np.flatnonzero(scenario.track_valid[:, step]):
         rows = scenario.track_rows[track_index, step]
-        sine = rows[contract.AGENT_HEADING_SINE]
-        cosine = rows[contract.AGENT_HEADING_COSINE]
+        sine = rows[layout.AGENT_HEADING_SINE]
+        cosine = rows[layout.AGENT_HEADING_COSINE]
         heading = np.arctan2(sine, cosine)
-        center = rows[contract.AGENT_POSITION]
+        center = rows[layout.AGENT_POSITION]
         pose = flat_pose(center, heading, 0.5 * BOX_HEIGHT)
-        length, width = rows[contract.AGENT_DIMENSIONS]
+        length, width = rows[layout.AGENT_DIMENSIONS]
         size = messages.Vector3(x=length, y=width, z=BOX_HEIGHT)
         box_color = agent_color(rows, track_index in tracks)
         box = messages.CubePrimitive(pose=pose, size=size, color=box_color)
@@ -143,7 +144,7 @@ def agents_update(scenario: StagedScenario, tracks: ndarray, step: int):
     return scene_update("agents", cubes=cubes)
 
 
-def futures_update(scenario: StagedScenario, tracks: ndarray, kept: Kept):
+def futures_update(scenario: StagedFile, tracks: ndarray, kept: Kept):
     """Each predicted track's 6 futures in the scene frame, starting at its
     current position, more opaque the more confident.
     """
@@ -151,14 +152,14 @@ def futures_update(scenario: StagedScenario, tracks: ndarray, kept: Kept):
     lines = []
     kept_rows = zip(tracks, kept.trajectories.numpy(), kept.confidences)
     for track_index, paths, confidences in kept_rows:
-        frame = loader.agent_frame(scenario.track_rows[track_index])
-        scene_paths = frame_ops.positions_from_frame(paths, frame)
+        frame = frames.agent_frame(scenario.track_rows[track_index])
+        scene_paths = frames.positions_from_frame(paths, frame)
         relative_confidences = confidences / confidences.max()
         for path, confidence in zip(scene_paths, relative_confidences):
             start = frame.origin[None]
             positions = np.concatenate([start, path])
             opacity = floor + (1.0 - floor) * float(confidence)
-            line_color = messages.Color(r=1.0, g=0.5, b=0.1, a=opacity)
+            line_color = color(*TARGET_RGB, alpha=opacity)
             line = line_strip(positions, FUTURE_LINE_WIDTH, line_color)
             lines.append(line)
     return scene_update("futures", lines=lines)
@@ -190,11 +191,9 @@ class LiveView:
         while not self.map_channel.has_sinks():
             time.sleep(WAIT_SECONDS)
 
-    def predict_now(self, scenario: StagedScenario, tracks: ndarray) -> None:
+    def predict_now(self, scenario: StagedFile, tracks: ndarray) -> None:
         start = time.perf_counter()
-        scene = inputs.scene_inputs(scenario, tracks)
-        batch = pipeline.torch_batch(scene)
-        kept = submit.predict_scene(self.predict, batch, scenario.scenario_id)
+        kept = submit.predict_scene(self.predict, scenario, tracks)
         milliseconds = 1000 * (time.perf_counter() - start)
         self.futures_channel.log(futures_update(scenario, tracks, kept))
         print(
@@ -202,21 +201,21 @@ class LiveView:
             f" {milliseconds:.0f} ms"
         )
 
-    def play(self, scenario: StagedScenario) -> None:
+    def play(self, scenario: StagedFile) -> None:
         """Sends the scene's steps, each due 0.1 s after the last; a step
         that falls behind is sent at once. The model runs at the current
         step on the designated targets.
         """
-        tracks = loader.designated_tracks(scenario)
+        tracks = views.designated_tracks(scenario)
         self.futures_channel.log(deletion_update())
         self.map_channel.log(map_update(scenario))
         start = time.monotonic()
         step_count = scenario.track_valid.shape[1]
         for step in range(step_count):
-            due = start + step * contract.TIMESTEP_SECONDS
+            due = start + step * layout.TIMESTEP_SECONDS
             time.sleep(max(0.0, due - time.monotonic()))
             self.agents_channel.log(agents_update(scenario, tracks, step))
-            if step == contract.CURRENT_STEP_INDEX:
+            if step == layout.CURRENT_STEP_INDEX:
                 self.predict_now(scenario, tracks)
 
 
@@ -233,7 +232,7 @@ def main() -> None:
     view = LiveView(predict)
     view.wait_for_viewer()
     for path in sorted(arguments.staged_directory.glob("*.npz")):
-        view.play(loader.read_scenario(path))
+        view.play(StagedFile.load(path))
     view.server.stop()
 
 

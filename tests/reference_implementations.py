@@ -4,7 +4,7 @@ the tests to compare against.
 
 import torch
 
-from womd import contract
+from womd import layout
 from womd.model import QUERY_COUNT
 from womd.pruning import PRUNE_DISTANCE_METRES
 
@@ -36,7 +36,7 @@ def unit_anchor_offsets_per_type():
     """Repeats the same 54 unit anchors once per object type, giving each type
     the same starting anchor set.
     """
-    return unit_anchor_offsets().repeat(contract.NUM_OBJECT_TYPES, 1, 1)
+    return unit_anchor_offsets().repeat(layout.NUM_OBJECT_TYPES, 1, 1)
 
 
 def prune_modes_single_sample(trajectories, confidence_logits):
@@ -60,12 +60,12 @@ def prune_modes_single_sample(trajectories, confidence_logits):
             dropped_indices.append(mode_index)
             continue
         kept_indices.append(mode_index)
-        if len(kept_indices) == contract.NUM_PREDICTED_MODES:
+        if len(kept_indices) == layout.NUM_PREDICTED_MODES:
             break
     # If suppression kept too few modes, pad back up to
     # NUM_PREDICTED_MODES with the highest-confidence dropped ones.
     kept_indices.extend(
-        dropped_indices[: contract.NUM_PREDICTED_MODES - len(kept_indices)]
+        dropped_indices[: layout.NUM_PREDICTED_MODES - len(kept_indices)]
     )
     kept = torch.tensor(kept_indices, device=trajectories.device)
     return trajectories[kept], confidence_logits[kept]

@@ -9,7 +9,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from womd import contract
+from womd import layout
 
 # Two kept futures may not end closer together than this; a chosen
 # value.
@@ -34,7 +34,7 @@ class PruneWalk:
 
     def __init__(self, endpoints: Tensor) -> None:
         batch_size = endpoints.shape[0]
-        slot_count = contract.NUM_PREDICTED_MODES
+        slot_count = layout.NUM_PREDICTED_MODES
         device = endpoints.device
         self.slot_positions = torch.arange(slot_count, device=device)
         self.kept_indices = torch.zeros(
@@ -143,6 +143,6 @@ def submitted_modes(trajectories: Tensor, logits: Tensor) -> SubmittedModes:
     pruned = prune_modes(trajectories, logits)
     kept = pruned.trajectories
     confidences = kept_confidences(trajectories, logits, kept)
-    indices = contract.SUBMISSION_FUTURE_INDICES
+    indices = layout.SUBMISSION_FUTURE_INDICES
     steps = torch.tensor(indices, device=trajectories.device)
     return SubmittedModes(kept.index_select(2, steps), confidences)

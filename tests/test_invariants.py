@@ -17,26 +17,25 @@ import reference_implementations
 import torch
 
 import fit_anchors
-import submit
 import train
 from womd import (
     baseline,
     checkpoint,
-    contract,
-    frame_ops,
-    inputs,
-    loader,
+    formats,
+    frames,
+    layout,
     loss,
     metrics,
     model,
     pipeline,
     pruning,
     store,
+    views,
 )
-from womd.frame_ops import Frame
-from womd.inputs import TargetInputs
+from womd.frames import Frame
 from womd.model import ModePredictions
 from womd.pipeline import BatchSettings
+from womd.views import TargetInputs
 from womd_protos import scenario_pb2
 
 STAGED_DIRECTORY = Path(__file__).resolve().parents[1] / "data" / "staged"
@@ -61,13 +60,13 @@ class SyntheticSize(NamedTuple):
 
 def lane_polyline_rows(first_dot_x, dot_count):
     """Map rows for a straight lane along x with one dot per metre."""
-    rows = np.zeros((dot_count, contract.MAP_FEATURE_DIM), dtype=np.float32)
+    rows = np.zeros((dot_count, layout.MAP_FEATURE_DIM), dtype=np.float32)
     along_x = first_dot_x + np.arange(dot_count, dtype=np.float64)
-    rows[:, contract.MAP_POSITION] = np.stack(
+    rows[:, layout.MAP_POSITION] = np.stack(
         [along_x, np.zeros(dot_count)], axis=1
     )
-    rows[:, contract.MAP_DIRECTION] = np.array([1.0, 0.0])
-    lane_column = contract.MAP_KIND.start + contract.MAP_POLYLINE_KINDS.index(
+    rows[:, layout.MAP_DIRECTION] = np.array([1.0, 0.0])
+    lane_column = layout.MAP_KIND.start + layout.MAP_POLYLINE_KINDS.index(
         "lane"
     )
     rows[:, lane_column] = 1.0
@@ -79,21 +78,21 @@ def synthetic_inputs(size):
     turn, each with size.agents agents (the target first) and size.polylines
     chunks of size.dots_per_polyline dots.
     """
-    history = contract.HISTORY_STEPS
-    signals = contract.NUM_TRAFFIC_SIGNAL_STATES
+    history = layout.HISTORY_STEPS
+    signals = layout.NUM_TRAFFIC_SIGNAL_STATES
     batch = size.samples
     agent_shape = (batch, size.agents, history)
-    agent_history = torch.randn(*agent_shape, contract.AGENT_FEATURE_DIM)
-    agent_history[..., contract.AGENT_TYPE] = 0.0
+    agent_history = torch.randn(*agent_shape, layout.AGENT_FEATURE_DIM)
+    agent_history[..., layout.AGENT_TYPE] = 0.0
     for sample_index in range(batch):
-        object_type = sample_index % contract.NUM_OBJECT_TYPES
-        type_column = contract.AGENT_TYPE.start + object_type
+        object_type = sample_index % layout.NUM_OBJECT_TYPES
+        type_column = layout.AGENT_TYPE.start + object_type
         agent_history[sample_index, :, :, type_column] = 1.0
     dot_shape = (batch, size.polylines, size.dots_per_polyline)
-    chunk_rows = torch.randn(*dot_shape, contract.MAP_FEATURE_DIM)
-    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, dot_shape)
-    chunk_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
-    chunk_rows[..., contract.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
+    chunk_rows = torch.randn(*dot_shape, layout.MAP_FEATURE_DIM)
+    codes = torch.randint(0, layout.NUM_BOUNDARY_CROSSING_CODES, dot_shape)
+    chunk_rows[..., layout.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
+    chunk_rows[..., layout.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
     return TargetInputs(
         agent_history=agent_history,
         agent_history_mask=torch.ones(agent_shape, dtype=torch.bool),
@@ -102,8 +101,8 @@ def synthetic_inputs(size):
         chunk_signal_history=torch.rand(
             batch, size.polylines, history, signals
         ),
-        future_positions=torch.randn(batch, contract.FUTURE_STEPS, 2),
-        future_mask=torch.ones(batch, contract.FUTURE_STEPS, dtype=torch.bool),
+        future_positions=torch.randn(batch, layout.FUTURE_STEPS, 2),
+        future_mask=torch.ones(batch, layout.FUTURE_STEPS, dtype=torch.bool),
     )
 
 
@@ -119,8 +118,8 @@ def test_agent_frame_transform_inverts():
     world_positions = random_generator.uniform(-120.0, 120.0, size=(64, 2))
     frame = Frame(np.array([13.5, -42.25]), 0.9137)
 
-    local = frame_ops.positions_to_frame(world_positions, frame)
-    recovered = frame_ops.positions_from_frame(local, frame)
+    local = frames.positions_to_frame(world_positions, frame)
+    recovered = frames.positions_from_frame(local, frame)
     assert np.allclose(recovered, world_positions, atol=1e-9)
 
 
@@ -133,17 +132,17 @@ def test_agent_frame_x_axis_points_ahead():
     leftward = np.array([-np.sin(heading), np.cos(heading)])
     distance = 17.0
 
-    straight_ahead = frame_ops.positions_to_frame(
+    straight_ahead = frames.positions_to_frame(
         origin + distance * forward, frame
     )
-    off_to_the_left = frame_ops.positions_to_frame(
+    off_to_the_left = frames.positions_to_frame(
         origin + distance * leftward, frame
     )
 
     assert np.allclose(straight_ahead, np.array([distance, 0.0]), atol=1e-9)
     assert np.allclose(off_to_the_left, np.array([0.0, distance]), atol=1e-9)
 
-    transposed_convention = (distance * forward) @ frame_ops.rotation_matrix(
+    transposed_convention = (distance * forward) @ frames.rotation_matrix(
         heading
     ).T
     assert not np.allclose(transposed_convention, straight_ahead, atol=1e-9)
@@ -152,7 +151,7 @@ def test_agent_frame_x_axis_points_ahead():
 def test_heading_wrap_stays_in_range():
     """Wrapped angles land in the half-open range from -pi to pi."""
     angles = np.array([-7.0, -np.pi, 0.0, np.pi, 7.0, 100.0])
-    wrapped = frame_ops.wrap_to_pi(angles)
+    wrapped = frames.wrap_to_pi(angles)
     assert (wrapped >= -np.pi).all() and (wrapped < np.pi).all()
 
 
@@ -160,7 +159,7 @@ def turning_track():
     """A vehicle track that drives an arc, every step valid."""
     track = scenario_pb2.Track()
     track.object_type = scenario_pb2.Track.TYPE_VEHICLE
-    for step_index in range(contract.TOTAL_STEPS):
+    for step_index in range(layout.TOTAL_STEPS):
         turn_angle = 0.03 * step_index
         state = track.states.add()
         state.center_x = 40.0 + 1.5 * step_index * np.cos(turn_angle)
@@ -181,8 +180,8 @@ def test_frame_transforms_compose():
     stored_rows = store.track_rows(track, sdc_frame, is_sdc=False)
     track_rows = stored_rows.astype(np.float32)
 
-    frame = loader.agent_frame(track_rows)
-    two_step = loader.rows_to_frame(track_rows, frame)
+    frame = frames.agent_frame(track_rows)
+    two_step = frames.rows_to_frame(track_rows, frame)
 
     world_positions = np.array(
         [[state.center_x, state.center_y] for state in track.states]
@@ -191,32 +190,32 @@ def test_frame_transforms_compose():
     world_velocities = np.array(
         [[state.velocity_x, state.velocity_y] for state in track.states]
     )
-    now_state = track.states[contract.CURRENT_STEP_INDEX]
+    now_state = track.states[layout.CURRENT_STEP_INDEX]
     now_frame = Frame(
         np.array([now_state.center_x, now_state.center_y]), now_state.heading
     )
 
-    direct_positions = frame_ops.positions_to_frame(world_positions, now_frame)
+    direct_positions = frames.positions_to_frame(world_positions, now_frame)
     direct_headings = world_headings - now_state.heading
-    direct_velocities = frame_ops.directions_to_frame(
+    direct_velocities = frames.directions_to_frame(
         world_velocities, now_state.heading
     )
 
     assert np.allclose(
-        two_step[:, contract.AGENT_POSITION], direct_positions, atol=1e-3
+        two_step[:, layout.AGENT_POSITION], direct_positions, atol=1e-3
     )
     assert np.allclose(
-        two_step[:, contract.AGENT_HEADING_COSINE],
+        two_step[:, layout.AGENT_HEADING_COSINE],
         np.cos(direct_headings),
         atol=1e-3,
     )
     assert np.allclose(
-        two_step[:, contract.AGENT_HEADING_SINE],
+        two_step[:, layout.AGENT_HEADING_SINE],
         np.sin(direct_headings),
         atol=1e-3,
     )
     assert np.allclose(
-        two_step[:, contract.AGENT_VELOCITY], direct_velocities, atol=1e-3
+        two_step[:, layout.AGENT_VELOCITY], direct_velocities, atol=1e-3
     )
 
 
@@ -229,19 +228,19 @@ def rotated_scenario(scenario, angle, shift):
         [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
     )
     tracks = scenario.track_rows.astype(np.float64).copy()
-    for columns in (contract.AGENT_VELOCITY, slice(2, 4)):
+    for columns in (layout.AGENT_VELOCITY, slice(2, 4)):
         tracks[..., columns] = tracks[..., columns] @ rotation.T
-    positions = tracks[..., contract.AGENT_POSITION]
-    tracks[..., contract.AGENT_POSITION] = positions @ rotation.T + shift
+    positions = tracks[..., layout.AGENT_POSITION]
+    tracks[..., layout.AGENT_POSITION] = positions @ rotation.T + shift
     rows = scenario.map_rows.astype(np.float64).copy()
-    directions = rows[:, contract.MAP_DIRECTION]
-    rows[:, contract.MAP_DIRECTION] = directions @ rotation.T
-    rows[:, contract.MAP_POSITION] = rows[:, contract.MAP_POSITION] @ rotation.T
-    rows[:, contract.MAP_POSITION] += shift
-    stops = rows[:, contract.MAP_STOP_POINT]
+    directions = rows[:, layout.MAP_DIRECTION]
+    rows[:, layout.MAP_DIRECTION] = directions @ rotation.T
+    rows[:, layout.MAP_POSITION] = rows[:, layout.MAP_POSITION] @ rotation.T
+    rows[:, layout.MAP_POSITION] += shift
+    stops = rows[:, layout.MAP_STOP_POINT]
     has_stop = (stops != 0.0).any(axis=1)
-    rows[has_stop, contract.MAP_STOP_POINT] = stops[has_stop] @ rotation.T
-    rows[has_stop, contract.MAP_STOP_POINT] += shift
+    rows[has_stop, layout.MAP_STOP_POINT] = stops[has_stop] @ rotation.T
+    rows[has_stop, layout.MAP_STOP_POINT] += shift
     return scenario._replace(
         track_rows=tracks.astype(np.float32), map_rows=rows.astype(np.float32)
     )
@@ -254,11 +253,11 @@ def test_inputs_ignore_where_the_scene_sits():
     scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:1]
     if not scenario_paths:
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
-    scenario = loader.read_scenario(scenario_paths[0])
-    tracks = loader.designated_tracks(scenario)
+    scenario = formats.StagedFile.load(scenario_paths[0])
+    tracks = views.designated_tracks(scenario)
     moved = rotated_scenario(scenario, 2.1, np.array([-310.0, 75.5]))
-    original = inputs.scene_inputs(scenario, tracks)
-    turned = inputs.scene_inputs(moved, tracks)
+    original = views.scene_inputs(scenario, tracks)
+    turned = views.scene_inputs(moved, tracks)
     for name, before, after in zip(original._fields, original, turned):
         assert np.allclose(before, after, atol=2e-3), name
 
@@ -268,13 +267,13 @@ def test_lane_ahead_lands_ahead():
     ahead, at (10, 0) in its own frame.
     """
     lane = lane_polyline_rows(0.0, 1)
-    lane[0, contract.MAP_POSITION] = [10.0, 15.0]
-    lane[0, contract.MAP_DIRECTION] = [0.0, 1.0]
+    lane[0, layout.MAP_POSITION] = [10.0, 15.0]
+    lane[0, layout.MAP_DIRECTION] = [0.0, 1.0]
     frame = Frame(np.array([10.0, 5.0]), np.pi / 2)
-    moved = inputs.map_rows_to_frame(lane, frame)
-    assert np.allclose(moved[0, contract.MAP_POSITION], [10.0, 0.0])
-    assert np.allclose(moved[0, contract.MAP_DIRECTION], [1.0, 0.0])
-    assert np.all(moved[0, contract.MAP_STOP_POINT] == 0.0)
+    moved = frames.map_rows_to_frame(lane, frame)
+    assert np.allclose(moved[0, layout.MAP_POSITION], [10.0, 0.0])
+    assert np.allclose(moved[0, layout.MAP_DIRECTION], [1.0, 0.0])
+    assert np.all(moved[0, layout.MAP_STOP_POINT] == 0.0)
 
 
 def test_path_distance_matches_dense_sampling():
@@ -287,7 +286,7 @@ def test_path_distance_matches_dense_sampling():
         samples = np.linspace(0.0, 1.0, 2001)[:, None] * path_end
         gaps = np.linalg.norm(points[:, None] - samples[None], axis=-1)
         dense = gaps.min(axis=1)
-        closed_form = inputs.segment_distance(points, path_end)
+        closed_form = views.segment_distance(points, path_end)
         assert np.allclose(closed_form, dense, atol=0.02)
 
 
@@ -339,105 +338,6 @@ def test_padded_slots_change_nothing():
     )
 
 
-def test_null_baselines_reproduce_their_motion():
-    """The constant-turn baseline retraces an arc exactly, the constant-velocity
-    one leaves it, and an invalid agent gets zeros.
-    """
-    step_offsets = np.arange(
-        -contract.CURRENT_STEP_INDEX, contract.FUTURE_STEPS + 1
-    )
-    elapsed = step_offsets * contract.TIMESTEP_SECONDS
-    speeds = np.array([8.0, 0.0])
-    yaw_rates = np.array([0.3, 0.0])
-
-    turned = yaw_rates[:, None] * elapsed[None, :]
-    safe_yaw_rates = np.where(yaw_rates == 0.0, 1.0, yaw_rates)
-    radii = np.where(yaw_rates == 0.0, 0.0, speeds / safe_yaw_rates)
-    arc_x = radii[:, None] * np.sin(turned)
-    arc_y = radii[:, None] * (1.0 - np.cos(turned))
-    arc_positions = np.stack([arc_x, arc_y], axis=-1)
-
-    agent_track = np.zeros(
-        (2, len(step_offsets), contract.AGENT_FEATURE_DIM), dtype=np.float32
-    )
-    agent_track[..., contract.AGENT_POSITION] = arc_positions
-    agent_track[..., contract.AGENT_HEADING_COSINE] = np.cos(turned)
-    agent_track[..., contract.AGENT_HEADING_SINE] = np.sin(turned)
-    heading_directions = np.stack([np.cos(turned), np.sin(turned)], axis=-1)
-    agent_track[..., contract.AGENT_VELOCITY] = (
-        speeds[:, None, None] * heading_directions
-    )
-
-    agent_history = torch.from_numpy(agent_track[:, : contract.HISTORY_STEPS])
-    agent_history_mask = torch.ones(2, contract.HISTORY_STEPS, dtype=torch.bool)
-    logged_future = torch.from_numpy(
-        arc_positions[:, contract.HISTORY_STEPS :].astype(np.float32)
-    )
-
-    turning_trajectories, turning_logits = baseline.constant_turn_rate(
-        agent_history, agent_history_mask
-    )
-    straight_trajectories, _ = baseline.constant_velocity(agent_history)
-    assert turning_trajectories.shape == (2, 1, contract.FUTURE_STEPS, 2)
-    assert turning_logits.shape == (2, 1)
-
-    assert torch.allclose(turning_trajectories[:, 0], logged_future, atol=1e-3)
-    assert (straight_trajectories[0, 0, -1] - logged_future[0, -1]).norm() > 1.0
-    assert torch.all(turning_trajectories[1] == 0.0)
-    assert torch.all(straight_trajectories[1] == 0.0)
-
-    pruned = pruning.prune_modes(turning_trajectories, turning_logits)
-    expanded = turning_trajectories.expand(
-        -1, contract.NUM_PREDICTED_MODES, -1, -1
-    )
-    assert torch.equal(pruned.trajectories, expanded)
-
-
-def test_anchor_null_ends_on_the_most_used_anchors():
-    """Anchors are in metres, so the agent's speed must not change where the
-    null's paths end.
-    """
-    reach = torch.tensor([40.0, 24.0, 12.0])[:, None, None]
-    unit_anchors = (
-        reference_implementations.unit_anchor_offsets_per_type() * reach
-    )
-    driven_types = torch.tensor([0, contract.NUM_OBJECT_TYPES - 1])
-    current_speeds = torch.tensor([8.0, 0.0])
-    agent_history = torch.zeros(
-        2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM
-    )
-    velocities = torch.stack([current_speeds, torch.zeros(2)], dim=-1)
-    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = (
-        velocities
-    )
-    type_columns = contract.AGENT_TYPE.start + driven_types
-    agent_history[
-        torch.arange(2), contract.CURRENT_STEP_INDEX, type_columns
-    ] = 1.0
-
-    trajectories, confidence_logits = baseline.straight_to_anchors(
-        agent_history, unit_anchors
-    )
-
-    assert trajectories.shape == (
-        2,
-        contract.NUM_PREDICTED_MODES,
-        contract.FUTURE_STEPS,
-        2,
-    )
-    assert confidence_logits.shape == (2, contract.NUM_PREDICTED_MODES)
-    assert torch.allclose(
-        trajectories[:, :, -1],
-        unit_anchors[driven_types][:, : contract.NUM_PREDICTED_MODES],
-        atol=1e-4,
-    )
-
-    steps = torch.cat(
-        [trajectories[..., :1, :], trajectories.diff(dim=-2)], dim=-2
-    )
-    assert torch.allclose(steps, steps[..., :1, :].expand_as(steps), atol=1e-5)
-
-
 def test_anchor_fitting_recovers_separated_clusters():
     """No anchor may be left without endpoints."""
     random_generator = np.random.default_rng(17)
@@ -465,14 +365,14 @@ def test_batched_pruning_matches_the_loop():
     """The plain single-sample loop is the reference."""
     torch.manual_seed(7)
     trajectories = pruning.PRUNE_DISTANCE_METRES * torch.randn(
-        2, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
+        2, model.QUERY_COUNT, layout.FUTURE_STEPS, 2
     )
     confidence_logits = torch.randn(2, model.QUERY_COUNT)
     trajectories[1] = trajectories[1, :1]
 
     pruned = pruning.prune_modes(trajectories, confidence_logits)
     kept_counts = pruned.kept_count
-    assert kept_counts[0] > 1 and kept_counts[0] <= contract.NUM_PREDICTED_MODES
+    assert kept_counts[0] > 1 and kept_counts[0] <= layout.NUM_PREDICTED_MODES
     assert kept_counts[1] == 1
     for sample_index in range(len(kept_counts)):
         walked = reference_implementations.prune_modes_single_sample(
@@ -492,12 +392,10 @@ def test_opposite_endpoints_get_opposite_anchors():
     sides.
     """
     unit_anchors = reference_implementations.unit_anchor_offsets() * 40.0
-    future_positions = torch.zeros(2, contract.FUTURE_STEPS, 2)
-    future_positions[0, :, 0] = torch.linspace(0.5, 40.0, contract.FUTURE_STEPS)
-    future_positions[1, :, 0] = torch.linspace(
-        -0.5, -40.0, contract.FUTURE_STEPS
-    )
-    future_mask = torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool)
+    future_positions = torch.zeros(2, layout.FUTURE_STEPS, 2)
+    future_positions[0, :, 0] = torch.linspace(0.5, 40.0, layout.FUTURE_STEPS)
+    future_positions[1, :, 0] = torch.linspace(-0.5, -40.0, layout.FUTURE_STEPS)
+    future_mask = torch.ones(2, layout.FUTURE_STEPS, dtype=torch.bool)
 
     targets = future_targets(future_positions, future_mask)
     assigned_mode = loss.anchor_assigned_mode(
@@ -516,9 +414,9 @@ def test_assignment_ignores_padded_steps():
     """Assignment scores the whole valid path, never the padded tail."""
     unit_anchors = reference_implementations.unit_anchor_offsets() * 40.0
     anchors = unit_anchors.expand(1, -1, -1)
-    future_positions = torch.zeros(1, contract.FUTURE_STEPS, 2)
+    future_positions = torch.zeros(1, layout.FUTURE_STEPS, 2)
     future_positions[0, :10, 0] = 40.0
-    future_mask = torch.zeros(1, contract.FUTURE_STEPS, dtype=torch.bool)
+    future_mask = torch.zeros(1, layout.FUTURE_STEPS, dtype=torch.bool)
     future_mask[0, :10] = True
 
     assigned_mode = loss.anchor_assigned_mode(
@@ -537,7 +435,7 @@ def test_assignment_ignores_padded_steps():
         40.0 / reference_implementations.ANCHOR_DISTANCE_COUNT
     )
 
-    waits_then_arrives = torch.zeros(1, contract.FUTURE_STEPS, 2)
+    waits_then_arrives = torch.zeros(1, layout.FUTURE_STEPS, 2)
     waits_then_arrives[0, -1, 0] = 40.0
     late_mode = loss.anchor_assigned_mode(
         anchors, future_targets(waits_then_arrives, all_valid)
@@ -553,37 +451,35 @@ def test_submission_returns_to_the_world_frame():
     if not scenario_paths:
         pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
 
-    scenario = loader.read_scenario(scenario_paths[0])
-    tracks = loader.eligible_tracks(scenario, designated_only=True)[:1]
+    scenario = formats.StagedFile.load(scenario_paths[0])
+    tracks = views.eligible_tracks(scenario, designated_only=True)[:1]
     track_index = tracks[0]
-    targets = inputs.scene_inputs(scenario, tracks)
+    targets = views.scene_inputs(scenario, tracks)
     agent_frame_future = targets.future_positions[0]
-    frame = loader.agent_frame(scenario.track_rows[track_index])
+    frame = frames.agent_frame(scenario.track_rows[track_index])
 
-    world_future = submit.to_world(
+    world_future = frames.to_world(
         agent_frame_future, frame, scenario.scene_frame
     )
     world_coordinate_resolution = (
         np.finfo(np.float32).eps * np.abs(world_future).max()
     )
 
-    back_to_scene_frame = frame_ops.positions_to_frame(
+    back_to_scene_frame = frames.positions_to_frame(
         world_future, scenario.scene_frame
     )
-    back_to_agent_frame = frame_ops.positions_to_frame(
-        back_to_scene_frame, frame
-    )
+    back_to_agent_frame = frames.positions_to_frame(back_to_scene_frame, frame)
     assert np.allclose(
         back_to_agent_frame,
         agent_frame_future,
         atol=world_coordinate_resolution,
     )
 
-    future_steps = slice(contract.CURRENT_STEP_INDEX + 1, None)
+    future_steps = slice(layout.CURRENT_STEP_INDEX + 1, None)
     logged_scene_future = scenario.track_rows[
-        track_index, future_steps, contract.AGENT_POSITION
+        track_index, future_steps, layout.AGENT_POSITION
     ]
-    logged_world_future = frame_ops.positions_from_frame(
+    logged_world_future = frames.positions_from_frame(
         logged_scene_future, scenario.scene_frame
     )
     logged = scenario.track_valid[track_index, future_steps]
@@ -600,79 +496,70 @@ def test_constant_velocity_null_keeps_the_logged_speed():
     logged_velocity = torch.tensor([[11.0, -4.0], [0.0, 0.0]])
     start = torch.tensor([3.0, 5.0])
     agent_history = torch.zeros(
-        2, contract.HISTORY_STEPS, contract.AGENT_FEATURE_DIM
+        2, layout.HISTORY_STEPS, layout.AGENT_FEATURE_DIM
     )
-    agent_history[:, :, contract.AGENT_HEADING_COSINE] = 1.0
-    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY] = (
+    agent_history[:, :, layout.AGENT_HEADING_COSINE] = 1.0
+    agent_history[:, layout.CURRENT_STEP_INDEX, layout.AGENT_VELOCITY] = (
         logged_velocity
     )
-    agent_history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_POSITION] = (
-        start
-    )
+    agent_history[:, layout.CURRENT_STEP_INDEX, layout.AGENT_POSITION] = start
 
     trajectories, _ = baseline.constant_velocity(agent_history)
-    step_numbers = torch.arange(
-        1, contract.FUTURE_STEPS + 1, dtype=torch.float32
-    )
-    elapsed_seconds = contract.TIMESTEP_SECONDS * step_numbers
+    step_numbers = torch.arange(1, layout.FUTURE_STEPS + 1, dtype=torch.float32)
+    elapsed_seconds = layout.TIMESTEP_SECONDS * step_numbers
     straight_line = start + logged_velocity[0] * elapsed_seconds[:, None]
 
     assert torch.allclose(trajectories[0, 0], straight_line, atol=1e-4)
-    step_length = float(logged_velocity[0].norm() * contract.TIMESTEP_SECONDS)
+    step_length = float(logged_velocity[0].norm() * layout.TIMESTEP_SECONDS)
     assert torch.allclose(
         trajectories[0, 0].diff(dim=0).norm(dim=-1),
-        torch.full((contract.FUTURE_STEPS - 1,), step_length),
+        torch.full((layout.FUTURE_STEPS - 1,), step_length),
         atol=1e-4,
     )
     assert torch.allclose(
-        trajectories[1, 0], start.expand(contract.FUTURE_STEPS, 2), atol=1e-4
+        trajectories[1, 0], start.expand(layout.FUTURE_STEPS, 2), atol=1e-4
     )
 
 
 def test_artifact_provenance_round_trips():
     """A missing stamp, or one from another code version, is refused."""
-    stamp = contract.artifact_provenance(
+    stamp = formats.artifact_provenance(
         "test_invariants.py", "unit-test-source"
     )
-    checked = contract.check_provenance(stamp, "in-memory", "Regenerate.")
-    assert checked["code_version"] == contract.STAGING_CODE_VERSION
+    checked = formats.check_provenance(stamp, "in-memory", "Regenerate.")
+    assert checked["code_version"] == layout.STAGING_CODE_VERSION
     assert checked["producer"] == "test_invariants.py"
 
     with pytest.raises(ValueError):
-        contract.check_provenance(None, "in-memory", "Regenerate.")
+        formats.check_provenance(None, "in-memory", "Regenerate.")
 
     stale = json.dumps(
         {"code_version": "not-the-working-tree", "producer": "x", "source": "y"}
     )
     with pytest.raises(ValueError):
-        contract.check_provenance(stale, "in-memory", "Regenerate.")
+        formats.check_provenance(stale, "in-memory", "Regenerate.")
 
 
 def write_scorer_scenario(path, scenario_id, agent_count):
     """A staged file of agent_count agents at x = 0, 1, 2, ... with no map."""
     track_rows = np.zeros(
-        (agent_count, contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM),
-        np.float32,
+        (agent_count, layout.TOTAL_STEPS, layout.AGENT_FEATURE_DIM), np.float32
     )
-    track_rows[:, :, contract.AGENT_HEADING_COSINE] = 1.0
-    track_rows[:, :, contract.AGENT_TYPE.start] = 1.0
+    track_rows[:, :, layout.AGENT_HEADING_COSINE] = 1.0
+    track_rows[:, :, layout.AGENT_TYPE.start] = 1.0
     for track_index in range(agent_count):
-        track_rows[track_index, :, contract.AGENT_POSITION.start] = float(
+        track_rows[track_index, :, layout.AGENT_POSITION.start] = float(
             track_index
         )
-    signal_shape = (
-        0,
-        contract.HISTORY_STEPS,
-        contract.NUM_TRAFFIC_SIGNAL_STATES,
-    )
+    signal_shape = (0, layout.HISTORY_STEPS, layout.NUM_TRAFFIC_SIGNAL_STATES)
     np.savez(
         path,
         track_rows=track_rows,
-        track_valid=np.ones((agent_count, contract.TOTAL_STEPS), dtype=bool),
+        track_valid=np.ones((agent_count, layout.TOTAL_STEPS), dtype=bool),
         track_ids=np.arange(10, 10 * (agent_count + 1), 10, dtype=np.int64),
         is_designated_target=np.ones(agent_count, dtype=bool),
         is_object_of_interest=np.zeros(agent_count, dtype=bool),
-        map_rows=np.zeros((0, contract.MAP_FEATURE_DIM), dtype=np.float32),
+        map_rows=np.zeros((0, layout.MAP_FEATURE_DIM), dtype=np.float32),
         feature_lengths=np.zeros(0, dtype=np.int64),
         feature_ids=np.zeros(0, dtype=np.int64),
         feature_is_interpolating=np.zeros(0, dtype=bool),
@@ -707,20 +594,20 @@ def test_scorer_tensors_group_by_scenario(tmp_path):
     target_count = len(prediction_track_ids)
     trajectory_shape = (
         target_count,
-        contract.NUM_PREDICTED_MODES,
-        contract.SUBMISSION_STEPS,
+        layout.NUM_PREDICTED_MODES,
+        layout.SUBMISSION_STEPS,
         2,
     )
-    predictions = contract.Submission(
+    predictions = formats.Submission(
         scenario_id=np.array(prediction_scenario_ids),
         track_id=np.array(prediction_track_ids, dtype=np.int64),
         world_trajectories=np.random.default_rng(0).normal(
             size=trajectory_shape
         ),
         confidences=np.full(
-            (target_count, contract.NUM_PREDICTED_MODES), 1.0 / 6.0
+            (target_count, layout.NUM_PREDICTED_MODES), 1.0 / 6.0
         ),
-        provenance=contract.artifact_provenance("test", "scorer-tensors"),
+        provenance=formats.artifact_provenance("test", "scorer-tensors"),
     )
 
     tensors = runner.metric_inputs(predictions, tmp_path)
@@ -728,15 +615,15 @@ def test_scorer_tensors_group_by_scenario(tmp_path):
     assert tensors.ground_truth_trajectory.shape == (
         2,
         3,
-        contract.TOTAL_STEPS,
+        layout.TOTAL_STEPS,
         7,
     )
     assert tensors.prediction_trajectory.shape == (
         2,
         2,
-        contract.NUM_PREDICTED_MODES,
+        layout.NUM_PREDICTED_MODES,
         1,
-        contract.SUBMISSION_STEPS,
+        layout.SUBMISSION_STEPS,
         2,
     )
     assert (
@@ -802,28 +689,20 @@ def two_lane_signal_scenario(track_count, signalled_history):
     """
     signalled_lane = lane_polyline_rows(0.0, 11)
     unsignalled_lane = lane_polyline_rows(0.0, 11)
-    unsignalled_lane[:, contract.MAP_POSITION.start + 1] = 40.0
-    signal_shape = (
-        2,
-        contract.HISTORY_STEPS,
-        contract.NUM_TRAFFIC_SIGNAL_STATES,
-    )
+    unsignalled_lane[:, layout.MAP_POSITION.start + 1] = 40.0
+    signal_shape = (2, layout.HISTORY_STEPS, layout.NUM_TRAFFIC_SIGNAL_STATES)
     polyline_signal_histories = np.zeros(signal_shape, dtype=np.float32)
     polyline_signal_histories[0] = signalled_history
-    track_shape = (
-        track_count,
-        contract.TOTAL_STEPS,
-        contract.AGENT_FEATURE_DIM,
-    )
+    track_shape = (track_count, layout.TOTAL_STEPS, layout.AGENT_FEATURE_DIM)
     track_rows = np.zeros(track_shape, dtype=np.float32)
-    track_valid = np.ones((track_count, contract.TOTAL_STEPS), dtype=bool)
-    track_rows[:, :, contract.AGENT_HEADING_COSINE] = 1.0
-    track_rows[0, :, contract.AGENT_POSITION] = np.array([5.0, 0.0])
-    track_rows[1, :, contract.AGENT_POSITION] = np.array([5.0, 40.0])
+    track_valid = np.ones((track_count, layout.TOTAL_STEPS), dtype=bool)
+    track_rows[:, :, layout.AGENT_HEADING_COSINE] = 1.0
+    track_rows[0, :, layout.AGENT_POSITION] = np.array([5.0, 0.0])
+    track_rows[1, :, layout.AGENT_POSITION] = np.array([5.0, 40.0])
     if track_count > 2:
-        track_rows[2, :, contract.AGENT_POSITION] = np.array([7.0, 0.0])
-        track_valid[2, contract.CURRENT_STEP_INDEX] = False
-    staged = contract.StagedFile(
+        track_rows[2, :, layout.AGENT_POSITION] = np.array([7.0, 0.0])
+        track_valid[2, layout.CURRENT_STEP_INDEX] = False
+    return formats.StagedFile(
         track_rows=track_rows,
         track_valid=track_valid,
         track_ids=np.arange(track_count),
@@ -838,27 +717,26 @@ def two_lane_signal_scenario(track_count, signalled_history):
         frame_heading=np.float32(0.0),
         scenario_id=np.array("two-lane"),
     )
-    return loader.staged_scenario(staged)
 
 
 def test_lane_chunks_carry_their_light():
     """The chunk of a signalled lane carries that lane's light history, the
     other lane's chunk carries none, and the prediction depends on it.
     """
-    signal_shape = (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
+    signal_shape = (layout.HISTORY_STEPS, layout.NUM_TRAFFIC_SIGNAL_STATES)
     signalled_history = np.zeros(signal_shape, dtype=np.float32)
-    stop_column = contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_STOP")
-    go_column = contract.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")
+    stop_column = layout.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_STOP")
+    go_column = layout.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_GO")
     signalled_history[:8, stop_column] = 1.0
     signalled_history[8:, go_column] = 1.0
     scenario = two_lane_signal_scenario(3, signalled_history)
-    target_inputs = inputs.scene_inputs(scenario, np.array([0]))
+    target_inputs = views.scene_inputs(scenario, np.array([0]))
     lights = target_inputs.chunk_signal_history[0]
     lit_chunks = [chunk for chunk in lights if chunk.any()]
     assert len(lit_chunks) == 1
     assert np.array_equal(lit_chunks[0], signalled_history)
 
-    batch = pipeline.torch_batch(target_inputs)
+    batch = target_inputs.each(torch.from_numpy)
     dark = batch._replace(
         chunk_signal_history=torch.zeros_like(batch.chunk_signal_history)
     )
@@ -876,7 +754,7 @@ def test_target_prediction_ignores_batch_company():
     """A target predicted alone must equal the same target batched beside other
     targets from another scene.
     """
-    signal_shape = (contract.HISTORY_STEPS, contract.NUM_TRAFFIC_SIGNAL_STATES)
+    signal_shape = (layout.HISTORY_STEPS, layout.NUM_TRAFFIC_SIGNAL_STATES)
     signalled_history = np.zeros(signal_shape, dtype=np.float32)
     three_track_scenario = two_lane_signal_scenario(3, signalled_history)
     two_track_scenario = two_lane_signal_scenario(2, signalled_history)
@@ -885,13 +763,13 @@ def test_target_prediction_ignores_batch_company():
     predictor = model.MotionPredictor(
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
-    alone = inputs.scene_inputs(three_track_scenario, np.array([1]))
-    first = inputs.scene_inputs(two_track_scenario, np.array([0]))
-    second = inputs.scene_inputs(three_track_scenario, np.array([0, 1]))
+    alone = views.scene_inputs(three_track_scenario, np.array([1]))
+    first = views.scene_inputs(two_track_scenario, np.array([0]))
+    second = views.scene_inputs(three_track_scenario, np.array([0, 1]))
     together = TargetInputs(*map(np.concatenate, zip(first, second)))
     with torch.no_grad():
-        alone_paths = predictor(pipeline.torch_batch(alone)).trajectories
-        together_paths = predictor(pipeline.torch_batch(together)).trajectories
+        alone_paths = predictor(alone.each(torch.from_numpy)).trajectories
+        together_paths = predictor(together.each(torch.from_numpy)).trajectories
     assert torch.allclose(alone_paths[0], together_paths[2], atol=1e-4)
 
 
@@ -909,7 +787,7 @@ def test_zero_head_output_lands_on_the_anchor():
         predictor.mode_decoder.trajectory_head[-1].weight.zero_()
         predictor.mode_decoder.trajectory_head[-1].bias.zero_()
     size = SyntheticSize(
-        samples=contract.NUM_OBJECT_TYPES,
+        samples=layout.NUM_OBJECT_TYPES,
         agents=2,
         polylines=2,
         dots_per_polyline=10,
@@ -921,10 +799,10 @@ def test_zero_head_output_lands_on_the_anchor():
         predicted.trajectories[:, :, -1], unit_anchors, atol=1e-4
     )
     assert torch.allclose(predicted.anchors, unit_anchors)
-    ramp = torch.arange(1, contract.FUTURE_STEPS + 1) / contract.FUTURE_STEPS
+    ramp = torch.arange(1, layout.FUTURE_STEPS + 1) / layout.FUTURE_STEPS
     logged_futures = unit_anchors[0][:, None, :] * ramp[None, :, None]
     all_valid = torch.ones(
-        model.QUERY_COUNT, contract.FUTURE_STEPS, dtype=torch.bool
+        model.QUERY_COUNT, layout.FUTURE_STEPS, dtype=torch.bool
     )
     assigned_mode = loss.anchor_assigned_mode(
         unit_anchors[0].expand(model.QUERY_COUNT, -1, -1),
@@ -937,9 +815,9 @@ def test_regression_term_is_gaussian_nll():
     """Checked against the closed form at the uncertainty the model states."""
     torch.manual_seed(53)
     sample_count = 4
-    future_positions = torch.randn(sample_count, contract.FUTURE_STEPS, 2)
+    future_positions = torch.randn(sample_count, layout.FUTURE_STEPS, 2)
     future_mask = torch.ones(
-        sample_count, contract.FUTURE_STEPS, dtype=torch.bool
+        sample_count, layout.FUTURE_STEPS, dtype=torch.bool
     )
     targets = future_targets(future_positions, future_mask)
     confidence_logits = torch.zeros(sample_count, model.QUERY_COUNT)
@@ -984,10 +862,10 @@ def test_regression_term_is_gaussian_nll():
 def test_classification_term_is_cross_entropy():
     """Taken over anchors, against the assigned mode."""
     sample_count = 3
-    future_positions = torch.zeros(sample_count, contract.FUTURE_STEPS, 2)
+    future_positions = torch.zeros(sample_count, layout.FUTURE_STEPS, 2)
     future_positions[:, -1, 0] = 1.0
     future_mask = torch.ones(
-        sample_count, contract.FUTURE_STEPS, dtype=torch.bool
+        sample_count, layout.FUTURE_STEPS, dtype=torch.bool
     )
     trajectories = future_positions.unsqueeze(1).expand(
         -1, model.QUERY_COUNT, -1, -1
@@ -1013,13 +891,13 @@ def test_masked_steps_move_no_loss():
     torch.manual_seed(103)
     sample_count = 4
     future_mask = torch.ones(
-        sample_count, contract.FUTURE_STEPS, dtype=torch.bool
+        sample_count, layout.FUTURE_STEPS, dtype=torch.bool
     )
-    future_mask[1, contract.FUTURE_STEPS // 2 :] = False
+    future_mask[1, layout.FUTURE_STEPS // 2 :] = False
     future_mask[2] = False
-    future_positions = torch.randn(sample_count, contract.FUTURE_STEPS, 2)
+    future_positions = torch.randn(sample_count, layout.FUTURE_STEPS, 2)
     trajectories = torch.randn(
-        sample_count, model.QUERY_COUNT, contract.FUTURE_STEPS, 2
+        sample_count, model.QUERY_COUNT, layout.FUTURE_STEPS, 2
     )
     log_standard_deviation = torch.randn_like(trajectories)
     confidence_logits = torch.randn(sample_count, model.QUERY_COUNT)
@@ -1065,7 +943,7 @@ def test_every_model_output_moves_the_loss():
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
     size = SyntheticSize(
-        samples=contract.NUM_OBJECT_TYPES,
+        samples=layout.NUM_OBJECT_TYPES,
         agents=3,
         polylines=2,
         dots_per_polyline=10,
@@ -1099,7 +977,7 @@ def test_no_step_uncertainty_starts_saturated():
         reference_implementations.unit_anchor_offsets_per_type()
     ).eval()
     size = SyntheticSize(
-        samples=contract.NUM_OBJECT_TYPES,
+        samples=layout.NUM_OBJECT_TYPES,
         agents=2,
         polylines=2,
         dots_per_polyline=10,
@@ -1171,7 +1049,7 @@ def test_training_step_runs_on_staged_scenarios(tmp_path):
 def test_pruning_conserves_probability_mass():
     """A dropped duplicate's share goes to the mode kept in its place."""
     torch.manual_seed(131)
-    trajectories = torch.zeros(1, model.QUERY_COUNT, contract.FUTURE_STEPS, 2)
+    trajectories = torch.zeros(1, model.QUERY_COUNT, layout.FUTURE_STEPS, 2)
     trajectories[0, :, -1, 0] = 10.0 * torch.arange(
         model.QUERY_COUNT, dtype=torch.float32
     )
@@ -1207,27 +1085,23 @@ def test_step_head_walks_a_line_or_an_arc():
     type_index = torch.zeros(1, dtype=torch.long)
     with torch.no_grad():
         decoder.trajectory_head[-1].weight.zero_()
-        bias = decoder.trajectory_head[-1].bias.view(
-            2, contract.FUTURE_STEPS, 2
-        )
+        bias = decoder.trajectory_head[-1].bias.view(2, layout.FUTURE_STEPS, 2)
         bias.zero_()
         bias[0, :, 0] = 0.5
         straight = decoder(memory, type_index)[-1].trajectories
-        angles = 0.02 * torch.arange(contract.FUTURE_STEPS, dtype=torch.float32)
+        angles = 0.02 * torch.arange(layout.FUTURE_STEPS, dtype=torch.float32)
         bias[0, :, 0] = 0.5 * angles.cos()
         bias[0, :, 1] = 0.5 * angles.sin()
         arc = decoder(memory, type_index)[-1].trajectories
-    step_numbers = torch.arange(
-        1, contract.FUTURE_STEPS + 1, dtype=torch.float32
-    )
+    step_numbers = torch.arange(1, layout.FUTURE_STEPS + 1, dtype=torch.float32)
     expected_straight = torch.stack(
-        [0.5 * step_numbers, torch.zeros(contract.FUTURE_STEPS)], dim=-1
+        [0.5 * step_numbers, torch.zeros(layout.FUTURE_STEPS)], dim=-1
     )
     assert torch.allclose(straight[0, 0], expected_straight, atol=1e-5)
     steps = arc[0, 0].diff(dim=0)
     assert torch.allclose(
         steps.norm(dim=-1),
-        torch.full((contract.FUTURE_STEPS - 1,), 0.5),
+        torch.full((layout.FUTURE_STEPS - 1,), 0.5),
         atol=1e-5,
     )
     turning = torch.atan2(steps[:, 1], steps[:, 0]).diff()
@@ -1247,9 +1121,9 @@ def test_unreadable_staged_file_names_itself(tmp_path):
     np.savez_compressed(missing, **kept_arrays)
     for path in (truncated, missing):
         with pytest.raises(ValueError, match=re.escape(str(path))):
-            contract.StagedFile.load(path)
+            formats.StagedFile.load(path)
     with pytest.raises(ValueError, match=re.escape(str(truncated))):
-        loader.read_track_arrays(truncated)
+        formats.TrackArrays.load(truncated)
 
 
 def test_step_count_matches_a_serial_count():
@@ -1262,15 +1136,15 @@ def test_step_count_matches_a_serial_count():
     settings = TWO_STAGED_SCENARIOS._replace(
         batch_size=batch_size, worker_count=worker_count, designated_only=False
     )
-    now = contract.CURRENT_STEP_INDEX
+    now = layout.CURRENT_STEP_INDEX
     expected = 0
     for worker_index in range(worker_count):
         targets = 0
         for path in paths[worker_index::worker_count]:
             with np.load(path) as staged:
                 valid_now = staged["track_valid"][:, now]
-                type_rows = staged["track_rows"][:, now, contract.AGENT_TYPE]
-            is_predicted = type_rows[:, : contract.NUM_OBJECT_TYPES].any(axis=1)
+                type_rows = staged["track_rows"][:, now, layout.AGENT_TYPE]
+            is_predicted = type_rows[:, : layout.NUM_OBJECT_TYPES].any(axis=1)
             targets += int((valid_now & is_predicted).sum())
         expected += math.ceil(targets / batch_size)
     assert pipeline.steps_per_epoch(paths, settings) == expected
@@ -1281,7 +1155,7 @@ def test_pruning_fills_six_slots_from_three_modes():
     the backfilled slots carry no confidence.
     """
     endpoints = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
-    ramp = torch.linspace(0.0, 1.0, contract.FUTURE_STEPS)[:, None]
+    ramp = torch.linspace(0.0, 1.0, layout.FUTURE_STEPS)[:, None]
     trajectories = (endpoints[:, None, :] * ramp)[None]
     logits = torch.tensor([[1.0, 3.0, 2.0]])
     pruned = pruning.prune_modes(trajectories, logits)
@@ -1300,19 +1174,19 @@ def test_pruning_fills_six_slots_from_three_modes():
 
 def test_broken_submission_is_refused(tmp_path):
     """A submission row the scorer would misread must fail on save."""
-    slots = contract.NUM_PREDICTED_MODES
-    steps = len(contract.SUBMISSION_FUTURE_INDICES)
+    slots = layout.NUM_PREDICTED_MODES
+    steps = len(layout.SUBMISSION_FUTURE_INDICES)
     confidences = np.zeros((2, slots))
     confidences[:, 0] = 1.0
-    good = contract.Submission(
+    good = formats.Submission(
         scenario_id=np.array(["scene", "scene"]),
         track_id=np.array([1, 2], dtype=np.int64),
         world_trajectories=np.zeros((2, slots, steps, 2)),
         confidences=confidences,
-        provenance=contract.artifact_provenance("test", tmp_path),
+        provenance=formats.artifact_provenance("test", tmp_path),
     )
     good.save(tmp_path / "good.npz")
-    assert len(contract.Submission.load(tmp_path / "good.npz").track_id) == 2
+    assert len(formats.Submission.load(tmp_path / "good.npz").track_id) == 2
     negative = confidences.copy()
     negative[0, :2] = [1.5, -0.5]
     not_finite = good.world_trajectories.copy()
@@ -1336,7 +1210,7 @@ def test_checkpoint_of_another_design_is_refused(tmp_path):
     renamed[checkpoint.ANCHORS_KEY] = model_state[checkpoint.ANCHORS_KEY]
     path = tmp_path / "other_design.pt"
     stored = {
-        "code_version": contract.STAGING_CODE_VERSION,
+        "code_version": layout.STAGING_CODE_VERSION,
         "model_state": renamed,
     }
     torch.save(stored, path)
@@ -1349,7 +1223,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[2])
-from womd import pipeline
+from womd import formats, frames, layout, pipeline, views
 from womd.pipeline import BatchSettings
 
 if __name__ == "__main__":

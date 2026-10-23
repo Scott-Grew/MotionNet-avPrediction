@@ -13,10 +13,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from womd.inputs import TargetInputs
 from womd.loss import LossTerms, mean_over_valid_steps
 from womd.model import QUERY_COUNT, ModePredictions
 from womd.pruning import prune_modes
+from womd.views import TargetInputs
 
 # A log line is printed once per this many batches, and the pruned
 # minADE and minFDE run on that batch only, because pruning is slow.

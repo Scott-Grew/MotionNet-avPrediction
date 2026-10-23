@@ -20,10 +20,10 @@ import onnxruntime
 import torch
 from torch import Tensor, nn
 
-from womd import inputs, loader, pipeline
+from womd import formats, views
 from womd.checkpoint import load_predictor
-from womd.inputs import TargetInputs
 from womd.pruning import submitted_modes
+from womd.views import TargetInputs
 
 # The graph's inputs are the arrays the model reads, in TargetInputs order;
 # the logged future is not an input.
@@ -114,11 +114,11 @@ def designated_batches(paths: list[Path]) -> list[TargetInputs]:
     """
     batches = []
     for path in paths:
-        scenario = loader.read_scenario(path)
-        tracks = loader.designated_tracks(scenario)
+        scenario = formats.StagedFile.load(path)
+        tracks = views.designated_tracks(scenario)
         if len(tracks):
-            scene = inputs.scene_inputs(scenario, tracks)
-            batches.append(pipeline.torch_batch(scene))
+            scene = views.scene_inputs(scenario, tracks)
+            batches.append(scene.each(torch.from_numpy))
     return batches
 
 

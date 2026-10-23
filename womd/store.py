@@ -9,9 +9,10 @@ from typing import NamedTuple
 
 import numpy as np
 
-from womd import contract, frame_ops
-from womd.contract import SIGNAL_HISTORY_SHAPE, StagedFile
-from womd.frame_ops import Frame
+from womd import formats, frames, layout
+from womd.formats import StagedFile
+from womd.frames import Frame
+from womd.layout import SIGNAL_HISTORY_SHAPE
 from womd_protos import map_pb2, scenario_pb2
 
 # Map feature kinds whose points form a closed polygon rather
@@ -52,7 +53,7 @@ class TrafficSignals(NamedTuple):
 
 def empty_staged_map() -> StagedMap:
     return StagedMap(
-        map_rows=np.zeros((0, contract.MAP_FEATURE_DIM)),
+        map_rows=np.zeros((0, layout.MAP_FEATURE_DIM)),
         feature_lengths=np.zeros(0, dtype=np.int64),
         feature_ids=np.zeros(0, dtype=np.int64),
         polyline_signal_histories=np.zeros((0,) + SIGNAL_HISTORY_SHAPE),
@@ -65,7 +66,7 @@ def scene_frame(scenario: scenario_pb2.Scenario) -> Frame:
     the current step.
     """
     sdc_track = scenario.tracks[scenario.sdc_track_index]
-    sdc_state = sdc_track.states[contract.CURRENT_STEP_INDEX]
+    sdc_state = sdc_track.states[layout.CURRENT_STEP_INDEX]
     if not sdc_state.valid:
         raise ValueError(f"invalid SDC at current step, {scenario.scenario_id}")
     origin = np.array([sdc_state.center_x, sdc_state.center_y])
@@ -77,10 +78,10 @@ def type_one_hot(track: Track) -> np.ndarray:
     the model does not predict counted as TYPE_OTHER.
     """
     type_name = Track.ObjectType.Name(track.object_type)
-    if type_name not in contract.AGENT_TYPES:
+    if type_name not in layout.AGENT_TYPES:
         type_name = "TYPE_OTHER"
-    one_hot = np.zeros(contract.NUM_AGENT_TYPES)
-    one_hot[contract.AGENT_TYPES.index(type_name)] = 1.0
+    one_hot = np.zeros(layout.NUM_AGENT_TYPES)
+    one_hot[layout.AGENT_TYPES.index(type_name)] = 1.0
     return one_hot
 
 
@@ -96,19 +97,17 @@ def track_rows(track: Track, frame: Frame, is_sdc: bool) -> np.ndarray:
     )
     dimensions = np.array([[state.length, state.width] for state in states])
 
-    scene_headings = frame_ops.headings_to_frame(headings, frame.heading)
-    rows = np.zeros((contract.TOTAL_STEPS, contract.AGENT_FEATURE_DIM))
-    rows[:, contract.AGENT_POSITION] = frame_ops.positions_to_frame(
-        positions, frame
-    )
-    rows[:, contract.AGENT_HEADING_COSINE] = np.cos(scene_headings)
-    rows[:, contract.AGENT_HEADING_SINE] = np.sin(scene_headings)
-    rows[:, contract.AGENT_VELOCITY] = frame_ops.directions_to_frame(
+    scene_headings = frames.headings_to_frame(headings, frame.heading)
+    rows = np.zeros((layout.TOTAL_STEPS, layout.AGENT_FEATURE_DIM))
+    rows[:, layout.AGENT_POSITION] = frames.positions_to_frame(positions, frame)
+    rows[:, layout.AGENT_HEADING_COSINE] = np.cos(scene_headings)
+    rows[:, layout.AGENT_HEADING_SINE] = np.sin(scene_headings)
+    rows[:, layout.AGENT_VELOCITY] = frames.directions_to_frame(
         velocities, frame.heading
     )
-    rows[:, contract.AGENT_DIMENSIONS] = dimensions
-    rows[:, contract.AGENT_TYPE] = type_one_hot(track)
-    rows[:, contract.AGENT_IS_SDC] = float(is_sdc)
+    rows[:, layout.AGENT_DIMENSIONS] = dimensions
+    rows[:, layout.AGENT_TYPE] = type_one_hot(track)
+    rows[:, layout.AGENT_IS_SDC] = float(is_sdc)
     return rows
 
 
@@ -146,7 +145,7 @@ def arc_lengths(points: np.ndarray) -> np.ndarray:
 
 def sample_distances(lengths: np.ndarray) -> np.ndarray:
     """Arc lengths to resample at, one per metre plus the final endpoint."""
-    spacing = contract.MAP_POINT_SPACING_METRES
+    spacing = layout.MAP_POINT_SPACING_METRES
     return np.append(np.arange(0.0, lengths[-1], spacing), lengths[-1])
 
 
@@ -190,9 +189,9 @@ def crossing_codes(feature: MapFeature, lengths: np.ndarray) -> np.ndarray:
     codes = np.zeros((len(distances), 2))
     if feature.WhichOneof("feature_data") != "lane":
         return codes
-    for side_index, side_name in enumerate(contract.LANE_SIDES):
+    for side_index, side_name in enumerate(layout.LANE_SIDES):
         for segment in getattr(feature.lane, f"{side_name}_boundaries"):
-            if segment.boundary_type >= len(contract.ROAD_LINE_TYPES):
+            if segment.boundary_type >= len(layout.ROAD_LINE_TYPES):
                 raise ValueError(
                     f"lane {feature.id}: unknown boundary type"
                     f" {segment.boundary_type}"
@@ -216,30 +215,30 @@ def feature_in_scene(feature: MapFeature, frame: Frame) -> SceneFeature | None:
     spaced = resample_polyline(points)
     directions = polyline_directions(spaced)
     codes = crossing_codes(feature, lengths)
-    scene_points = frame_ops.positions_to_frame(spaced, frame)
-    scene_directions = frame_ops.directions_to_frame(directions, frame.heading)
+    scene_points = frames.positions_to_frame(spaced, frame)
+    scene_directions = frames.directions_to_frame(directions, frame.heading)
     inside = (
         np.linalg.norm(scene_points, axis=1)
-        <= contract.STAGING_CROP_RADIUS_METRES
+        <= layout.STAGING_CROP_RADIUS_METRES
     )
     return SceneFeature(
         scene_points[inside],
         scene_directions[inside],
         codes[inside],
-        contract.MAP_POLYLINE_KINDS.index(feature.WhichOneof("feature_data")),
+        layout.MAP_POLYLINE_KINDS.index(feature.WhichOneof("feature_data")),
     )
 
 
 def traffic_signals(scenario: scenario_pb2.Scenario) -> TrafficSignals:
     histories: dict[int, np.ndarray] = {}
     stop_points: dict[int, np.ndarray] = {}
-    history_states = scenario.dynamic_map_states[: contract.HISTORY_STEPS]
+    history_states = scenario.dynamic_map_states[: layout.HISTORY_STEPS]
     for step_index, dynamic_state in enumerate(history_states):
         for lane_state in dynamic_state.lane_states:
             state_name = map_pb2.TrafficSignalLaneState.State.Name(
                 lane_state.state
             )
-            state_index = contract.TRAFFIC_SIGNAL_STATES.index(state_name)
+            state_index = layout.TRAFFIC_SIGNAL_STATES.index(state_name)
             history = histories.setdefault(
                 lane_state.lane, np.zeros(SIGNAL_HISTORY_SHAPE)
             )
@@ -272,33 +271,33 @@ class MapStager:
         scene_feature = feature_in_scene(feature, self.frame)
         if scene_feature is None or len(scene_feature.points) == 0:
             return None
-        kind_name = contract.MAP_POLYLINE_KINDS[scene_feature.kind_index]
-        rows = np.zeros((len(scene_feature.points), contract.MAP_FEATURE_DIM))
-        rows[:, contract.MAP_POSITION] = scene_feature.points
-        rows[:, contract.MAP_DIRECTION] = scene_feature.directions
-        rows[:, contract.MAP_KIND.start + scene_feature.kind_index] = 1.0
-        rows[:, contract.MAP_LEFT_BOUNDARY_CROSSING] = (
+        kind_name = layout.MAP_POLYLINE_KINDS[scene_feature.kind_index]
+        rows = np.zeros((len(scene_feature.points), layout.MAP_FEATURE_DIM))
+        rows[:, layout.MAP_POSITION] = scene_feature.points
+        rows[:, layout.MAP_DIRECTION] = scene_feature.directions
+        rows[:, layout.MAP_KIND.start + scene_feature.kind_index] = 1.0
+        rows[:, layout.MAP_LEFT_BOUNDARY_CROSSING] = (
             scene_feature.crossing_codes[:, 0]
         )
-        rows[:, contract.MAP_RIGHT_BOUNDARY_CROSSING] = (
+        rows[:, layout.MAP_RIGHT_BOUNDARY_CROSSING] = (
             scene_feature.crossing_codes[:, 1]
         )
 
         if kind_name == "lane":
             if feature.id in self.signals.stop_points:
                 stop_point = self.signals.stop_points[feature.id]
-                rows[:, contract.MAP_STOP_POINT] = frame_ops.positions_to_frame(
+                rows[:, layout.MAP_STOP_POINT] = frames.positions_to_frame(
                     stop_point, self.frame
                 )
-            rows[:, contract.MAP_LANE_TYPE.start + feature.lane.type] = 1.0
-            rows[:, contract.MAP_SPEED_LIMIT] = feature.lane.speed_limit_mph
+            rows[:, layout.MAP_LANE_TYPE.start + feature.lane.type] = 1.0
+            rows[:, layout.MAP_SPEED_LIMIT] = feature.lane.speed_limit_mph
         elif kind_name == "road_line":
-            rows[
-                :, contract.MAP_BOUNDARY_TYPE.start + feature.road_line.type
-            ] = 1.0
+            rows[:, layout.MAP_BOUNDARY_TYPE.start + feature.road_line.type] = (
+                1.0
+            )
         elif kind_name == "road_edge":
-            first_edge_column = contract.MAP_BOUNDARY_TYPE.start + len(
-                contract.ROAD_LINE_TYPES
+            first_edge_column = layout.MAP_BOUNDARY_TYPE.start + len(
+                layout.ROAD_LINE_TYPES
             )
             rows[:, first_edge_column + feature.road_edge.type] = 1.0
         return rows
@@ -346,11 +345,11 @@ def worst_spacing_deviation(scenario: scenario_pb2.Scenario) -> float:
     gaps = np.diff(np.array(scenario.timestamps_seconds))
     if len(gaps) == 0:
         return 0.0
-    return float(np.max(np.abs(gaps - contract.TIMESTEP_SECONDS)))
+    return float(np.max(np.abs(gaps - layout.TIMESTEP_SECONDS)))
 
 
 def staged_file(scenario: scenario_pb2.Scenario) -> StagedFile:
-    if scenario.current_time_index != contract.CURRENT_STEP_INDEX:
+    if scenario.current_time_index != layout.CURRENT_STEP_INDEX:
         raise ValueError(
             f"current_time_index {scenario.current_time_index},"
             f" {scenario.scenario_id}"
@@ -386,7 +385,7 @@ def staged_file(scenario: scenario_pb2.Scenario) -> StagedFile:
         frame_origin=frame.origin.astype(np.float32),
         frame_heading=np.float32(frame.heading),
         scenario_id=scenario.scenario_id,
-        provenance=contract.artifact_provenance(
+        provenance=formats.artifact_provenance(
             "stage.py", scenario.scenario_id
         ),
     )

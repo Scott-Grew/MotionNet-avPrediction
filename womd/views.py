@@ -1,32 +1,61 @@
-"""Builds each predicted agent's model inputs: its own history and future, its
-nearest agents and its nearest map chunks, all in its own frame at the current
-step. Nearest means nearest to the straight path the agent would cover in 8 s
-at its current velocity, so a fast agent sees far ahead and a slow one sees
-around itself.
+"""Each predicted agent's view of its scene: which agents are predicted, and
+for each one its own history and future, its nearest agents and its nearest
+map chunks, all in its own frame at the current step. Nearest means nearest
+to the straight path the agent would cover in 8 s at its current velocity,
+so a fast agent sees far ahead and a slow one sees around itself.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Union
 
 import numpy as np
 from numpy import ndarray
 
-from womd import contract, frame_ops
-from womd.frame_ops import Frame
-from womd.loader import (
-    FUTURE,
-    HISTORY,
-    StagedScenario,
-    agent_frame,
-    rows_to_frame,
-)
+from womd import layout
+from womd.formats import StagedFile, TrackArrays
+from womd.frames import agent_frame, map_rows_to_frame, rows_to_frame
+from womd.layout import FUTURE, HISTORY
 
 # How many agents (the target included) and map chunks each target sees.
 # Chosen by Scott 2026-10-19 from their measured exclusions.
 AGENT_SLOTS = 48
 CHUNK_SLOTS = 256
+
+
+TrackSource = Union[StagedFile, TrackArrays]
+
+
+def eligible_tracks(scenario: TrackSource, designated_only: bool) -> ndarray:
+    """Indices of tracks valid at the current step and of a predicted object
+    type, optionally restricted to designated targets.
+    """
+    now_rows = scenario.track_rows[:, layout.CURRENT_STEP_INDEX]
+    # The predicted types are the first NUM_OBJECT_TYPES columns of the type
+    # one-hot; the column after them is TYPE_OTHER.
+    type_one_hot = now_rows[:, layout.AGENT_TYPE]
+    predicted_columns = type_one_hot[:, : layout.NUM_OBJECT_TYPES]
+    is_predicted_type = predicted_columns.any(axis=1)
+    now_valid = scenario.track_valid[:, layout.CURRENT_STEP_INDEX]
+    is_eligible = now_valid & is_predicted_type
+    if designated_only:
+        is_eligible = is_eligible & scenario.is_designated_target
+    return np.flatnonzero(is_eligible)
+
+
+def designated_tracks(scenario: StagedFile) -> ndarray:
+    """The tracks Waymo designated for scoring; raises if any of them cannot
+    be predicted.
+    """
+    designated_count = int(scenario.is_designated_target.sum())
+    track_indices = eligible_tracks(scenario, designated_only=True)
+    if len(track_indices) != designated_count:
+        raise ValueError(
+            f"{scenario.scenario_id} designates {designated_count} targets,"
+            f" {len(track_indices)} can be predicted"
+        )
+    return track_indices
 
 
 class SceneChunks(NamedTuple):
@@ -59,14 +88,15 @@ class TargetInputs(NamedTuple):
         return TargetInputs(*applied)
 
 
-def scene_chunks(scenario: StagedScenario) -> SceneChunks:
+def scene_chunks(scenario: StagedFile) -> SceneChunks:
     """Cuts each polyline into chunks of MAP_CHUNK_DOTS dots, the last one
     shorter, and lays them out as one padded row block per chunk.
     """
     lengths = scenario.feature_lengths
-    chunk_dots = contract.MAP_CHUNK_DOTS
+    chunk_dots = layout.MAP_CHUNK_DOTS
     chunks_per_polyline = -(-lengths // chunk_dots)
-    dot_polyline = scenario.map_dot_polyline_index
+    polylines = np.arange(len(lengths))
+    dot_polyline = np.repeat(polylines, lengths)
     # A dot's place along its polyline is its index minus the index of the
     # polyline's first dot, an exclusive cumulative sum of the lengths.
     first_dot = np.cumsum(lengths) - lengths
@@ -76,7 +106,7 @@ def scene_chunks(scenario: StagedScenario) -> SceneChunks:
     dot_slot = along % chunk_dots
 
     chunk_count = int(chunks_per_polyline.sum())
-    row_shape = (chunk_count, chunk_dots, contract.MAP_FEATURE_DIM)
+    row_shape = (chunk_count, chunk_dots, layout.MAP_FEATURE_DIM)
     rows = np.zeros(row_shape, dtype=np.float32)
     rows[dot_chunk, dot_slot] = scenario.map_rows
     dot_mask = np.zeros((chunk_count, chunk_dots), dtype=bool)
@@ -100,26 +130,6 @@ def segment_distance(points: ndarray, path_end: ndarray) -> ndarray:
     return np.linalg.norm(points - nearest, axis=-1)
 
 
-def map_rows_to_frame(rows: ndarray, frame: Frame) -> ndarray:
-    """Re-expresses map rows' position, direction and stop point columns in a
-    frame. A dot with no stop point keeps zeros there.
-    """
-    moved = rows.copy()
-    moved[..., contract.MAP_POSITION] = frame_ops.positions_to_frame(
-        rows[..., contract.MAP_POSITION], frame
-    )
-    moved[..., contract.MAP_DIRECTION] = frame_ops.directions_to_frame(
-        rows[..., contract.MAP_DIRECTION], frame.heading
-    )
-    stop_points = rows[..., contract.MAP_STOP_POINT]
-    has_stop_point = (stop_points != 0.0).any(axis=-1, keepdims=True)
-    moved_stops = frame_ops.positions_to_frame(stop_points, frame)
-    moved[..., contract.MAP_STOP_POINT] = np.where(
-        has_stop_point, moved_stops, 0.0
-    )
-    return moved
-
-
 def padded(array: ndarray, length: int) -> ndarray:
     """Zero-pads the first axis of array to length."""
     widths = [(0, length - len(array))] + [(0, 0)] * (array.ndim - 1)
@@ -130,28 +140,30 @@ def last_valid_positions(history: ndarray, valid: ndarray) -> ndarray:
     """Each track's position (T, 2) at its last valid history step, from its
     history rows (T, 11, 13) and their validity (T, 11).
     """
-    steps = np.arange(contract.HISTORY_STEPS)
+    steps = np.arange(layout.HISTORY_STEPS)
     last_step = np.where(valid, steps, 0).max(axis=1)
     rows = history[np.arange(len(history)), last_step]
-    return rows[:, contract.AGENT_POSITION]
+    return rows[:, layout.AGENT_POSITION]
 
 
-def path_end(tracks: ndarray, target: int) -> ndarray:
-    """Where the target would be after 8 s at its current velocity, in its
-    own frame.
+class ScenePath(NamedTuple):
+    """A target's 8 s straight path at its current velocity, in the scene
+    frame. Distances to it do not change with the frame, so both selections
+    measure in the scene frame.
     """
-    now = tracks[target, contract.CURRENT_STEP_INDEX]
-    return now[contract.AGENT_VELOCITY] * contract.FUTURE_HORIZON_SECONDS
+
+    start: ndarray  # (2,) metres
+    travel: ndarray  # (2,) metres
 
 
-def nearest_agents(scenario: StagedScenario, history: ndarray, target: int):
+def nearest_agents(scenario: StagedFile, path: ScenePath, target: int):
     """The target, then up to AGENT_SLOTS - 1 other tracks with a valid history
-    step, nearest first to the target's 8 s path. history holds every track's
-    history rows (T, 11, 13) in the target's frame.
+    step, nearest first by their last valid position to the target's path.
     """
     history_valid = scenario.track_valid[:, HISTORY]
+    history = scenario.track_rows[:, HISTORY]
     positions = last_valid_positions(history, history_valid)
-    distances = segment_distance(positions, path_end(history, target))
+    distances = segment_distance(positions - path.start, path.travel)
     is_candidate = history_valid.any(axis=1)
     is_candidate[target] = False
     others = np.flatnonzero(is_candidate)
@@ -159,16 +171,12 @@ def nearest_agents(scenario: StagedScenario, history: ndarray, target: int):
     return np.concatenate([[target], nearest_first[: AGENT_SLOTS - 1]])
 
 
-def nearest_chunks(chunks: SceneChunks, scenario, target: int) -> ndarray:
+def nearest_chunks(chunks: SceneChunks, path: ScenePath) -> ndarray:
     """Up to CHUNK_SLOTS chunk indices, nearest first by each chunk's nearest
-    dot to the target's 8 s straight path at its current velocity. Distances
-    do not change with the frame, so they are measured in the scene frame.
+    dot to the target's path.
     """
-    now = scenario.track_rows[target, contract.CURRENT_STEP_INDEX]
-    start = now[contract.AGENT_POSITION]
-    travel = now[contract.AGENT_VELOCITY] * contract.FUTURE_HORIZON_SECONDS
-    scene_positions = chunks.rows[..., contract.MAP_POSITION]
-    distances = segment_distance(scene_positions - start, travel)
+    scene_positions = chunks.rows[..., layout.MAP_POSITION]
+    distances = segment_distance(scene_positions - path.start, path.travel)
     nearest_dot = np.where(chunks.dot_mask, distances, np.inf).min(axis=1)
     return np.argsort(nearest_dot, kind="stable")[:CHUNK_SLOTS]
 
@@ -177,28 +185,33 @@ def target_inputs(scenario, chunks: SceneChunks, target: int) -> TargetInputs:
     """One target's inputs, everything moved into its frame at the current
     step and padded to AGENT_SLOTS agents and CHUNK_SLOTS chunks.
     """
+    now = scenario.track_rows[target, layout.CURRENT_STEP_INDEX]
+    travel = now[layout.AGENT_VELOCITY] * layout.FUTURE_HORIZON_SECONDS
+    path = ScenePath(now[layout.AGENT_POSITION], travel)
     frame = agent_frame(scenario.track_rows[target])
-    history = rows_to_frame(scenario.track_rows[:, HISTORY], frame)
+    agents = nearest_agents(scenario, path, target)
+    history = rows_to_frame(scenario.track_rows[agents][:, HISTORY], frame)
     own_track = rows_to_frame(scenario.track_rows[target], frame)
-    agents = nearest_agents(scenario, history, target)
-    chosen = nearest_chunks(chunks, scenario, target)
+    chosen = nearest_chunks(chunks, path)
     chunk_rows = map_rows_to_frame(chunks.rows[chosen], frame)
     dot_mask = chunks.dot_mask[chosen]
+    # Moving a padded dot's zeros into the target's frame makes them
+    # non-zero, so padding is zeroed again after the move.
     chunk_rows[~dot_mask] = 0.0
     agent_mask = scenario.track_valid[agents, HISTORY]
     signals = chunks.signal_history[chosen]
     return TargetInputs(
-        agent_history=padded(history[agents], AGENT_SLOTS),
+        agent_history=padded(history, AGENT_SLOTS),
         agent_history_mask=padded(agent_mask, AGENT_SLOTS),
         chunk_rows=padded(chunk_rows, CHUNK_SLOTS),
         chunk_dot_mask=padded(dot_mask, CHUNK_SLOTS),
         chunk_signal_history=padded(signals, CHUNK_SLOTS),
-        future_positions=own_track[FUTURE, contract.AGENT_POSITION],
+        future_positions=own_track[FUTURE, layout.AGENT_POSITION],
         future_mask=scenario.track_valid[target, FUTURE],
     )
 
 
-def scene_inputs(scenario: StagedScenario, targets: ndarray) -> TargetInputs:
+def scene_inputs(scenario: StagedFile, targets: ndarray) -> TargetInputs:
     """Every given target of one scene, stacked on a leading axis."""
     if len(targets) == 0:
         raise ValueError(f"{scenario.scenario_id}: no targets to stack")

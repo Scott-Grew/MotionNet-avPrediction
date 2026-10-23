@@ -21,10 +21,9 @@ import womd.runtime_env  # noqa: E402, F401
 
 import numpy as np  # noqa: E402
 
-from womd import contract, frame_ops, loader  # noqa: E402
-from womd.contract import Submission  # noqa: E402
-from womd.frame_ops import Frame  # noqa: E402
-from womd.loader import StagedScenario  # noqa: E402
+from womd import formats, frames, layout  # noqa: E402
+from womd.formats import StagedFile, Submission  # noqa: E402
+from womd.frames import Frame  # noqa: E402
 
 # The pip package holding Waymo's metrics; its installed version is
 # printed with each run.
@@ -104,24 +103,24 @@ def world_states(rows: np.ndarray, frame: Frame) -> np.ndarray:
     """Scene-frame agent rows (..., 13) to the 7 world-frame columns the
     metrics op wants, x, y, length, width, heading, vx and vy.
     """
-    positions = frame_ops.positions_from_frame(
-        rows[..., contract.AGENT_POSITION], frame
+    positions = frames.positions_from_frame(
+        rows[..., layout.AGENT_POSITION], frame
     )
-    velocities = frame_ops.directions_from_frame(
-        rows[..., contract.AGENT_VELOCITY], frame.heading
+    velocities = frames.directions_from_frame(
+        rows[..., layout.AGENT_VELOCITY], frame.heading
     )
-    sine = rows[..., contract.AGENT_HEADING_SINE]
-    cosine = rows[..., contract.AGENT_HEADING_COSINE]
-    headings = frame_ops.wrap_to_pi(np.arctan2(sine, cosine) + frame.heading)
-    dimensions = rows[..., contract.AGENT_DIMENSIONS]
+    sine = rows[..., layout.AGENT_HEADING_SINE]
+    cosine = rows[..., layout.AGENT_HEADING_COSINE]
+    headings = frames.wrap_to_pi(np.arctan2(sine, cosine) + frame.heading)
+    dimensions = rows[..., layout.AGENT_DIMENSIONS]
     columns = [positions, dimensions, headings[..., np.newaxis], velocities]
     return np.concatenate(columns, axis=-1).astype(np.float32)
 
 
-def ground_truth(scenario: StagedScenario) -> GroundTruth:
+def ground_truth(scenario: StagedFile) -> GroundTruth:
     states = world_states(scenario.track_rows, scenario.scene_frame)
     now_types = scenario.track_rows[
-        :, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE
+        :, layout.CURRENT_STEP_INDEX, layout.AGENT_TYPE
     ]
     object_types = now_types.argmax(axis=-1).astype(np.int64) + 1
     return GroundTruth(states, scenario.track_valid, object_types)
@@ -140,7 +139,7 @@ def rows_by_scenario(scenario_ids: np.ndarray) -> dict[str, list[int]]:
 def empty_inputs(padding: Padding, scenario_ids: list[str]) -> MetricInputs:
     per_prediction = (padding.scenarios, padding.predictions)
     per_agent = (padding.scenarios, padding.agents)
-    logged = contract.TOTAL_STEPS
+    logged = layout.TOTAL_STEPS
     return MetricInputs(
         prediction_trajectory=np.zeros(
             per_prediction + (padding.modes, 1, padding.steps, 2), np.float32
@@ -174,7 +173,7 @@ class InputsBuilder:
         self.scenarios = []
         for scenario_id in rows_of:
             self.scenarios.append(
-                loader.read_scenario(staged / f"{scenario_id}.npz")
+                formats.StagedFile.load(staged / f"{scenario_id}.npz")
             )
         modes, steps = predictions.world_trajectories.shape[1:3]
         padding = Padding(
@@ -186,7 +185,7 @@ class InputsBuilder:
         )
         self.tensors = empty_inputs(padding, list(rows_of))
 
-    def add_ground_truth(self, row: int, scenario: StagedScenario) -> None:
+    def add_ground_truth(self, row: int, scenario: StagedFile) -> None:
         """Ground truth holds every agent of the scenario."""
         truth = ground_truth(scenario)
         agents = (row, slice(0, len(scenario.track_ids)))
@@ -195,7 +194,7 @@ class InputsBuilder:
         self.tensors.object_type[agents] = truth.object_types
         self.tensors.object_id[agents] = scenario.track_ids
 
-    def add_predictions(self, row: int, scenario: StagedScenario) -> None:
+    def add_predictions(self, row: int, scenario: StagedFile) -> None:
         """Each prediction points at its agent by index, not track id."""
         predictions = self.predictions
         tensors = self.tensors

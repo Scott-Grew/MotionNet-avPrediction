@@ -11,8 +11,8 @@ from typing import List, NamedTuple
 import torch
 from torch import Tensor, nn
 
-from womd import contract
-from womd.inputs import TargetInputs
+from womd import layout
+from womd.views import TargetInputs
 
 # Network size, chosen values. Tokens, queries and attention layers
 # share one hidden width.
@@ -28,7 +28,7 @@ QUERY_COUNT = 54
 # A chunk's dots are read relative to its centre in units of half a
 # chunk's length, so a 20 m curve spans about -1 to 1.
 CHUNK_HALF_LENGTH_METRES = (
-    contract.MAP_CHUNK_DOTS * contract.MAP_POINT_SPACING_METRES / 2
+    layout.MAP_CHUNK_DOTS * layout.MAP_POINT_SPACING_METRES / 2
 )
 # Predicted log sigma is clamped to 0.2 m .. 148 m; without a
 # floor the likelihood rewards ever-narrower Gaussians.
@@ -74,12 +74,12 @@ def agent_feature_divisors() -> Tensor:
     """Per-feature scale so position (metres), velocity (m/s) and dimensions
     (metres) are normalised before they enter the network.
     """
-    divisors = torch.ones(contract.AGENT_FEATURE_DIM)
-    divisors[contract.AGENT_POSITION] = contract.DISTANCE_NORMALISER_METRES
-    divisors[contract.AGENT_VELOCITY] = (
-        contract.VELOCITY_NORMALISER_METRES_PER_SECOND
+    divisors = torch.ones(layout.AGENT_FEATURE_DIM)
+    divisors[layout.AGENT_POSITION] = layout.DISTANCE_NORMALISER_METRES
+    divisors[layout.AGENT_VELOCITY] = (
+        layout.VELOCITY_NORMALISER_METRES_PER_SECOND
     )
-    divisors[contract.AGENT_DIMENSIONS] = contract.DIMENSION_NORMALISER_METRES
+    divisors[layout.AGENT_DIMENSIONS] = layout.DIMENSION_NORMALISER_METRES
     return divisors
 
 
@@ -88,12 +88,12 @@ def map_feature_divisors() -> Tensor:
     centre, stop point in the target's frame in metres, and speed limit in
     miles per hour.
     """
-    divisors = torch.ones(contract.MAP_FEATURE_DIM)
-    divisors[contract.MAP_POSITION] = CHUNK_HALF_LENGTH_METRES
-    divisors[contract.MAP_SPEED_LIMIT] = (
-        contract.SPEED_LIMIT_NORMALISER_MILES_PER_HOUR
+    divisors = torch.ones(layout.MAP_FEATURE_DIM)
+    divisors[layout.MAP_POSITION] = CHUNK_HALF_LENGTH_METRES
+    divisors[layout.MAP_SPEED_LIMIT] = (
+        layout.SPEED_LIMIT_NORMALISER_MILES_PER_HOUR
     )
-    divisors[contract.MAP_STOP_POINT] = contract.DISTANCE_NORMALISER_METRES
+    divisors[layout.MAP_STOP_POINT] = layout.DISTANCE_NORMALISER_METRES
     return divisors
 
 
@@ -109,19 +109,19 @@ def predicted_type_index(history: Tensor) -> Tensor:
     """Each agent's predicted type index, from the one-hot object type at the
     current history step.
     """
-    type_one_hot = history[:, contract.CURRENT_STEP_INDEX, contract.AGENT_TYPE]
-    return type_one_hot[:, : contract.NUM_OBJECT_TYPES].argmax(dim=-1)
+    type_one_hot = history[:, layout.CURRENT_STEP_INDEX, layout.AGENT_TYPE]
+    return type_one_hot[:, : layout.NUM_OBJECT_TYPES].argmax(dim=-1)
 
 
 def agent_reachable_distance(history: Tensor) -> Tensor:
     """Upper bound on how far an agent could travel over the future horizon at
     constant maximum acceleration from its current speed.
     """
-    speed = history[
-        :, contract.CURRENT_STEP_INDEX, contract.AGENT_VELOCITY
-    ].norm(dim=-1)
-    horizon = contract.FUTURE_HORIZON_SECONDS
-    acceleration = contract.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED
+    speed = history[:, layout.CURRENT_STEP_INDEX, layout.AGENT_VELOCITY].norm(
+        dim=-1
+    )
+    horizon = layout.FUTURE_HORIZON_SECONDS
+    acceleration = layout.MAXIMUM_ACCELERATION_METRES_PER_SECOND_SQUARED
     # d = v T + a T^2 / 2 for speed v, horizon T and acceleration a.
     return speed * horizon + 0.5 * acceleration * horizon**2
 
@@ -132,8 +132,8 @@ def anchor_lines(anchors: Tensor) -> Tensor:
     The decoder adds its offsets to these lines and the loss assigns each
     logged future to the nearest one, so both must use this one rule.
     """
-    steps = torch.arange(1, contract.FUTURE_STEPS + 1, device=anchors.device)
-    ramp = steps.to(anchors.dtype) / contract.FUTURE_STEPS
+    steps = torch.arange(1, layout.FUTURE_STEPS + 1, device=anchors.device)
+    ramp = steps.to(anchors.dtype) / layout.FUTURE_STEPS
     return anchors[..., None, :] * ramp[:, None]
 
 
@@ -147,7 +147,7 @@ class ModeDecoder(nn.Module):
 
     def __init__(self, unit_anchors: Tensor) -> None:
         super().__init__()
-        expected_shape = (contract.NUM_OBJECT_TYPES, QUERY_COUNT, 2)
+        expected_shape = (layout.NUM_OBJECT_TYPES, QUERY_COUNT, 2)
         if unit_anchors.shape != expected_shape:
             raise ValueError(
                 f"unit_anchors has shape {tuple(unit_anchors.shape)},"
@@ -169,7 +169,7 @@ class ModeDecoder(nn.Module):
         self.trajectory_head = nn.Sequential(
             nn.Linear(HIDDEN_DIM, FEEDFORWARD_DIM),
             nn.ReLU(),
-            nn.Linear(FEEDFORWARD_DIM, 2 * contract.FUTURE_STEPS * 2),
+            nn.Linear(FEEDFORWARD_DIM, 2 * layout.FUTURE_STEPS * 2),
         )
         # There is no final bias because one bias shared by all modes
         # cancels in the softmax over modes and could never be trained.
@@ -189,7 +189,7 @@ class ModeDecoder(nn.Module):
         queries = self.head_norm(queries)
         # Cast up so the cumulative sum below runs in float32 even under
         # mixed precision.
-        head_shape = queries.shape[:2] + (2, contract.FUTURE_STEPS, 2)
+        head_shape = queries.shape[:2] + (2, layout.FUTURE_STEPS, 2)
         head_output = self.trajectory_head(queries).float().view(head_shape)
         step_displacements, log_sigma = head_output.unbind(dim=2)
         # A mode is its anchor's straight constant-speed line plus the running
@@ -207,7 +207,7 @@ class ModeDecoder(nn.Module):
         """Each round's modes, first round first; the last is the answer."""
         anchors = self.unit_anchors[type_index]
         lines = anchor_lines(anchors)
-        scaled_anchors = anchors / contract.DISTANCE_NORMALISER_METRES
+        scaled_anchors = anchors / layout.DISTANCE_NORMALISER_METRES
         queries = self.anchor_query(scaled_anchors)
         normed_tokens = self.scene_norm(memory.tokens)
         padding = ~memory.present
@@ -231,14 +231,14 @@ class MotionPredictor(nn.Module):
         super().__init__()
         self.register_buffer("agent_divisors", agent_feature_divisors())
         self.register_buffer("map_divisors", map_feature_divisors())
-        crossing_codes = contract.NUM_BOUNDARY_CROSSING_CODES
+        crossing_codes = layout.NUM_BOUNDARY_CROSSING_CODES
         self.register_buffer("crossing_code_rows", torch.eye(crossing_codes))
-        step_width = contract.AGENT_FEATURE_DIM + 1
-        self.agent_network = two_layer_mlp(contract.HISTORY_STEPS * step_width)
-        plain_columns = contract.MAP_LEFT_BOUNDARY_CROSSING
+        step_width = layout.AGENT_FEATURE_DIM + 1
+        self.agent_network = two_layer_mlp(layout.HISTORY_STEPS * step_width)
+        plain_columns = layout.MAP_LEFT_BOUNDARY_CROSSING
         self.dot_network = two_layer_mlp(plain_columns + 2 * crossing_codes)
         self.chunk_pose_projection = nn.Linear(4, HIDDEN_DIM)
-        signal_width = contract.POLYLINE_SIGNAL_DIM
+        signal_width = layout.POLYLINE_SIGNAL_DIM
         self.signal_projection = nn.Linear(signal_width, HIDDEN_DIM, bias=False)
         layer = nn.TransformerEncoderLayer(**TRANSFORMER_LAYER_SETTINGS)
         self.encoder = nn.TransformerEncoder(
@@ -269,7 +269,7 @@ class MotionPredictor(nn.Module):
         """One token per map dot. The two crossing codes are category numbers,
         not quantities, so each is widened to a one-hot first.
         """
-        crossing = contract.MAP_LEFT_BOUNDARY_CROSSING
+        crossing = layout.MAP_LEFT_BOUNDARY_CROSSING
         scaled = map_rows / self.map_divisors
         plain = scaled[..., :crossing]
         crossing_codes = map_rows[..., crossing:].long()
@@ -297,8 +297,8 @@ class MotionPredictor(nn.Module):
         )
         is_dot = dot_mask.unsqueeze(-1).to(rows.dtype)
         dot_count = is_dot.sum(dim=-2).clamp_min(1.0)
-        positions = rows[..., contract.MAP_POSITION]
-        directions = rows[..., contract.MAP_DIRECTION]
+        positions = rows[..., layout.MAP_POSITION]
+        directions = rows[..., layout.MAP_DIRECTION]
         centre = (positions * is_dot).sum(dim=-2) / dot_count
         mean_direction = (directions * is_dot).sum(dim=-2) / dot_count
         local = positions - centre.unsqueeze(-2)
@@ -308,7 +308,7 @@ class MotionPredictor(nn.Module):
         dots = dots.masked_fill(~dot_mask.unsqueeze(-1), float("-inf"))
         pooled = dots.max(dim=-2).values
         pooled = pooled.masked_fill(~present.unsqueeze(-1), 0.0)
-        scaled_centre = centre / contract.DISTANCE_NORMALISER_METRES
+        scaled_centre = centre / layout.DISTANCE_NORMALISER_METRES
         pose = torch.cat([scaled_centre, mean_direction], dim=-1)
         signals = signal_history.flatten(start_dim=-2)
         tokens = pooled + self.chunk_pose_projection(pose)

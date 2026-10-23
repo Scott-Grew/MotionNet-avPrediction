@@ -14,9 +14,9 @@ import torch
 from reference_implementations import unit_anchor_offsets_per_type
 
 import train
-from womd import checkpoint, contract, loss, model
-from womd.inputs import TargetInputs
+from womd import checkpoint, formats, layout, loss, model
 from womd.model import MotionPredictor
+from womd.views import TargetInputs
 
 KERNEL_PATH = (
     Path(__file__).parent.parent
@@ -31,20 +31,20 @@ def synthetic_batch():
     """Two targets, each with three agents (itself first) and two map chunks
     of five dots whose crossing columns hold valid codes.
     """
-    history = contract.HISTORY_STEPS
-    signals = contract.NUM_TRAFFIC_SIGNAL_STATES
-    chunk_rows = torch.randn(2, 2, 5, contract.MAP_FEATURE_DIM)
-    codes = torch.randint(0, contract.NUM_BOUNDARY_CROSSING_CODES, (2, 2, 5))
-    chunk_rows[..., contract.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
-    chunk_rows[..., contract.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
+    history = layout.HISTORY_STEPS
+    signals = layout.NUM_TRAFFIC_SIGNAL_STATES
+    chunk_rows = torch.randn(2, 2, 5, layout.MAP_FEATURE_DIM)
+    codes = torch.randint(0, layout.NUM_BOUNDARY_CROSSING_CODES, (2, 2, 5))
+    chunk_rows[..., layout.MAP_LEFT_BOUNDARY_CROSSING] = codes.float()
+    chunk_rows[..., layout.MAP_RIGHT_BOUNDARY_CROSSING] = codes.float()
     return TargetInputs(
-        agent_history=torch.randn(2, 3, history, contract.AGENT_FEATURE_DIM),
+        agent_history=torch.randn(2, 3, history, layout.AGENT_FEATURE_DIM),
         agent_history_mask=torch.ones(2, 3, history, dtype=torch.bool),
         chunk_rows=chunk_rows,
         chunk_dot_mask=torch.ones(2, 2, 5, dtype=torch.bool),
         chunk_signal_history=torch.zeros(2, 2, history, signals),
-        future_positions=torch.randn(2, contract.FUTURE_STEPS, 2),
-        future_mask=torch.ones(2, contract.FUTURE_STEPS, dtype=torch.bool),
+        future_positions=torch.randn(2, layout.FUTURE_STEPS, 2),
+        future_mask=torch.ones(2, layout.FUTURE_STEPS, dtype=torch.bool),
     )
 
 
@@ -80,12 +80,12 @@ def test_checkpoint_round_trips(tmp_path):
     model_state = torch.nn.Linear(1, 1).state_dict()
     state = {
         "model_state": model_state,
-        "code_version": contract.STAGING_CODE_VERSION,
+        "code_version": layout.STAGING_CODE_VERSION,
     }
     checkpoint_path = tmp_path / "checkpoint.pt"
     torch.save(state, checkpoint_path)
     reloaded_state = checkpoint.load_checkpoint(checkpoint_path)
-    assert reloaded_state["code_version"] == contract.STAGING_CODE_VERSION
+    assert reloaded_state["code_version"] == layout.STAGING_CODE_VERSION
     assert torch.equal(
         reloaded_state["model_state"]["weight"], model_state["weight"]
     )
@@ -182,13 +182,11 @@ def test_kernel_command_line_parses(tmp_path):
     while flag_arguments and not flag_arguments[0].startswith("--"):
         flag_arguments = flag_arguments[1:]
     anchors_path = tmp_path / "training_anchors.npz"
-    anchor_shape = (contract.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2)
+    anchor_shape = (layout.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2)
     np.savez(
         anchors_path,
         unit_anchors=np.zeros(anchor_shape, dtype=np.float32),
-        provenance=contract.artifact_provenance(
-            "test", "kernel-interface-test"
-        ),
+        provenance=formats.artifact_provenance("test", "kernel-interface-test"),
     )
     value_of_flag = {
         "--anchors": str(anchors_path),

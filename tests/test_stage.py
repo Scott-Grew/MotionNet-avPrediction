@@ -11,7 +11,7 @@ import pytest
 import tensorflow
 
 import stage
-from womd import contract
+from womd import layout
 from womd_protos import map_pb2, scenario_pb2
 
 STAGING_PIN_PATH = Path(__file__).parent / "staging_pinned.json"
@@ -22,7 +22,7 @@ def add_track(scenario, *, track_id, object_type, base_x, base_y):
     track = scenario.tracks.add()
     track.id = track_id
     track.object_type = object_type
-    for step_index in range(contract.TOTAL_STEPS):
+    for step_index in range(layout.TOTAL_STEPS):
         state = track.states.add()
         state.center_x = base_x + 0.1 * step_index
         state.center_y = base_y
@@ -40,7 +40,7 @@ def build_fixture_scenario(scenario_id):
     """
     scenario = scenario_pb2.Scenario()
     scenario.scenario_id = scenario_id
-    scenario.current_time_index = contract.CURRENT_STEP_INDEX
+    scenario.current_time_index = layout.CURRENT_STEP_INDEX
     scenario.sdc_track_index = 0
     vehicle = scenario_pb2.Track.TYPE_VEHICLE
     pedestrian = scenario_pb2.Track.TYPE_PEDESTRIAN

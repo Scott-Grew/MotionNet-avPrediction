@@ -18,8 +18,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from womd import inputs, loader
-from womd.inputs import TargetInputs
+from womd import formats, views
+from womd.views import TargetInputs
 
 COUNT_REPORT_EVERY_FILES = 10000
 COUNT_READ_THREADS = 32
@@ -31,10 +31,6 @@ class BatchSettings(NamedTuple):
     prefetch_batches: int
     seed: int
     designated_only: bool
-
-
-def torch_batch(batch: TargetInputs) -> TargetInputs:
-    return batch.each(torch.from_numpy)
 
 
 class TargetStream(IterableDataset):
@@ -54,19 +50,15 @@ class TargetStream(IterableDataset):
         worker = get_worker_info()
         worker_index = worker.id if worker else 0
         worker_count = worker.num_workers if worker else 1
-        worker_paths = worker_share(self.paths, worker_index, worker_count)
+        worker_paths = self.paths[worker_index::worker_count]
         generator = np.random.default_rng(self.settings.seed + worker_index)
         designated_only = self.settings.designated_only
         for scenario_index in generator.permutation(len(worker_paths)):
-            scenario = loader.read_scenario(worker_paths[scenario_index])
-            eligible = loader.eligible_tracks(scenario, designated_only)
-            chunks = inputs.scene_chunks(scenario)
+            scenario = formats.StagedFile.load(worker_paths[scenario_index])
+            eligible = views.eligible_tracks(scenario, designated_only)
+            chunks = views.scene_chunks(scenario)
             for target in generator.permutation(eligible):
-                yield inputs.target_inputs(scenario, chunks, int(target))
-
-
-def worker_share(paths: list[Path], index: int, count: int) -> list[Path]:
-    return paths[index::count]
+                yield views.target_inputs(scenario, chunks, int(target))
 
 
 def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
@@ -88,8 +80,7 @@ def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
                 seconds = time.perf_counter() - start
                 print(
                     f"counted {files_read} of {len(paths)} files"
-                    f" in {seconds:.0f} s",
-                    flush=True,
+                    f" in {seconds:.0f} s"
                 )
     step_count = 0
     for index in range(worker_count):
@@ -99,8 +90,8 @@ def steps_per_epoch(paths: list[Path], settings: BatchSettings) -> int:
 
 
 def eligible_count(path: Path, designated_only: bool) -> int:
-    tracks = loader.read_track_arrays(path)
-    eligible = loader.eligible_tracks(tracks, designated_only)
+    tracks = formats.TrackArrays.load(path)
+    eligible = views.eligible_tracks(tracks, designated_only)
     return len(eligible)
 
 

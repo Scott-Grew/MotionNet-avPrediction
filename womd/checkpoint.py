@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from womd import contract
+from womd import formats, layout
 from womd.model import MotionPredictor
 
 Checkpoint = dict[str, Any]
@@ -26,10 +26,10 @@ def load_checkpoint(path: Path | str, device: Device = "cpu") -> Checkpoint:
     """
     checkpoint = torch.load(path, map_location=device)
     code_version = checkpoint.get("code_version")
-    if code_version != contract.STAGING_CODE_VERSION:
+    if code_version != layout.STAGING_CODE_VERSION:
         raise ValueError(
             f"{path} is from code version {code_version!r}, this tree is"
-            f" {contract.STAGING_CODE_VERSION!r}"
+            f" {layout.STAGING_CODE_VERSION!r}"
         )
     return checkpoint
 
@@ -73,7 +73,7 @@ def load_anchor_file(path: Path | str) -> torch.Tensor:
             anchors_file["provenance"] if "provenance" in stored else None
         )
         hint = "Refit them with fit_anchors.py."
-        contract.check_provenance(provenance, path, hint)
+        formats.check_provenance(provenance, path, hint)
         return torch.from_numpy(anchors_file["unit_anchors"])
 
 

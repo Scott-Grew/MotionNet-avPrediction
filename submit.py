@@ -18,19 +18,11 @@ import torch
 from numpy import ndarray
 from torch import Tensor
 
-from womd import (
-    baseline,
-    contract,
-    frame_ops,
-    inputs,
-    loader,
-    pipeline,
-    pruning,
-)
+from womd import baseline, formats, frames, pruning, views
 from womd.checkpoint import load_predictor
-from womd.frame_ops import Frame
-from womd.inputs import TargetInputs
+from womd.formats import StagedFile
 from womd.model import MotionPredictor
+from womd.views import TargetInputs
 
 # A prediction function takes a batch and returns every target's modes,
 # trajectories (B, modes, 80, 2) and confidence logits (B, modes).
@@ -48,26 +40,23 @@ def constant_velocity_modes(batch: TargetInputs) -> Modes:
     return baseline.constant_velocity(batch.agent_history[:, 0])
 
 
-def predict_scene(predict: Predict, batch: TargetInputs, scenario_id: str):
-    """One scene's modes at 10 Hz become Waymo's 6 kept modes at 2 Hz, in
-    each target's own frame. A non-finite mode is refused here, because
-    pruning would turn it into confidences that still sum to 1.
+def predict_scene(predict: Predict, scenario: StagedFile, tracks: ndarray):
+    """The given tracks' 6 kept modes at Waymo's 2 Hz, in each one's own
+    frame. A non-finite mode is refused here, because pruning would turn it
+    into confidences that still sum to 1.
     """
+    scene = views.scene_inputs(scenario, tracks)
+    batch = scene.each(torch.from_numpy)
     with torch.no_grad():
         trajectories, logits = predict(batch)
     finite = torch.isfinite(trajectories).all() & torch.isfinite(logits).all()
     if not finite:
-        raise ValueError(f"{scenario_id}: the model output is not finite")
+        message = f"{scenario.scenario_id}: the model output is not finite"
+        raise ValueError(message)
     return pruning.submitted_modes(trajectories, logits)
 
 
-def to_world(positions: ndarray, agent: Frame, scene: Frame) -> ndarray:
-    """Agent-frame positions out to the world, through the scene frame."""
-    scene_positions = frame_ops.positions_from_frame(positions, agent)
-    return frame_ops.positions_from_frame(scene_positions, scene)
-
-
-def submission(predict: Predict, staged: Path) -> contract.Submission:
+def submission(predict: Predict, staged: Path) -> formats.Submission:
     """Predicts the designated targets one scene at a time and converts each
     target's 6 futures to the world frame.
     """
@@ -76,29 +65,28 @@ def submission(predict: Predict, staged: Path) -> contract.Submission:
     world_trajectories = []
     confidences = []
     for path in sorted(staged.glob("*.npz")):
-        scenario = loader.read_scenario(path)
-        tracks = loader.designated_tracks(scenario)
+        scenario = formats.StagedFile.load(path)
+        tracks = views.designated_tracks(scenario)
         if len(tracks) == 0:
             continue
-        batch = pipeline.torch_batch(inputs.scene_inputs(scenario, tracks))
-        kept = predict_scene(predict, batch, scenario.scenario_id)
+        kept = predict_scene(predict, scenario, tracks)
         kept_paths = kept.trajectories.numpy()
         kept_rows = zip(tracks, kept_paths, kept.confidences.numpy())
         for track_index, paths, scores in kept_rows:
-            frame = loader.agent_frame(scenario.track_rows[track_index])
-            world = to_world(paths, frame, scenario.scene_frame)
+            frame = frames.agent_frame(scenario.track_rows[track_index])
+            world = frames.to_world(paths, frame, scenario.scene_frame)
             scenario_ids.append(scenario.scenario_id)
             track_ids.append(scenario.track_ids[track_index])
             world_trajectories.append(world)
             confidences.append(scores)
     if not scenario_ids:
         raise ValueError(f"{staged}: no staged scene has a designated target")
-    return contract.Submission(
+    return formats.Submission(
         scenario_id=np.array(scenario_ids),
         track_id=np.array(track_ids, dtype=np.int64),
         world_trajectories=np.stack(world_trajectories),
         confidences=np.stack(confidences).astype(np.float64),
-        provenance=contract.artifact_provenance("submit.py", staged),
+        provenance=formats.artifact_provenance("submit.py", staged),
     )
 
 

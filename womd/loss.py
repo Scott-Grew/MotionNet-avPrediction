@@ -10,8 +10,8 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from womd.inputs import TargetInputs
 from womd.model import ModePredictions, RoundPredictions, anchor_lines
+from womd.views import TargetInputs
 
 # The constant term of a Gaussian's negative log likelihood, per
 # dimension.

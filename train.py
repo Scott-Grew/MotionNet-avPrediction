@@ -23,7 +23,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.tensorboard import SummaryWriter
 
-from womd import contract, loss, pipeline
+from womd import layout, loss, pipeline
 from womd.checkpoint import (
     ANCHORS_KEY,
     GradScaler,
@@ -33,10 +33,10 @@ from womd.checkpoint import (
     previous_path,
     save_checkpoint,
 )
-from womd.inputs import TargetInputs
 from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars
 from womd.model import MotionPredictor
 from womd.pipeline import BatchSettings
+from womd.views import TargetInputs
 
 # The peak learning rate unless --learning-rate sets another, and
 # AdamW's own default weight decay.
@@ -54,7 +54,6 @@ class EpochPlan(NamedTuple):
     with the same settings reuses it.
     """
 
-    scenario_count: int
     scenario_names_digest: str
     worker_count: int
     batch_size: int
@@ -95,25 +94,15 @@ class Schedule(NamedTuple):
 
 def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
     """Splits parameters so weight decay applies to matrices only, not to
-    biases, norms or the learned anchor queries.
+    biases or norms.
     """
-    decayed = []
-    undecayed = []
-    for name, parameter in predictor.named_parameters():
-        if parameter.ndim >= 2 and not name.endswith("queries"):
-            decayed.append(parameter)
-        else:
-            undecayed.append(parameter)
+    parameters = list(predictor.parameters())
+    decayed = [parameter for parameter in parameters if parameter.ndim >= 2]
+    undecayed = [parameter for parameter in parameters if parameter.ndim < 2]
     return [
         {"params": decayed, "weight_decay": WEIGHT_DECAY},
         {"params": undecayed, "weight_decay": 0.0},
     ]
-
-
-def training_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -150,7 +139,8 @@ class TrainingRun:
     def __init__(self, arguments: argparse.Namespace) -> None:
         self.launch_time = time.perf_counter()
         self.arguments = arguments
-        self.device = training_device()
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device_type)
         torch.manual_seed(arguments.seed)
         anchors = load_anchor_file(arguments.anchors)
         self.predictor = MotionPredictor(anchors).to(self.device)
@@ -178,7 +168,7 @@ class TrainingRun:
         for name, value in scalars.items():
             self.writer.add_scalar(name, value, step)
         printed = [f"{name} {value:.4g}" for name, value in scalars.items()]
-        print(" | ".join([heading] + printed), flush=True)
+        print(" | ".join([heading] + printed))
         self.writer.flush()
 
     def resume(self) -> tuple[int, EpochPlan | None]:
@@ -195,9 +185,7 @@ class TrainingRun:
             # A crash between save_checkpoint's two renames leaves only the
             # fallback, which is moved back so the checkpoint path holds it.
             fallback.replace(path)
-            print(
-                f"checkpoint missing, restored it from {fallback}", flush=True
-            )
+            print(f"checkpoint missing, restored it from {fallback}")
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
@@ -212,11 +200,9 @@ class TrainingRun:
             )
         self.predictor.load_state_dict(model_state)
         self.optimizer.load_state_dict(checkpoint["optimizer_state"])
-        if "gradient_scaler_state" in checkpoint:
-            scaler_state = checkpoint["gradient_scaler_state"]
-            self.scaler.load_state_dict(scaler_state)
+        self.scaler.load_state_dict(checkpoint["gradient_scaler_state"])
         completed = checkpoint["completed_epochs"]
-        print(f"resuming {path}: {completed} epochs complete", flush=True)
+        print(f"resuming {path}: {completed} epochs complete")
         stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
         return completed, stored
 
@@ -236,28 +222,22 @@ class TrainingRun:
         """
         settings = self.batch_settings(0)
         names = "\n".join(path.name for path in self.paths).encode()
-        settings_now = EpochPlan(
-            scenario_count=len(self.paths),
-            scenario_names_digest=hashlib.sha256(names).hexdigest(),
-            worker_count=settings.worker_count,
-            batch_size=settings.batch_size,
-            designated_only=settings.designated_only,
-            steps_per_epoch=0,
+        settings_now = (
+            hashlib.sha256(names).hexdigest(),
+            settings.worker_count,
+            settings.batch_size,
+            settings.designated_only,
         )
-        if (
-            stored is not None
-            and stored._replace(steps_per_epoch=0) == settings_now
-        ):
-            print("optimiser step count read from the checkpoint", flush=True)
+        if stored is not None and stored[:-1] == settings_now:
+            print("optimiser step count read from the checkpoint")
             return stored
         count = pipeline.steps_per_epoch(self.paths, settings)
         epochs = self.arguments.epochs
         print(
             f"{count} optimiser steps per epoch,"
-            f" {count * epochs} over {epochs} epochs",
-            flush=True,
+            f" {count * epochs} over {epochs} epochs"
         )
-        return settings_now._replace(steps_per_epoch=count)
+        return EpochPlan(*settings_now, steps_per_epoch=count)
 
     def learning_rate_schedule(self) -> Schedule:
         arguments = self.arguments
@@ -280,8 +260,7 @@ class TrainingRun:
             "optimizer_state": self.optimizer.state_dict(),
             "gradient_scaler_state": self.scaler.state_dict(),
             "completed_epochs": completed_epochs,
-            "seed": self.arguments.seed,
-            "code_version": contract.STAGING_CODE_VERSION,
+            "code_version": layout.STAGING_CODE_VERSION,
             "epoch_plan": self.plan._asdict(),
         }
         save_checkpoint(self.arguments.checkpoint_path, state)
@@ -377,9 +356,7 @@ class TrainingRun:
             elapsed = time.perf_counter() - start
             if elapsed + last_epoch_seconds > budget:
                 heading = f"STOPPING BEFORE EPOCH {epoch_index + 1}"
-                print(
-                    self.stop_message(heading, elapsed, epoch_index), flush=True
-                )
+                print(self.stop_message(heading, elapsed, epoch_index))
                 return
 
             epoch_start = time.perf_counter()
@@ -396,22 +373,17 @@ class TrainingRun:
             else:
                 print(
                     f"epoch {epoch_index + 1} mean total loss {total},"
-                    f" checkpoint left as it was",
-                    flush=True,
+                    f" checkpoint left as it was"
                 )
 
             elapsed = time.perf_counter() - start
             if elapsed >= budget:
                 completed = epoch_index + 1
-                print(
-                    self.stop_message("STOPPING EARLY", elapsed, completed),
-                    flush=True,
-                )
+                print(self.stop_message("STOPPING EARLY", elapsed, completed))
                 return
         print(
             f"done: {arguments.checkpoint_path} holds"
-            f" {self.saved_epochs} epochs",
-            flush=True,
+            f" {self.saved_epochs} epochs"
         )
 
 
@@ -436,4 +408,6 @@ if __name__ == "__main__":
     # The Kaggle launcher sends SIGUSR1 before it kills a run that passed
     # its deadline, so the log shows where the run was.
     faulthandler.register(signal.SIGUSR1, file=sys.stderr)
+    # Kaggle pipes stdout to its log, so each line is flushed as printed.
+    sys.stdout.reconfigure(line_buffering=True)
     TrainingRun(parse_arguments()).run()

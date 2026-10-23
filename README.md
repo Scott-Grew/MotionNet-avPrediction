@@ -54,7 +54,7 @@ free Kaggle GPU. Not comparable to the public leaderboard.
    ONNX graph, checked against PyTorch. (`export_onnx.py`)
 
 The exact inputs the model reads are drawn, column by column, at the
-bottom of `womd/contract.py`.
+bottom of `womd/layout.py`.
 
 ## Architecture
 
@@ -72,7 +72,7 @@ flowchart LR
         AGENTS & ROAD --> ENCODER --> DECODER
         QUERY --> DECODER --> HEADS
     end
-    STAGED -->|inputs.py| AGENTS & ROAD
+    STAGED -->|views.py| AGENTS & ROAD
     STAGED -->|fit_anchors.py| ANCHORS[("54 anchors<br/>per type")] --> QUERY
     HEADS -->|pruning.py| OUT[/"Submission<br/>live view<br/>ONNX"/]
     HEADS --> LOSS["Training<br/>MultiPath<br/>loss"]

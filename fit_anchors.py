@@ -16,7 +16,7 @@ import torch
 from sklearn.cluster import KMeans
 from torch import Tensor
 
-from womd import contract, loader, model
+from womd import formats, frames, layout, model, views
 
 # Fixed, so a refit on the same endpoints gives the same anchors.
 # Every other k-means setting is scikit-learn's default.
@@ -32,17 +32,17 @@ def reachable_endpoints(paths: list[Path]) -> tuple[Tensor, Tensor]:
     histories = []
     positions = []
     for path in paths:
-        scenario = loader.read_scenario(path)
-        eligible = loader.eligible_tracks(scenario, designated_only=True)
+        scenario = formats.StagedFile.load(path)
+        eligible = views.eligible_tracks(scenario, designated_only=True)
         for track_index in eligible:
             rows = scenario.track_rows[track_index]
-            own_rows = loader.rows_to_frame(rows, loader.agent_frame(rows))
-            future_valid = scenario.track_valid[track_index, loader.FUTURE]
+            own_rows = frames.rows_to_frame(rows, frames.agent_frame(rows))
+            future_valid = scenario.track_valid[track_index, layout.FUTURE]
             valid_steps = np.flatnonzero(future_valid)
             if valid_steps.size == 0:
                 continue
-            future = own_rows[loader.FUTURE, contract.AGENT_POSITION]
-            histories.append(own_rows[loader.HISTORY])
+            future = own_rows[layout.FUTURE, layout.AGENT_POSITION]
+            histories.append(own_rows[layout.HISTORY])
             positions.append(future[valid_steps[-1]])
     history = torch.from_numpy(np.stack(histories))
     endpoints = torch.from_numpy(np.stack(positions))
@@ -100,12 +100,12 @@ def main() -> None:
     paths = sorted(arguments.staged_directory.glob("*.npz"))
     endpoints, type_index = reachable_endpoints(paths)
     per_type_anchors = []
-    for index, type_name in enumerate(contract.PREDICTED_OBJECT_TYPES):
+    for index, type_name in enumerate(layout.PREDICTED_OBJECT_TYPES):
         anchors, _ = fit_type(type_name, endpoints[type_index == index])
         per_type_anchors.append(anchors)
 
     unit_anchors = torch.stack(per_type_anchors)
-    provenance = contract.artifact_provenance(
+    provenance = formats.artifact_provenance(
         "fit_anchors.py", arguments.staged_directory
     )
     np.savez(
@@ -115,7 +115,7 @@ def main() -> None:
     )
     print(
         f"wrote {arguments.output_path}, one set of anchors per"
-        f" {contract.PREDICTED_OBJECT_TYPES} in that order, most-used first"
+        f" {layout.PREDICTED_OBJECT_TYPES} in that order, most-used first"
     )
 
 
