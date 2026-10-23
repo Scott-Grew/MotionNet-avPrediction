@@ -60,6 +60,7 @@ class EpochPlan(NamedTuple):
 
     scenario_names_digest: str
     process_count: int
+    epochs_per_pass: int
     worker_count: int
     batch_size: int
     designated_only: bool
@@ -132,6 +133,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--all-eligible-agents", action="store_true")
+    parser.add_argument("--epochs-per-pass", type=int, default=1)
     return parser.parse_args()
 
 
@@ -260,6 +262,14 @@ class TrainingRun:
         stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
         return completed, stored
 
+    def epoch_paths(self, epoch_index: int) -> list[Path]:
+        """This process's files for one epoch: one of --epochs-per-pass
+        disjoint slices, so one pass over every file takes that many epochs
+        and each epoch stays short enough to checkpoint and resume.
+        """
+        parts = self.arguments.epochs_per_pass
+        return self.paths[epoch_index % parts :: parts]
+
     def batch_settings(self, epoch_index: int) -> BatchSettings:
         arguments = self.arguments
         return BatchSettings(
@@ -279,6 +289,7 @@ class TrainingRun:
         settings_now = (
             hashlib.sha256(names).hexdigest(),
             self.process_count,
+            self.arguments.epochs_per_pass,
             settings.worker_count,
             settings.batch_size,
             settings.designated_only,
@@ -286,10 +297,15 @@ class TrainingRun:
         if stored is not None and stored[:-1] == settings_now:
             print("optimiser step count read from the checkpoint")
             return stored
-        # Each process counts its own share of the files; every process
-        # then stops at the smallest count, so none waits on another.
-        own_count = pipeline.steps_per_epoch(self.paths, settings)
-        count = self.smallest(own_count)
+        # Each process counts every slice of its own share of the files;
+        # every epoch then stops at the smallest count, so each epoch has
+        # the same steps and no process waits on another.
+        slice_counts = []
+        for part in range(self.arguments.epochs_per_pass):
+            part_paths = self.epoch_paths(part)
+            part_count = pipeline.steps_per_epoch(part_paths, settings)
+            slice_counts.append(part_count)
+        count = self.smallest(min(slice_counts))
         epochs = self.arguments.epochs
         print(
             f"{count} optimiser steps per epoch,"
@@ -425,7 +441,8 @@ class TrainingRun:
 
             epoch_start = time.perf_counter()
             settings = self.batch_settings(epoch_index)
-            batches = pipeline.batches(self.paths, settings)
+            epoch_paths = self.epoch_paths(epoch_index)
+            batches = pipeline.batches(epoch_paths, settings)
             scalars = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
             heading = f"epoch {epoch_index + 1}/{arguments.epochs}"

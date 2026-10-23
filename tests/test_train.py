@@ -336,3 +336,22 @@ def test_decay_from_the_first_epoch_starts_after_warm_up(tmp_path):
     end_of_warm_up = run.arguments.warmup_steps
     assert schedule.at(end_of_warm_up - 1) == pytest.approx(peak)
     assert schedule.at(end_of_warm_up) == pytest.approx(peak)
+
+
+def test_epoch_slices_cover_every_file_once(tmp_path):
+    """One pass of --epochs-per-pass epochs trains on every file exactly
+    once.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 7)
+    run = training_run(
+        staged,
+        tmp_path / "checkpoint.pt",
+        ANCHOR_FILE,
+        "--epochs-per-pass",
+        "3",
+    )
+    slices = [run.epoch_paths(epoch_index) for epoch_index in range(3)]
+    covered = [path for part in slices for path in part]
+    assert sorted(covered) == sorted(run.paths)
+    assert len(covered) == len(set(covered))
+    assert run.epoch_paths(3) == slices[0]
