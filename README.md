@@ -59,7 +59,7 @@ bottom of `womd/layout.py`.
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     RAW[("Waymo<br/>shards")] -->|stage.py| STAGED[("Staged<br/>scenes")]
     STAGED -->|views.py| VIEW["Each target's view,<br/>in its own frame"]
     STAGED -->|fit_anchors.py| ANCHORS[("54 anchors")]
